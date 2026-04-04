@@ -2,7 +2,7 @@
 # Override any value via CLI args (e.g. --num-tasks 5 --max-train-steps 2)
 
 # ── Model ────────────────────────────────────────────────────────────
-project: "tau2-ART-proj"
+project: "tau2-ART-proj-04034"
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_name: "tau2-ART-telecom-Qwen3-30B-A3B-Instruct-2507"
 
@@ -20,22 +20,21 @@ user_llm_args:
 # ── Training hyperparameters ────────────────────────────────────────
 #current setup will take around 1 hour 20 minutes to train
 groups_per_step: 8
-num_epochs: 1
+num_epochs: 2
 rollouts_per_group: 4
 learning_rate: 1.0e-5
 max_orchestrator_steps: 30
-kl_beta: 0.04
 
 # ── Validation & early stopping ────────────────────────────────────
 validation_step_interval: 5
 save_checkpoint_artifact: true
 # Leaderboard: optional. If unset, create_leaderboard.py uses .last_trained_model written by the latest train run.
 # leaderboard_trained_model_name: "tau2-telecom-Qwen3-30B-A3B-Instruct-2507-0313-20260312-1009"
-training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
-training_weave_dataset: "tau2-ART-telecom-training-scenarios"
-validation_dataset_artifact: "tau2-ART-telecom-validation-scenarios:latest"
-validation_weave_dataset: "tau2-ART-telecom-validation-scenarios"
-base_weave_dataset: "tau2-ART-telecom-base-scenarios"
+training_dataset_artifact: "tau2-ART-telecom-training-scenarios-04032:latest"
+training_weave_dataset: "tau2-ART-telecom-training-scenarios-04032"
+validation_dataset_artifact: "tau2-ART-telecom-validation-scenarios-04032:latest"
+validation_weave_dataset: "tau2-ART-telecom-validation-scenarios-04032"
+base_weave_dataset: "tau2-ART-telecom-base-scenarios-04032"
 
 # ── Shaped reward (continuous 0-1 for GRPO signal) ─────────────────
 # When true, training uses fractional sub-metric scores instead of binary 0/1.

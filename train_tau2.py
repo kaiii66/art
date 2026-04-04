@@ -191,7 +191,6 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
     print(f"groups_per_step  : {groups_per_step}")
     print(f"rollouts_per_group: {rollouts_per_group}")
     print(f"learning_rate    : {learning_rate}")
-    print(f"kl_beta          : {config.get('kl_beta', 0.04)}")
     print(f"shaped_reward    : {use_shaped}")
     if max_train_steps:
         print(f"max_train_steps  : {max_train_steps}")
@@ -283,7 +282,6 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
                         model,
                         finished_groups,
                         learning_rate=learning_rate,
-                        beta=config.get("kl_beta", 0.04),
                     )
                     await model.log(
                         finished_groups,
