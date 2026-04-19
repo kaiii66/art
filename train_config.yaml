@@ -2,7 +2,7 @@
 # Override any value via CLI args (e.g. --num-tasks 5 --max-train-steps 2)
 
 # ── Model ────────────────────────────────────────────────────────────
-project: "tau2-ART-proj"
+project: "tau2-ART-proj-0419"
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_name: "tau2-ART-telecom-Qwen3-30B-A3B-Instruct-2507"
 
@@ -20,7 +20,7 @@ user_llm_args:
 # ── Training hyperparameters ────────────────────────────────────────
 #current setup will take around 1 hour 20 minutes to train
 groups_per_step: 8
-num_epochs: 1
+num_epochs: 2
 rollouts_per_group: 4
 learning_rate: 1.0e-5
 max_orchestrator_steps: 30

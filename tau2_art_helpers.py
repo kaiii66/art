@@ -565,6 +565,8 @@ class Tau2BaseModelWrapper(weave.Model):
     agent_llm_args: dict = {}
     max_steps: int = 30
     agent_llm: Optional[str] = None
+    use_shaped_reward: bool = False
+    shaped_reward_weights: dict = {}
 
     @weave.op()
     async def predict(self, task_id: str, domain: str) -> dict:
@@ -578,6 +580,8 @@ class Tau2BaseModelWrapper(weave.Model):
                 max_steps=self.max_steps,
                 agent_llm=self.agent_llm,
                 agent_llm_args=self.agent_llm_args,
+                use_shaped_reward=self.use_shaped_reward,
+                shaped_reward_weights=self.shaped_reward_weights,
             )
         except Exception as e:
             logger.warning("Leaderboard eval failed for task_id=%s (will be excluded from pass^k): %s", task_id, e)

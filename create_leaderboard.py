@@ -1,7 +1,7 @@
 """
 Leaderboard script for tau2-bench: compare base (Qwen) and trained (GRPO) models.
 
-Uses Weave Evaluation on the baseline set and builds a leaderboard with task_reward and success.
+Uses Weave Evaluation on the validation set and builds a leaderboard with task_reward and success.
 
 Usage:
     python create_leaderboard.py --models all --publish-leaderboard
@@ -59,7 +59,8 @@ async def main(
     base_model = config["base_model"]
     agent_llm = config.get("agent_llm", f"wandb/{base_model}")
     user_llm = config["user_llm"]
-    base_weave = config.get("base_weave_dataset") or f"tau2-{domain}-base-scenarios"
+    # base_weave = config.get("base_weave_dataset") or f"tau2-{domain}-base-scenarios"
+    eval_weave = config.get("validation_weave_dataset") or f"tau2-{domain}-validation-scenarios"
     trained_name = trained_model_name or config.get("leaderboard_trained_model_name")
     if not trained_name:
         last_model_file = Path(config_path).resolve().parent / ".last_trained_model"
@@ -73,25 +74,27 @@ async def main(
 
     wc = weave.init(project)
 
-    # Load baseline dataset (same set as train_tau2.py --mode baseline)
-    print("\nLoading baseline dataset...")
+    print("\nLoading validation dataset...")
     try:
-        original = weave.ref(base_weave).get()
+        # original = weave.ref(base_weave).get()
+        original = weave.ref(eval_weave).get()
     except Exception as e:
-        raise RuntimeError(f"Could not load Weave dataset {base_weave}: {e}") from e
-    print(f"Loaded {len(original.rows)} rows from {base_weave}")
+        # raise RuntimeError(f"Could not load Weave dataset {base_weave}: {e}") from e
+        raise RuntimeError(f"Could not load Weave dataset {eval_weave}: {e}") from e
+    # print(f"Loaded {len(original.rows)} rows from {base_weave}")
+    print(f"Loaded {len(original.rows)} rows from {eval_weave}")
 
-    leaderboard_dataset_name = f"tau2-{domain}-base-scenarios-leaderboard"
-    # Always build leaderboard dataset from current baseline data so we never use a stale
+    leaderboard_dataset_name = f"tau2-{domain}-validation-scenarios-leaderboard"
+    # Always build leaderboard dataset from current validation data so we never use a stale
     # cached dataset (e.g. airline rows when config was switched to telecom).
     dataset = weave.Dataset(name=leaderboard_dataset_name, rows=original.rows)
     weave.publish(dataset)
-    print("Published leaderboard dataset from current baseline data")
+    print("Published leaderboard dataset from current validation data")
 
     # Scorers and shared evaluation
     pass_at_k_scorer = PassAtKScorer(num_trials=num_trials)
     scorers = [score_task_reward, score_success, pass_at_k_scorer]
-    eval_name = f"tau2-{domain}-evaluation-leaderboard"
+    eval_name = f"tau2-{domain}-evaluation-leaderboard-validation"
     shared_evaluation = weave.Evaluation(
         name=eval_name,
         dataset=dataset,
@@ -192,7 +195,7 @@ async def main(
                 ),
             )
         leaderboard_spec = leaderboard.Leaderboard(
-            name=f"tau2-{domain}-leaderboard-v4",
+            name=f"tau2-{domain}-leaderboard-validation",
             description=f"tau2-bench {domain}: task_reward, success, and pass^k ({num_trials} trials).",
             columns=lb_columns,
         )
