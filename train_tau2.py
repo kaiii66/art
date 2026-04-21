@@ -171,7 +171,14 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
         validation_tasks = []
     domain = config["domain"]
     user_llm = config["user_llm"]
-    user_llm_args = config.get("user_llm_args", {"temperature": 1.0})
+    user_llm_args = config.get("user_llm_args", {"temperature": 1.0, "max_tokens": 16384})
+    # NOTE: training rollouts deliberately do NOT pass `agent_llm` to tau2_rollout.
+    # When agent_llm is None, tau2_rollout uses ARTAgent against the trainable
+    # LoRA (what we want to optimize). Passing config['agent_llm'] would switch
+    # to the static LLMAgent path and rollouts would no longer sample from the
+    # policy being trained. Only `agent_llm_args` (temperature, max_tokens) is
+    # plumbed through so the inference call has sane decoding settings.
+    agent_llm_args = config.get("agent_llm_args", {"temperature": 1.0, "max_tokens": 16384})
     max_steps = config.get("max_orchestrator_steps", 30)
     groups_per_step = config["groups_per_step"]
     rollouts_per_group = config["rollouts_per_group"]
@@ -191,7 +198,6 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
     print(f"groups_per_step  : {groups_per_step}")
     print(f"rollouts_per_group: {rollouts_per_group}")
     print(f"learning_rate    : {learning_rate}")
-    print(f"kl_beta          : {config.get('kl_beta', 0.04)}")
     print(f"shaped_reward    : {use_shaped}")
     if max_train_steps:
         print(f"max_train_steps  : {max_train_steps}")
@@ -227,6 +233,7 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
                         scenario,
                         user_llm=user_llm,
                         user_llm_args=user_llm_args,
+                        agent_llm_args=agent_llm_args,
                         max_steps=max_steps,
                         use_shaped_reward=use_shaped,
                         shaped_reward_weights=shaped_weights,
@@ -279,11 +286,13 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
         for attempt in range(max_retries):
             try:
                 async with asyncio.timeout(1800):
+                    # Note: KL-against-reference (`beta`/`kl_penalty_coef`) is not
+                    # exposed by the current ServerlessBackend.train() API, so we
+                    # don't pass it. config['kl_beta'] is currently unused.
                     result = await backend.train(
                         model,
                         finished_groups,
                         learning_rate=learning_rate,
-                        beta=config.get("kl_beta", 0.04),
                     )
                     await model.log(
                         finished_groups,
@@ -321,6 +330,7 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
                             scenario,
                             user_llm=user_llm,
                             user_llm_args=user_llm_args,
+                            agent_llm_args=agent_llm_args,
                             max_steps=max_steps,
                         )
                     ])
@@ -387,7 +397,15 @@ async def main(args):
 
     random.seed(config.get("random_seed", 42))
 
-    # ── W&B ──
+    # ── Names (W&B run + ART model) ──
+    # The W&B run name is always uniquely timestamped so each training run is
+    # distinct in the W&B UI. The ART model.name (= W&B artifact collection)
+    # is either:
+    #   - `continue_from_model`, when set, so GRPO continues that collection's
+    #     checkpoint history (e.g. RL on top of an SFT collection's step 6 →
+    #     produces step 7, 8, … in the same collection, all servable).
+    #   - `<model_name>-<timestamp>`, otherwise, for a fresh LoRA in a new
+    #     auto-named collection.
     lr_str = f"{config['learning_rate']:.0e}".replace("-0", "-")
     now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
     run_name = (
@@ -395,6 +413,13 @@ async def main(args):
         f"-r{config['rollouts_per_group']}-lr{lr_str}"
         f"-{now_pt.strftime('%Y%m%d-%H%M')}"
     )
+    continue_from = config.get("continue_from_model")
+    if continue_from:
+        model_name = continue_from
+    else:
+        model_name = f"{config['model_name']}-{now_pt.strftime('%Y%m%d-%H%M')}"
+
+    # ── W&B (main training run) ──
     wandb.init(
         project=config["project"],
         name=run_name,
@@ -403,7 +428,6 @@ async def main(args):
     )
 
     # ── ART model ──
-    model_name = f"{config['model_name']}-{now_pt.strftime('%Y%m%d-%H%M')}"
     model = art.TrainableModel(
         name=model_name,
         project=config["project"],
@@ -411,6 +435,25 @@ async def main(args):
     )
     backend = ServerlessBackend()
     await model.register(backend)
+
+    starting_step = await model.get_step()
+    if continue_from:
+        print(
+            f"Continuing collection '{model_name}' from step {starting_step}. "
+            f"GRPO will append step {starting_step + 1}, {starting_step + 2}, …"
+        )
+        if starting_step == 0:
+            print(
+                "WARNING: continue_from_model is set but the collection's latest "
+                "registered step is 0 (base init). RL will effectively train from "
+                "the base LoRA. Verify the source collection actually has the "
+                "expected SFT checkpoint registered with the ART backend."
+            )
+    else:
+        print(
+            f"Fresh collection '{model_name}'. GRPO starts from base LoRA "
+            f"(step {starting_step})."
+        )
 
     # So create_leaderboard.py can find this run's model without --trained-model-name
     (config_path.resolve().parent / ".last_trained_model").write_text(model_name)

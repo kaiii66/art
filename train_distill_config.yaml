@@ -1,0 +1,53 @@
+# ART SFT-distillation configuration for tau2-bench.
+# Teacher (MiniMax-M2.5) plays tau2 as the agent; only successful rollouts
+# are used to supervised-fine-tune the student (Qwen3-30B-A3B-Instruct-2507).
+# Override anything via CLI args (see train_tau2_distill.py --help).
+
+# ── Model ───────────────────────────────────────────────────────────
+project: "tau2-ART-distill-0419"
+base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507"
+
+# ── Domain ─────────────────────────────────────────────────────────
+domain: "telecom"
+
+# ── LLM routing (litellm provider prefix) ──────────────────────────
+# Both teacher and user simulator use W&B Inference (WANDB_API_KEY from env).
+teacher_llm: "wandb/MiniMaxAI/MiniMax-M2.5"
+teacher_llm_args:
+  temperature: 0.7
+  max_tokens: 4096
+user_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
+user_llm_args:
+  temperature: 1.0
+
+# ── Teacher data generation ────────────────────────────────────────
+num_training_tasks: 8
+teacher_rollouts_per_task: 1
+num_validation_tasks: 4
+max_orchestrator_steps: 30
+filter_successful_only: true
+teacher_concurrency: 8
+# When true, first run 1 probe rollout per task to find solvable tasks, then
+# concentrate the remaining (teacher_rollouts_per_task - 1) rollouts on those
+# solvable tasks only. Avoids wasting compute on tasks the teacher can't solve.
+prefilter_tasks: true
+
+# ── SFT hyperparameters ────────────────────────────────────────────
+sft_epochs: 2
+sft_batch_size: 2
+# 1e-4 is conservative; 2e-4 was overfitting on small (~13 traj) datasets.
+sft_peak_lr: 1.0e-4
+sft_warmup_ratio: 0.1
+sft_schedule_type: "cosine"
+sft_chunk_size: 8          # batches per train_sft call (=> validation cadence)
+validation_every_n_chunks: 4
+
+# ── Datasets (W&B artifacts produced by upload_dataset_to_wandb.py) ─
+training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
+validation_dataset_artifact: "tau2-ART-telecom-validation-scenarios:latest"
+validation_task_split: "test"
+
+# ── Reproducibility / W&B ──────────────────────────────────────────
+random_seed: 42
+wandb_job_type: "distill"

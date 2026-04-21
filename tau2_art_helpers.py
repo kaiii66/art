@@ -393,6 +393,173 @@ def _redact_model_key(inputs: dict[str, Any]) -> dict[str, Any]:
         return {**inputs, "model": redacted}
     return inputs
 
+def _tau2_messages_to_openai_dicts(messages) -> list[dict]:
+    """Convert tau2 simulation messages to strict OpenAI chat-format dicts.
+
+    Unlike tau2.utils.llm_utils.to_litellm_messages, this emits tool_calls
+    using only the OpenAI-spec fields ({id, type, function:{name, arguments}})
+    so they can be used directly as SFT training data per
+    https://art.openpipe.ai/fundamentals/sft-training.
+    """
+    out: list[dict] = []
+    for msg in messages:
+        if isinstance(msg, SystemMessage):
+            out.append({"role": "system", "content": msg.content})
+        elif isinstance(msg, UserMessage):
+            out.append({"role": "user", "content": msg.content})
+        elif isinstance(msg, AssistantMessage):
+            d: dict = {"role": "assistant", "content": msg.content}
+            if msg.tool_calls:
+                d["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments),
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ]
+            out.append(d)
+        elif isinstance(msg, ToolMessage):
+            out.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": msg.id,
+                    "content": msg.content or "",
+                }
+            )
+    return out
+
+
+@weave.op()
+async def tau2_teacher_rollout(
+    task_scenario: Tau2TaskScenario,
+    teacher_llm: str,
+    teacher_llm_args: Optional[dict] = None,
+    user_llm: str = "openai/gpt-4o-mini",
+    user_llm_args: Optional[dict] = None,
+    max_steps: int = 30,
+) -> art.Trajectory:
+    """Run a tau2 simulation using `teacher_llm` as the agent and return an
+    SFT-ready ART Trajectory.
+
+    The returned Trajectory's `messages_and_choices` is a list of plain dicts
+    in OpenAI chat format (system + user/assistant/tool turns), and `tools`
+    is the domain's OpenAI tool schema. metrics["task_reward"] / "success"
+    are populated from tau2's evaluator so callers can filter for successful
+    teacher trajectories before training.
+    """
+    if teacher_llm_args is None:
+        teacher_llm_args = {"temperature": 0.7}
+    if user_llm_args is None:
+        user_llm_args = {"temperature": 1.0}
+
+    domain = task_scenario.domain
+    task_id = task_scenario.task_id
+
+    def _run_sync():
+        tasks = registry.get_tasks_loader(domain)()
+        task = None
+        for t in tasks:
+            if t.id == task_id:
+                task = t
+                break
+        if task is None:
+            raise ValueError(f"Task {task_id} not found in domain {domain}")
+
+        env_constructor = registry.get_env_constructor(domain)
+        environment = env_constructor()
+
+        AgentConstructor = registry.get_agent_constructor("llm_agent")
+        agent = AgentConstructor(
+            tools=environment.get_tools(),
+            domain_policy=environment.get_policy(),
+            llm=teacher_llm,
+            llm_args=deepcopy(teacher_llm_args),
+        )
+        openai_tools = [t.openai_schema for t in environment.get_tools()]
+        domain_policy = environment.get_policy()
+
+        try:
+            user_tools = environment.get_user_tools()
+        except (ValueError, Exception):
+            user_tools = None
+
+        user = UserSimulator(
+            tools=user_tools,
+            instructions=str(task.user_scenario),
+            llm=user_llm,
+            llm_args=deepcopy(user_llm_args),
+        )
+
+        orchestrator = Orchestrator(
+            domain=domain,
+            agent=agent,
+            user=user,
+            environment=environment,
+            task=task,
+            max_steps=max_steps,
+        )
+        simulation = orchestrator.run()
+
+        reward_info = _evaluate_and_get_reward(simulation, task, domain)
+        simulation.reward_info = reward_info
+
+        return (
+            simulation,
+            reward_info,
+            openai_tools,
+            domain_policy,
+            task,
+        )
+
+    (
+        simulation,
+        reward_info,
+        openai_tools,
+        domain_policy,
+        task,
+    ) = await asyncio.to_thread(_run_sync)
+
+    binary_reward = reward_info.reward
+    success = 1.0 if abs(binary_reward - 1.0) < 1e-6 else 0.0
+
+    sys_msg = {
+        "role": "system",
+        "content": SYSTEM_PROMPT.format(
+            domain_policy=domain_policy,
+            agent_instruction=AGENT_INSTRUCTION,
+        ),
+    }
+    convo = _tau2_messages_to_openai_dicts(simulation.messages)
+    # tau2 simulation messages may already include the system message; if so
+    # drop ours to avoid duplication.
+    if convo and convo[0].get("role") == "system":
+        messages = convo
+    else:
+        messages = [sys_msg] + convo
+
+    traj = art.Trajectory(
+        reward=binary_reward,
+        messages_and_choices=messages,
+        metadata={
+            "task_id": task.id,
+            "step": task_scenario.step,
+            "domain": task_scenario.domain,
+            "termination_reason": simulation.termination_reason.value,
+            "teacher_llm": teacher_llm,
+        },
+        metrics={
+            "task_reward": binary_reward,
+            "success": success,
+        },
+    )
+    traj.tools = openai_tools
+    return traj
+
+
 @weave.op(postprocess_inputs=_redact_model_key)
 async def tau2_rollout(
     model: Optional[Any],
@@ -404,6 +571,8 @@ async def tau2_rollout(
     agent_llm_args: Optional[dict] = None,
     use_shaped_reward: bool = False,
     shaped_reward_weights: Optional[dict] = None,
+    pinned_step: Optional[int] = None,
+    pinned_alias: Optional[str] = None,
 ) -> art.Trajectory:
     """Run a tau2-bench simulation and return an ART Trajectory.
 
@@ -449,12 +618,25 @@ async def tau2_rollout(
             messages_and_choices = []
         else:
             inference_api_key = os.getenv("WANDB_API_KEY")
+            if pinned_alias is not None:
+                # Pin directly to any W&B artifact alias on this model's collection
+                # (e.g. "v1", "latest", "best"). Useful when the desired checkpoint
+                # exists in W&B but doesn't carry a `step{N}` alias (for example,
+                # an artifact orphaned by a buggy fork).
+                inference_name = (
+                    f"wandb-artifact:///{model.entity}/{model.project}/"
+                    f"{model.name}:{pinned_alias}"
+                )
+            elif pinned_step is not None:
+                inference_name = model.get_inference_name(step=pinned_step)
+            else:
+                inference_name = model.get_inference_name()
             agent = ARTAgent(
                 tools=environment.get_tools(),
                 domain_policy=environment.get_policy(),
                 inference_base_url=model.inference_base_url,
                 inference_api_key=inference_api_key,
-                model_name=model.get_inference_name(),
+                model_name=inference_name,
                 temperature=agent_llm_args.get("temperature", 1.0),
                 llm_kwargs=deepcopy(agent_llm_args),
             )
@@ -567,6 +749,15 @@ class Tau2BaseModelWrapper(weave.Model):
     agent_llm: Optional[str] = None
     use_shaped_reward: bool = False
     shaped_reward_weights: dict = {}
+    # When set, evaluate a specific LoRA checkpoint of `self.model` instead
+    # of the collection's `:latest`. Resolves to the W&B artifact alias
+    # `step{pinned_step}` (e.g. step0 = freshly forked SFT, pre-RL).
+    pinned_step: Optional[int] = None
+    # When set, pin directly to an arbitrary W&B artifact alias on this
+    # collection (e.g. "v1", "latest"). Takes precedence over `pinned_step`.
+    # Useful for evaluating artifacts that were uploaded but never received
+    # a `step{N}` alias (e.g. orphaned fork checkpoints).
+    pinned_alias: Optional[str] = None
 
     @weave.op()
     async def predict(self, task_id: str, domain: str) -> dict:
@@ -582,6 +773,8 @@ class Tau2BaseModelWrapper(weave.Model):
                 agent_llm_args=self.agent_llm_args,
                 use_shaped_reward=self.use_shaped_reward,
                 shaped_reward_weights=self.shaped_reward_weights,
+                pinned_step=self.pinned_step,
+                pinned_alias=self.pinned_alias,
             )
         except Exception as e:
             logger.warning("Leaderboard eval failed for task_id=%s (will be excluded from pass^k): %s", task_id, e)
@@ -656,3 +849,12 @@ def score_task_reward(model_output: dict) -> dict:
 def score_success(model_output: dict) -> dict:
     """Weave scorer: extracts the binary success flag (0/1)."""
     return {"success": model_output.get("success", 0.0)}
+
+
+# NOTE: A `fork_model_weights` helper used to live here, wrapping ART's
+# `_experimental_fork_checkpoint`. It was removed because forked artifacts
+# upload bytes to W&B Artifacts but are NOT registered with W&B Inference,
+# making them unservable. To start RL from an existing SFT, set
+# `continue_from_model: <sft-collection-name>` in train_config.yaml so GRPO
+# continues that collection's checkpoint history (step 7, 8, …) through the
+# proper server-side checkpoint-registration path.

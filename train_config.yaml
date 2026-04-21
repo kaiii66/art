@@ -2,25 +2,55 @@
 # Override any value via CLI args (e.g. --num-tasks 5 --max-train-steps 2)
 
 # ── Model ────────────────────────────────────────────────────────────
-project: "tau2-ART-proj-0419"
+# project: "tau2-ART-proj-0419"
+project: "tau2-ART-distill-0419"
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_name: "tau2-ART-telecom-Qwen3-30B-A3B-Instruct-2507"
+
+# ── Optional: continue training in an existing model's collection ───
+# When set, GRPO uses this collection name as the ART model.name, so its
+# server-side trainer initializes from the collection's latest checkpoint
+# (e.g. the SFT step 6 LoRA below) and appends step 7, 8, … to the same
+# collection through the proper checkpoint-registration path.
+#
+# Why not "fork" into a new collection? `_experimental_fork_checkpoint`
+# uploads bytes to W&B Artifacts but does NOT register them with W&B
+# Inference, so forked artifacts are unservable. Continuing in-place is
+# the only path that produces servable RL checkpoints today.
+#
+# Safety: existing inference endpoints pinned to a *specific version*
+# (e.g. `:v6`) are unaffected — version aliases are immutable and new
+# RL training only appends new versions. Anything pinned to `:latest`
+# or to the SFT's `:step6` will shift to RL weights after step 7+.
+#
+# Comment out to train from `base_model` with a fresh LoRA in a new,
+# auto-named collection.
+continue_from_model: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260419-1420"
 
 # ── Domain / tasks ──────────────────────────────────────────────────
 domain: "telecom"
 
 # ── LLM routing (litellm provider prefix) ────────────────────────────
 # Uses litellm's native W&B Inference provider (WANDB_API_KEY from env).
+#
+# Sampling args MUST set max_tokens — without it the W&B Inference default
+# is far too small for tool-using agents and rollouts truncate to ~30-500
+# tokens, producing reward 0 on every group and starving GRPO of signal.
+# Temperature 1.0 keeps exploration high so rollouts in a group differ.
 agent_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
+agent_llm_args:
+  temperature: 1.0
+  max_tokens: 16384
 # user_llm: "wandb/Qwen/Qwen3-235B-A22B-Instruct-2507" #as of 031226 there is issue with this model
 user_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
 user_llm_args:
   temperature: 1.0
+  max_tokens: 16384
 
 # ── Training hyperparameters ────────────────────────────────────────
 #current setup will take around 1 hour 20 minutes to train
 groups_per_step: 8
-num_epochs: 2
+num_epochs: 1
 rollouts_per_group: 4
 learning_rate: 1.0e-5
 max_orchestrator_steps: 30
@@ -40,7 +70,7 @@ base_weave_dataset: "tau2-ART-telecom-base-scenarios"
 # ── Shaped reward (continuous 0-1 for GRPO signal) ─────────────────
 # When true, training uses fractional sub-metric scores instead of binary 0/1.
 # Baseline/leaderboard evaluation always uses the original binary reward.
-shaped_reward: true
+shaped_reward: false
 shaped_reward_weights:
   action: 0.35
   communicate: 0.10
