@@ -3,7 +3,8 @@
 
 # ── Model ────────────────────────────────────────────────────────────
 # project: "tau2-ART-proj-0419"
-project: "tau2-ART-distill-0419"
+# project: "tau2-ART-distill-0419"
+project: "tau2-ART-distill-04211613"
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_name: "tau2-ART-telecom-Qwen3-30B-A3B-Instruct-2507"
 
@@ -49,16 +50,53 @@ user_llm_args:
 
 # ── Training hyperparameters ────────────────────────────────────────
 #current setup will take around 1 hour 20 minutes to train
-groups_per_step: 8
+# Bumped rollouts_per_group 4 -> 8 and dropped groups_per_step 8 -> 4 to
+# raise within-group statistical power without changing total rollouts/step.
+# This is the cheapest fix for the "~99% of GRPO groups had zero variance"
+# pathology observed in run kwt/tau2-ART-distill-04211613/3kxgwhmp.
+groups_per_step: 4
 num_epochs: 1
-rollouts_per_group: 4
-learning_rate: 1.0e-5
+rollouts_per_group: 8
+# Lowered 1e-5 -> 5e-6: with no SFT KL anchor available in
+# ServerlessBackend.train(), a smaller LR is the only knob to limit drift
+# from the post-SFT policy.
+learning_rate: 5.0e-6
 max_orchestrator_steps: 30
+# NOTE: kl_beta is currently NOT honored. The serverless ART backend's
+# train() API does not expose `beta`/`kl_penalty_coef`, so this value is
+# logged in the config snapshot but never wired into the loss. Kept here
+# for forward-compat / documentation; remove once ART exposes the kwarg.
 kl_beta: 0.04
 
 # ── Validation & early stopping ────────────────────────────────────
-validation_step_interval: 5
+# Validate every 2 RL steps (was 5) so short runs (<=30 steps) get
+# multiple datapoints to drive best-step selection / early-stop.
+validation_step_interval: 2
+# Stop training if val/reward has not improved for this many consecutive
+# validations. None / 0 disables. Used in train_tau2.py run_training.
+early_stop_patience_evals: 2
 save_checkpoint_artifact: true
+
+# ── RL pre-filter (curriculum) ─────────────────────────────────────
+# Before the GRPO loop, probe each training task k_probe times on the
+# loaded SFT model and keep only tasks whose probe success rate falls in
+# [low, high]. Tasks at 0/1 contribute zero advantage to GRPO anyway;
+# focusing on the trainable middle band is much more sample-efficient.
+# Set rl_prefilter_tasks: false to disable.
+rl_prefilter_tasks: true
+rl_prefilter_k: 4
+rl_prefilter_keep_band: [0.25, 0.75]
+
+# ── Pre-GRPO checkpoint digest sanity check ────────────────────────
+# When true (and continue_from_model is set), before the first GRPO step
+# fetch the W&B artifact aliases :step{starting_step} and :latest on the
+# `continue_from_model` collection via wandb.Api() and compare digests.
+# A match means the registry head is exactly the SFT checkpoint we
+# resumed from. A mismatch is logged as a warning but never fatal. The
+# script also uploads a small text artifact ("checkpoint-digest-check")
+# to the run for an audit trail. Note: digest is a content checksum on
+# the W&B artifact; it does NOT prove server-side inference cache state.
+verify_checkpoint_digest_before_train: true
 # Leaderboard: optional. If unset, create_leaderboard.py uses .last_trained_model written by the latest train run.
 # leaderboard_trained_model_name: "tau2-telecom-Qwen3-30B-A3B-Instruct-2507-0313-20260312-1009"
 training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
@@ -70,7 +108,7 @@ base_weave_dataset: "tau2-ART-telecom-base-scenarios"
 # ── Shaped reward (continuous 0-1 for GRPO signal) ─────────────────
 # When true, training uses fractional sub-metric scores instead of binary 0/1.
 # Baseline/leaderboard evaluation always uses the original binary reward.
-shaped_reward: false
+shaped_reward: true
 shaped_reward_weights:
   action: 0.35
   communicate: 0.10

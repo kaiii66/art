@@ -60,6 +60,8 @@ async def main(
     config_path: str = "train_config.yaml",
     models_to_eval: list = None,
     trained_model_name: str = None,
+    trained_model_step: int = None,
+    trained_model_alias: str = None,
     publish_leaderboard: bool = False,
 ):
     if models_to_eval is None:
@@ -80,6 +82,29 @@ async def main(
         last_model_file = Path(config_path).resolve().parent / ".last_trained_model"
         if last_model_file.exists():
             trained_name = last_model_file.read_text().strip()
+    # Pin the trained-model evaluation to a specific LoRA checkpoint. Resolution
+    # order (highest precedence first):
+    #   1. CLI --trained-model-alias / --trained-model-step
+    #   2. config.leaderboard_trained_model_alias / leaderboard_trained_model_step
+    #   3. .best_rl_step file next to the snapshot config (auto-written by
+    #      train_tau2.py at the step with the highest val/reward). This makes
+    #      `eval_rl` in run_pipeline.py automatically score the best RL step
+    #      instead of whichever step is currently :latest.
+    pinned_alias = trained_model_alias or config.get("leaderboard_trained_model_alias")
+    pinned_step = trained_model_step
+    if pinned_step is None:
+        pinned_step = config.get("leaderboard_trained_model_step")
+    if pinned_step is None and pinned_alias is None:
+        best_step_file = Path(config_path).resolve().parent / ".best_rl_step"
+        if best_step_file.exists():
+            try:
+                pinned_step = int(best_step_file.read_text().strip())
+                print(
+                    f"  [eval_rl] auto-pinned to best RL step {pinned_step} "
+                    f"from {best_step_file.name}"
+                )
+            except (ValueError, OSError) as e:
+                print(f"  [eval_rl] could not read {best_step_file}: {e}")
     lb_config = config.get("leaderboard", {})
     num_trials = lb_config.get("num_trials", 1)
     max_steps = lb_config.get("max_steps", config.get("max_orchestrator_steps", 30))
@@ -160,20 +185,37 @@ async def main(
                 base_model=base_model,
             )
             await trained_model.register(backend)
-            step = await trained_model.get_step()
+            latest_step = await trained_model.get_step()
+            if pinned_alias is not None:
+                eval_step_label = f"pinned alias :{pinned_alias}"
+                print(
+                    f"Pinning evaluation to artifact alias :{pinned_alias} "
+                    f"(collection latest is step {latest_step})"
+                )
+            elif pinned_step is not None:
+                eval_step_label = f"pinned step {pinned_step}"
+                print(
+                    f"Pinning evaluation to checkpoint :step{pinned_step} "
+                    f"(collection latest is step {latest_step})"
+                )
+            else:
+                eval_step_label = f"latest step {latest_step}"
+            trained_display = f"{base_model} (GRPO @ {eval_step_label})"
             trained_wrapper = Tau2BaseModelWrapper(
                 model=trained_model,
-                model_name=f"{base_model} (GRPO @ step {step})",
+                model_name=trained_display,
                 domain=domain,
                 user_llm=user_llm,
                 user_llm_args=user_llm_args,
                 agent_llm_args=agent_llm_args,
                 max_steps=max_steps,
+                pinned_step=pinned_step,
+                pinned_alias=pinned_alias,
                 **shaped_kwargs,
             )
             models.append(trained_wrapper)
             model_names.append("trained")
-            display_names.append(f"{base_model} (GRPO @ step {step})")
+            display_names.append(trained_display)
         except Exception as e:
             print(f"Could not load trained model {trained_name}: {e}")
     elif should_eval_trained and not trained_name:
@@ -233,6 +275,27 @@ if __name__ == "__main__":
     )
     parser.add_argument("--trained-model-name", type=str, default=None, help="Trained model name (overrides config)")
     parser.add_argument(
+        "--trained-model-step",
+        type=int,
+        default=None,
+        help=(
+            "Pin trained-model evaluation to LoRA checkpoint alias :step{N} "
+            "instead of :latest. Default: auto-read .best_rl_step next to the "
+            "config (written by train_tau2.py at the best val/reward step), "
+            "else fall back to :latest."
+        ),
+    )
+    parser.add_argument(
+        "--trained-model-alias",
+        type=str,
+        default=None,
+        help=(
+            "Pin trained-model evaluation directly to a W&B artifact alias "
+            "(e.g. 'v1', 'latest'). Takes precedence over --trained-model-step "
+            "and over .best_rl_step auto-discovery."
+        ),
+    )
+    parser.add_argument(
         "--publish-leaderboard",
         action="store_true",
         help="Publish/overwrite leaderboard definition (use only for first time or to update structure)",
@@ -242,5 +305,7 @@ if __name__ == "__main__":
         config_path=args.config,
         models_to_eval=args.models,
         trained_model_name=args.trained_model_name,
+        trained_model_step=args.trained_model_step,
+        trained_model_alias=args.trained_model_alias,
         publish_leaderboard=args.publish_leaderboard,
     ))

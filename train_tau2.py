@@ -10,8 +10,9 @@ import argparse
 import asyncio
 import json
 import random
+import tempfile
 import yaml
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -160,13 +161,192 @@ def load_validation_tasks(config):
     return [id_to_task[tid] for tid in task_ids]
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Pre-GRPO checkpoint digest verification
+# ─────────────────────────────────────────────────────────────────────
+
+def verify_checkpoint_digest(model, starting_step: int) -> dict:
+    """Sanity-check that the loaded ART model's :step{N} alias matches :latest.
+
+    At RL start (continue_from_model set), the W&B artifact alias :step{starting_step}
+    should be the same content (digest) as :latest in the same collection. If they
+    diverge it usually means the registry's head moved (or starting_step was not the
+    one we think). Mismatch is a warning, never fatal.
+
+    Logs a `checkpoint/digest_match` scalar and a small text artifact to the active
+    wandb.run for audit. Returns the summary dict.
+    """
+    summary = {
+        "entity": None,
+        "project": None,
+        "model_name": getattr(model, "name", None),
+        "starting_step": starting_step,
+        "step_alias": f"step{starting_step}",
+        "step_alias_digest": None,
+        "latest_digest": None,
+        "match": None,
+        "error": None,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+    run = wandb.run
+    if run is None:
+        summary["error"] = "no_active_wandb_run"
+        print("  [digest-check] skipped: no active wandb.run")
+        return summary
+
+    entity = run.entity
+    project = run.project
+    summary["entity"] = entity
+    summary["project"] = project
+
+    collection = summary["model_name"]
+    if not collection:
+        summary["error"] = "model_has_no_name"
+        print("  [digest-check] skipped: model.name is empty")
+        return summary
+
+    step_ref = f"{entity}/{project}/{collection}:step{starting_step}"
+    latest_ref = f"{entity}/{project}/{collection}:latest"
+
+    try:
+        api = wandb.Api()
+        art_step = api.artifact(step_ref)
+        art_latest = api.artifact(latest_ref)
+        summary["step_alias_digest"] = art_step.digest
+        summary["latest_digest"] = art_latest.digest
+        summary["match"] = art_step.digest == art_latest.digest
+    except Exception as e:
+        summary["error"] = f"{type(e).__name__}: {e}"
+        print(f"  [digest-check] failed to fetch artifacts: {summary['error']}")
+
+    if summary["error"] is None:
+        prefix = "OK" if summary["match"] else "MISMATCH"
+        print(
+            f"  [digest-check] {prefix} {step_ref} digest={summary['step_alias_digest']} "
+            f"vs :latest digest={summary['latest_digest']}"
+        )
+        try:
+            wandb.log({
+                "checkpoint/digest_match": 1 if summary["match"] else 0,
+                "checkpoint/starting_step": starting_step,
+            })
+        except Exception as e:
+            print(f"  [digest-check] wandb.log failed: {e}")
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", prefix="checkpoint_digest_", delete=False
+        ) as f:
+            f.write("checkpoint digest verification (pre-GRPO)\n")
+            for k, v in summary.items():
+                f.write(f"{k}: {v}\n")
+            txt_path = f.name
+        artifact = wandb.Artifact(
+            name="checkpoint-digest-check",
+            type="checkpoint-verification",
+            metadata={k: v for k, v in summary.items() if k != "timestamp"},
+        )
+        artifact.add_file(local_path=txt_path)
+        run.log_artifact(artifact)
+    except Exception as e:
+        print(f"  [digest-check] failed to upload text artifact: {e}")
+
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────
+# RL pre-filter (curriculum)
+# ─────────────────────────────────────────────────────────────────────
+
+async def prefilter_training_tasks(model, training_tasks, config):
+    """Probe each training task k times on the loaded SFT/RL policy and keep
+    only tasks whose probe success rate is in the trainable band.
+
+    Tasks at success_rate 0 (always-fail) or 1 (always-pass) contribute zero
+    GRPO advantage because every rollout in the group will share the same
+    reward. Filtering them out before the loop concentrates compute on the
+    middle band where gradients actually exist.
+
+    Reads:
+        rl_prefilter_k:           int, rollouts per task during the probe
+        rl_prefilter_keep_band:   [low, high], inclusive band on success rate
+
+    Returns the filtered list (falls back to the full list if 0 tasks
+    survive the band, since training nothing is worse than training noise).
+    """
+    k_probe = int(config.get("rl_prefilter_k", 4))
+    keep_band = config.get("rl_prefilter_keep_band", [0.25, 0.75])
+    low, high = float(keep_band[0]), float(keep_band[1])
+    domain = config["domain"]
+    user_llm = config["user_llm"]
+    user_llm_args = config.get("user_llm_args", {"temperature": 1.0, "max_tokens": 16384})
+    agent_llm_args = config.get("agent_llm_args", {"temperature": 1.0, "max_tokens": 16384})
+    max_steps = config.get("max_orchestrator_steps", 30)
+
+    total = len(training_tasks)
+    print(
+        f"\n[rl-prefilter] probing {total} task(s) with k_probe={k_probe} "
+        f"on the loaded policy; keeping success_rate in [{low}, {high}]"
+    )
+
+    probe_groups = []
+    for task in training_tasks:
+        scenario = Tau2TaskScenario(task_id=task.id, domain=domain)
+        probe_groups.append(
+            art.TrajectoryGroup(
+                tau2_rollout(
+                    model,
+                    scenario,
+                    user_llm=user_llm,
+                    user_llm_args=user_llm_args,
+                    agent_llm_args=agent_llm_args,
+                    max_steps=max_steps,
+                )
+                for _ in range(k_probe)
+            )
+        )
+
+    finished = await art.gather_trajectory_groups(
+        probe_groups,
+        pbar_desc="rl-prefilter",
+        max_exceptions=k_probe * total,
+    )
+
+    kept_tasks = []
+    for task, group in zip(training_tasks, finished):
+        trajs = list(group.trajectories)
+        if not trajs:
+            continue
+        success_rate = sum(t.metrics.get("success", 0.0) for t in trajs) / len(trajs)
+        if low <= success_rate <= high:
+            kept_tasks.append(task)
+
+    kept = len(kept_tasks)
+    print(
+        f"[rl-prefilter] kept {kept}/{total} "
+        f"({(kept / total * 100 if total else 0):.1f}%) tasks in band"
+    )
+
+    if kept == 0:
+        print("[rl-prefilter] WARNING: 0 tasks in band; falling back to full set")
+        return list(training_tasks)
+    return kept_tasks
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Training mode
 # ─────────────────────────────────────────────────────────────────────
 
-async def run_training(model, backend, training_tasks, config, max_train_steps=None, validation_tasks=None):
-    """GRPO training loop with optional validation every N steps and checkpoint metadata artifact (art-demo pattern)."""
+async def run_training(model, backend, training_tasks, config, max_train_steps=None, validation_tasks=None, best_step_file=None):
+    """GRPO training loop with optional validation every N steps and checkpoint metadata artifact (art-demo pattern).
+
+    If `best_step_file` is provided and validation_tasks are non-empty, the step
+    that achieves the highest `val/reward` is recorded to that file (mirrors how
+    `.last_trained_model` is auto-discovered by the leaderboard scripts). The
+    `eval_rl` stage in run_pipeline.py then evaluates that step instead of
+    whichever step is currently `:latest`.
+    """
     if validation_tasks is None:
         validation_tasks = []
     domain = config["domain"]
@@ -187,6 +367,7 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
     use_shaped = config.get("shaped_reward", False)
     shaped_weights = config.get("shaped_reward_weights")
     validation_interval = config.get("validation_step_interval", 5)
+    early_stop_patience = int(config.get("early_stop_patience_evals") or 0)
 
     print(f"\n{'='*60}")
     print(f"TRAINING")
@@ -199,6 +380,9 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
     print(f"rollouts_per_group: {rollouts_per_group}")
     print(f"learning_rate    : {learning_rate}")
     print(f"shaped_reward    : {use_shaped}")
+    print(f"val_interval     : {validation_interval}")
+    if early_stop_patience > 0:
+        print(f"early_stop_patience: {early_stop_patience} validations without val/reward improvement")
     if max_train_steps:
         print(f"max_train_steps  : {max_train_steps}")
     print(f"{'='*60}\n")
@@ -214,7 +398,9 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
         initial_step=0,
     )
 
-
+    best_val_reward = float("-inf")
+    best_step = None
+    evals_without_improvement = 0
     steps_completed = 0
     for batch in training_iterator:
         if max_train_steps and steps_completed >= max_train_steps:
@@ -286,9 +472,16 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
         for attempt in range(max_retries):
             try:
                 async with asyncio.timeout(1800):
-                    # Note: KL-against-reference (`beta`/`kl_penalty_coef`) is not
-                    # exposed by the current ServerlessBackend.train() API, so we
-                    # don't pass it. config['kl_beta'] is currently unused.
+                    # NOTE: KL-against-reference is NOT applied. The serverless
+                    # ART backend's train() API does not expose `beta` /
+                    # `kl_penalty_coef`, so config['kl_beta'] is silently
+                    # ignored. When continuing from an SFT checkpoint, this
+                    # means there is no soft anchor preventing the policy from
+                    # drifting off the SFT distribution; the only available
+                    # mitigations are a smaller learning_rate and early-stop
+                    # on val/reward (both wired above). A one-time warning is
+                    # emitted in main() when continue_from_model is set so the
+                    # missing anchor is visible at run start.
                     result = await backend.train(
                         model,
                         finished_groups,
@@ -346,13 +539,51 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
                 val_reward = sum(t.reward for t in val_trajs) / len(val_trajs)
                 val_success = sum(t.metrics.get("success", 0.0) for t in val_trajs) / len(val_trajs)
                 val_tokens = sum(t.metadata.get("completion_tokens", 0) for t in val_trajs)
+                current_step = await model.get_step()
                 wandb.log({
                     "val/reward": val_reward,
                     "val/success": val_success,
                     "val/completion_tokens": val_tokens,
                     "val/num_tasks": len(val_trajs),
+                    "rl/current_step": current_step,
+                    "rl/current_val_reward": val_reward,
                 })
                 print(f"  val reward={val_reward:.3f}  success={val_success:.1%}")
+
+                if val_reward > best_val_reward:
+                    best_val_reward = val_reward
+                    best_step = current_step
+                    evals_without_improvement = 0
+                    if best_step_file is not None:
+                        try:
+                            best_step_file.write_text(str(best_step))
+                            print(
+                                f"  [best-step] new best val/reward={best_val_reward:.3f} "
+                                f"@ step {best_step}; wrote {best_step_file.name}"
+                            )
+                        except Exception as e:
+                            print(f"  [best-step] failed to write {best_step_file}: {e}")
+                    if wandb.run is not None:
+                        wandb.run.summary["rl/best_step"] = best_step
+                        wandb.run.summary["rl/best_val_reward"] = best_val_reward
+                    wandb.log({
+                        "rl/best_step": best_step,
+                        "rl/best_val_reward": best_val_reward,
+                    })
+                else:
+                    evals_without_improvement += 1
+                    if early_stop_patience > 0:
+                        print(
+                            f"  [early-stop] {evals_without_improvement}/{early_stop_patience} "
+                            f"validations without val/reward improvement (best={best_val_reward:.3f} "
+                            f"@ step {best_step})"
+                        )
+                        if evals_without_improvement >= early_stop_patience:
+                            print(
+                                f"\n[early-stop] no improvement for {early_stop_patience} "
+                                f"consecutive validations; stopping training."
+                            )
+                            break
 
         # Checkpoint metadata artifact (art-demo pattern; actual weights managed by ART backend)
         if config.get("save_checkpoint_artifact", True):
@@ -374,6 +605,20 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
             wandb.run.log_artifact(checkpoint_artifact)
 
     print(f"\nTraining complete. {steps_completed} steps finished.")
+    if best_step is not None:
+        msg = f"[rl] best step: {best_step}  best val/reward: {best_val_reward:.3f}"
+        if best_step_file is not None:
+            msg += f"  -> {best_step_file}"
+        print(msg)
+    elif validation_tasks and best_step_file is not None:
+        # No validation ever produced a real number; do not pin so eval_rl falls
+        # back to :latest. Remove a stale file from a previous run if present.
+        if best_step_file.exists():
+            try:
+                best_step_file.unlink()
+                print(f"[rl] no successful validation; removed stale {best_step_file.name}")
+            except Exception as e:
+                print(f"[rl] could not remove stale {best_step_file}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -449,11 +694,26 @@ async def main(args):
                 "the base LoRA. Verify the source collection actually has the "
                 "expected SFT checkpoint registered with the ART backend."
             )
+        # The serverless ART backend's train() does not accept `beta`/
+        # `kl_penalty_coef`, so config['kl_beta'] is silently ignored. Surface
+        # a one-time warning when continuing from SFT, since the missing KL
+        # anchor is the most likely cause of post-SFT regression. Mitigations:
+        # smaller learning_rate and early_stop_patience_evals (both supported).
+        if config.get("kl_beta") is not None:
+            print(
+                "WARNING: kl_beta is set in config but ServerlessBackend.train() "
+                "does not accept it. There is NO KL anchor to the SFT policy. "
+                "Rely on a small learning_rate and early_stop_patience_evals "
+                "to limit drift."
+            )
     else:
         print(
             f"Fresh collection '{model_name}'. GRPO starts from base LoRA "
             f"(step {starting_step})."
         )
+
+    if config.get("verify_checkpoint_digest_before_train", False) and continue_from:
+        verify_checkpoint_digest(model, starting_step)
 
     # So create_leaderboard.py can find this run's model without --trained-model-name
     (config_path.resolve().parent / ".last_trained_model").write_text(model_name)
@@ -475,6 +735,12 @@ async def main(args):
     validation_tasks = load_validation_tasks(config)
     if validation_tasks:
         print(f"Loaded {len(validation_tasks)} validation tasks")
+
+    if config.get("rl_prefilter_tasks", False) and training_tasks:
+        training_tasks = await prefilter_training_tasks(model, training_tasks, config)
+        print(f"RL training set size after prefilter: {len(training_tasks)} tasks")
+
+    best_step_file = config_path.resolve().parent / ".best_rl_step"
     await run_training(
         model,
         backend,
@@ -482,6 +748,7 @@ async def main(args):
         config,
         max_train_steps=args.max_train_steps,
         validation_tasks=validation_tasks,
+        best_step_file=best_step_file,
     )
 
     wandb.finish()
