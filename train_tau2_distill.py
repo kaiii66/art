@@ -324,21 +324,30 @@ async def main(args):
     random.seed(config.get("random_seed", 42))
 
     # ── W&B ──
+    # The pipeline writes `group: pipeline-<MMDDHHMM>` into the snapshot
+    # config so every wandb.run from this iteration (upload, sft, rl,
+    # leaderboard) collapses under one expandable group in the W&B UI.
+    # Ad-hoc invocations without the pipeline default to "manual".
     now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+    group = config.get("group") or "manual"
+    suffix = group.removeprefix("pipeline-") if group.startswith("pipeline-") else group
     run_name = (
-        f"distill-{config['domain']}-r{config.get('teacher_rollouts_per_task', 1)}"
+        f"sft-{suffix}-r{config.get('teacher_rollouts_per_task', 1)}"
         f"-ep{config.get('sft_epochs', 2)}"
-        f"-{now_pt.strftime('%Y%m%d-%H%M')}"
     )
     wandb.init(
         project=config["project"],
+        group=group,
         name=run_name,
         config=config,
         job_type=config.get("wandb_job_type", "distill"),
     )
 
     # ── ART model ──
-    model_name = f"{config['model_name']}-{now_pt.strftime('%Y%m%d-%H%M')}"
+    # Tie the SFT collection name to the iteration suffix (same string used in
+    # the snapshot dir name, W&B group, and leaderboard row labels) so it's
+    # trivially greppable across all four surfaces.
+    model_name = f"{config['model_name']}-{suffix}"
     model = art.TrainableModel(
         name=model_name,
         project=config["project"],

@@ -4,7 +4,10 @@
 # Override anything via CLI args (see train_tau2_distill.py --help).
 
 # ── Model ───────────────────────────────────────────────────────────
-project: "tau2-ART-distill-0419"
+# Must match train_config.yaml's `project` so SFT and RL runs land in the
+# same W&B project (and the `continue_from_model` artifact path resolves).
+project: "tau2-ART-autoresearch-telecom"
+# group: written by run_pipeline.py make_snapshot at runtime (e.g. pipeline-04241730)
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507"
 

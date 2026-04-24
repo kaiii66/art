@@ -1,0 +1,53 @@
+# ── Python bytecode / venv / build ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+.pdm-build/
+*.egg-info/
+build/
+dist/
+
+# ── Secrets / local env ───────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── ART / W&B / Weave local caches ────────────────────────────────────
+# These are produced as a side effect of every training/eval run. They
+# can be hundreds of MB to several GB and serve no purpose on GitHub
+# (everything important is already in the W&B project).
+.art/
+wandb/
+artifacts/
+weave/
+
+# ── Regenerated scenario JSONs (rebuilt by upload_dataset_to_wandb.py) ─
+# The canonical source is the W&B/Weave dataset; these local files are
+# scratch.
+training_scenarios.json
+validation_scenarios.json
+base_scenarios.json
+
+# ── Stray top-level state files written by the legacy non-pipeline path ─
+# The autoresearch loop uses pipeline_runs/<MMDDHHMM>/.last_trained_model
+# instead. Ignoring the top-level copy avoids cross-iteration cross-talk.
+/.last_trained_model
+/.sft_endpoint_step
+/.best_rl_step
+
+# ── Misc local logs / scratch ─────────────────────────────────────────
+tea_debug.log
+*.log.tmp
+.DS_Store
+
+# ── pipeline_runs/ ────────────────────────────────────────────────────
+# Pattern A wants per-iteration commits to track research progress, so
+# we KEEP these (they are all small text files):
+#   manifest.json
+#   train_config.yaml, train_distill_config.yaml  (snapshot copies)
+#   02-upload.log, 03-sft.log, 04-rl.log, 05-leaderboard.log
+#   .last_trained_model, .sft_endpoint_step, .best_rl_step
+# Nothing in pipeline_runs/<MMDDHHMM>/ needs to be ignored today.

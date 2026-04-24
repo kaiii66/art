@@ -637,30 +637,33 @@ async def main(args):
     random.seed(config.get("random_seed", 42))
 
     # ── Names (W&B run + ART model) ──
-    # The W&B run name is always uniquely timestamped so each training run is
-    # distinct in the W&B UI. The ART model.name (= W&B artifact collection)
+    # The W&B run name encodes the iteration suffix (same as the snapshot dir
+    # and group) plus the GRPO knobs, so cross-iteration comparison reduces to
+    # a regex on the run list. The ART model.name (= W&B artifact collection)
     # is either:
     #   - `continue_from_model`, when set, so GRPO continues that collection's
     #     checkpoint history (e.g. RL on top of an SFT collection's step 6 →
     #     produces step 7, 8, … in the same collection, all servable).
-    #   - `<model_name>-<timestamp>`, otherwise, for a fresh LoRA in a new
-    #     auto-named collection.
+    #   - `<model_name>-<suffix>`, otherwise, for a fresh LoRA in a new
+    #     auto-named collection that's still tied back to the iteration.
     lr_str = f"{config['learning_rate']:.0e}".replace("-0", "-")
     now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+    group = config.get("group") or "manual"
+    suffix = group.removeprefix("pipeline-") if group.startswith("pipeline-") else group
     run_name = (
-        f"train-{config['domain']}-g{config['groups_per_step']}"
+        f"rl-{suffix}-g{config['groups_per_step']}"
         f"-r{config['rollouts_per_group']}-lr{lr_str}"
-        f"-{now_pt.strftime('%Y%m%d-%H%M')}"
     )
     continue_from = config.get("continue_from_model")
     if continue_from:
         model_name = continue_from
     else:
-        model_name = f"{config['model_name']}-{now_pt.strftime('%Y%m%d-%H%M')}"
+        model_name = f"{config['model_name']}-{suffix}"
 
     # ── W&B (main training run) ──
     wandb.init(
         project=config["project"],
+        group=group,
         name=run_name,
         config=config,
         job_type=config.get("wandb_job_type", "train"),

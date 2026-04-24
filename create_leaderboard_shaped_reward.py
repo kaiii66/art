@@ -10,28 +10,46 @@ step penalty) than the binary leaderboard in create_leaderboard.py, so this scri
 publishes its own Weave Evaluation / Leaderboard objects (suffixed with "-shaped")
 to keep the two histories cleanly separated.
 
-Important caveats:
-  - task_reward.mean here is the CONTINUOUS shaped score, NOT comparable to the
-    binary task_reward in create_leaderboard.py or to published tau2-bench numbers.
-  - Use success.mean for objective comparison; task_reward.mean is for fine-grained
-    training-objective signal (especially useful early in training when binary
-    success is near zero).
-  - At num_trials=1, single-sample variance on ~40 validation tasks is roughly
-    +/- 7-8pp on the binary column.
+Idempotency / autoresearch design:
+  This script is the LAST stage in run_pipeline.py and is invoked once per
+  autoresearch iteration. We want a SINGLE leaderboard that grows with one
+  bundle of new rows per iteration:
+
+    iter 1 :  3 rows  (base-<model>, sft-<tag1>-stepN, rl-<tag1>-stepM)
+    iter 2 :  2 rows  (sft-<tag2>-stepN, rl-<tag2>-stepM)
+    iter 3 :  2 rows  (sft-<tag3>-stepN, rl-<tag3>-stepM)
+    ...
+
+  Mechanics:
+   1. weave.publish(Dataset|Evaluation|Leaderboard) is content-hash deduped, so
+      republishing the same scaffolding on every invocation is a no-op (just
+      retrieves the existing object). No CLI flag needed.
+   2. The base model row is identical across iterations, so we use a W&B
+      sentinel artifact (`tau2-leaderboard-shaped-base-evaluated:latest`) to
+      record that base has already been evaluated. If the sentinel exists,
+      we skip the base row this iteration (still emits sft + rl).
+   3. Each Tau2BaseModelWrapper gets a stable, descriptive `name` field so its
+      row in the Weave leaderboard is trivially traceable back to a W&B run:
+        - base : "base-<base_model_short>"           (e.g. base-Qwen3-30B-A3B-Instruct-2507)
+        - sft  : "sft-<iter_suffix>-step<N>"          (e.g. sft-04241342-step6)
+        - rl   : "rl-<iter_suffix>-step<N>" / "-alias-<X>" / "-latest"
 
 Usage:
-    python create_leaderboard_shaped_reward.py --models all --publish-leaderboard
+    python create_leaderboard_shaped_reward.py
+    python create_leaderboard_shaped_reward.py --models all
     python create_leaderboard_shaped_reward.py --models rl --trained-model-name <name>
     python create_leaderboard_shaped_reward.py --models base sft rl
+    python create_leaderboard_shaped_reward.py --reevaluate-base    # force base re-eval
 
 Model options: base, sft, rl, all
-  - base : raw `base_model` via tau2 LLMAgent
+  - base : raw `base_model` via tau2 LLMAgent (auto-skipped if sentinel exists)
   - sft  : trained collection pinned to .sft_endpoint_step (final SFT checkpoint)
   - rl   : trained collection pinned to .best_rl_step  (best val/reward RL step)
   - all  : base + sft + rl
 """
 import argparse
 import asyncio
+import os
 import yaml
 from pathlib import Path
 
@@ -53,6 +71,9 @@ from tau2_art_helpers import (
 )
 
 
+BASE_SENTINEL_ARTIFACT = "tau2-leaderboard-shaped-base-evaluated"
+
+
 def load_config(config_path: str) -> dict:
     path = Path(config_path)
     if not path.exists():
@@ -61,13 +82,66 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _short(model_id: str) -> str:
+    """Filesystem/URL-safe short tag for a HF model id (`Qwen/Qwen3-...` -> `Qwen3-...`)."""
+    return model_id.split("/")[-1]
+
+
+def _base_already_evaluated(project: str) -> bool:
+    """Probe the project for the base-evaluated sentinel artifact.
+
+    Returns True iff a previous iteration has logged
+    `<entity>/<project>/tau2-leaderboard-shaped-base-evaluated:latest`. This is
+    how we make the base row appear once and only once in the leaderboard,
+    regardless of how many iterations run_pipeline.py is invoked.
+    """
+    try:
+        api = wandb.Api()
+    except Exception as e:
+        print(f"  [base-sentinel] wandb.Api() failed ({type(e).__name__}: {e}); will evaluate base")
+        return False
+    entity = os.environ.get("WANDB_ENTITY") or api.default_entity
+    if not entity:
+        print("  [base-sentinel] no entity resolvable; will evaluate base")
+        return False
+    ref = f"{entity}/{project}/{BASE_SENTINEL_ARTIFACT}:latest"
+    try:
+        api.artifact(ref)
+        return True
+    except Exception:
+        return False
+
+
+def _log_base_sentinel(run, base_short: str, base_model: str) -> None:
+    """Persist a tiny marker artifact to indicate the base row is now in the eval."""
+    try:
+        art_obj = wandb.Artifact(
+            name=BASE_SENTINEL_ARTIFACT,
+            type="leaderboard-marker",
+            description=(
+                "Sentinel: the base model has been evaluated and added to the "
+                "shaped-reward Weave leaderboard. Subsequent autoresearch "
+                "iterations skip the base row to avoid duplicates."
+            ),
+            metadata={
+                "base_model": base_model,
+                "base_model_short": base_short,
+                "wandb_run_path": run.path if run is not None else None,
+            },
+        )
+        run.log_artifact(art_obj)
+        print(f"  [base-sentinel] logged {BASE_SENTINEL_ARTIFACT} so future iterations skip the base row")
+    except Exception as e:
+        print(f"  [base-sentinel] failed to log sentinel ({type(e).__name__}: {e}); base may be re-evaluated next iter")
+
+
 async def main(
     config_path: str = "train_config.yaml",
     models_to_eval: list = None,
     trained_model_name: str = None,
     trained_model_step: int = None,
     trained_model_alias: str = None,
-    publish_leaderboard: bool = False,
+    reevaluate_base: bool = False,
 ):
     if models_to_eval is None:
         models_to_eval = ["all"]
@@ -84,9 +158,16 @@ async def main(
     project = config["project"]
     domain = config["domain"]
     base_model = config["base_model"]
+    base_short = _short(base_model)
     agent_llm = config.get("agent_llm", f"wandb/{base_model}")
     user_llm = config["user_llm"]
     eval_weave = config.get("validation_weave_dataset") or f"tau2-{domain}-validation-scenarios"
+
+    # Iteration group: written by run_pipeline.make_snapshot. Falls back to
+    # "manual" for ad-hoc invocations outside the pipeline.
+    group = config.get("group") or "manual"
+    suffix = group.removeprefix("pipeline-") if group.startswith("pipeline-") else group
+
     trained_name = trained_model_name or config.get("leaderboard_trained_model_name")
     if not trained_name:
         last_model_file = Path(config_path).resolve().parent / ".last_trained_model"
@@ -142,7 +223,7 @@ async def main(
         shaped_reward_weights=config.get("shaped_reward_weights", {}),
     )
 
-    wc = weave.init(project)
+    weave.init(project)
 
     print("\nLoading validation dataset...")
     try:
@@ -151,12 +232,14 @@ async def main(
         raise RuntimeError(f"Could not load Weave dataset {eval_weave}: {e}") from e
     print(f"Loaded {len(original.rows)} rows from {eval_weave}")
 
+    # The four Weave scaffold objects (Dataset, Evaluation, Leaderboard cols,
+    # Leaderboard) are content-hash deduped by weave.publish, so it's safe
+    # (and idempotent) to (re)publish them every iteration. The first
+    # iteration creates them; every subsequent iteration just reuses the
+    # existing version.
     leaderboard_dataset_name = f"tau2-{domain}-validation-scenarios-leaderboard-shaped"
-    # Always rebuild leaderboard dataset from current validation data so we never
-    # use a stale cached copy (e.g. if the config was switched to a new domain).
     dataset = weave.Dataset(name=leaderboard_dataset_name, rows=original.rows)
     weave.publish(dataset)
-    print("Published leaderboard dataset from current validation data")
 
     scorers = [score_success, score_task_reward]
     eval_name = f"tau2-{domain}-evaluation-leaderboard-shaped"
@@ -167,14 +250,36 @@ async def main(
         trials=num_trials,
     )
     weave.publish(shared_evaluation)
-    print(f"Using evaluation with {num_trials} trial(s) per task (shaped reward enabled: {shaped_kwargs['use_shaped_reward']})")
+    print(
+        f"Using evaluation '{eval_name}' (trials={num_trials}, "
+        f"shaped_reward={shaped_kwargs['use_shaped_reward']})"
+    )
 
     run = wandb.init(
         project=project,
-        name="tau2-leaderboard-evaluation-shaped",
+        group=group,
+        name=f"leaderboard-{suffix}",
         config=config,
         job_type="leaderboard",
     )
+
+    # Decide whether to actually evaluate base. We evaluate only if (a) the
+    # caller asked for it AND (b) it hasn't been evaluated before in this
+    # project (sentinel artifact missing) OR they asked for --reevaluate-base.
+    base_eval_skipped = False
+    if should_eval_base:
+        if reevaluate_base:
+            print("\n[base] --reevaluate-base set; will re-evaluate base row")
+        elif _base_already_evaluated(project):
+            print(
+                "\n[base] sentinel artifact found; base model already in leaderboard "
+                "from a previous iteration. Skipping base row this iteration "
+                "(use --reevaluate-base to force)."
+            )
+            should_eval_base = False
+            base_eval_skipped = True
+        else:
+            print("\n[base] no sentinel found; this is the first iteration — evaluating base row")
 
     models = []
     model_names = []
@@ -182,8 +287,9 @@ async def main(
 
     if should_eval_base:
         print(f"\nLoading base model: {base_model} (agent_llm={agent_llm})")
+        base_row_name = f"base-{base_short}"
         base_wrapper = Tau2BaseModelWrapper(
-            name="qwen3-30b-baseline",
+            name=base_row_name,
             model=None,
             model_name=base_model,
             domain=domain,
@@ -196,7 +302,7 @@ async def main(
         )
         models.append(base_wrapper)
         model_names.append("base")
-        display_names.append(f"{base_model} (base)")
+        display_names.append(base_row_name)
 
     # Both "sft" and "rl" rows evaluate the SAME trained collection at
     # different LoRA checkpoint steps, so we register the TrainableModel once
@@ -240,12 +346,17 @@ async def main(
                         "This is normal for ad-hoc runs without the pipeline."
                     )
                 else:
-                    sft_label = f"SFT @ step {sft_pinned_step}"
-                    sft_display = f"{base_model} ({sft_label})"
+                    # Stable, descriptive name: ties this leaderboard row back
+                    # to its W&B run group (`pipeline-<suffix>`) and to its
+                    # exact LoRA checkpoint step. Identical naming convention
+                    # used in `name=` on the Weave Model and `display_name=`
+                    # on the eval call so the two surfaces agree.
+                    sft_row_name = f"sft-{suffix}-step{sft_pinned_step}"
                     print(f"Pinning sft row to checkpoint :step{sft_pinned_step}")
                     sft_wrapper = Tau2BaseModelWrapper(
+                        name=sft_row_name,
                         model=trained_model,
-                        model_name=sft_display,
+                        model_name=sft_row_name,
                         domain=domain,
                         user_llm=user_llm,
                         user_llm_args=user_llm_args,
@@ -256,30 +367,31 @@ async def main(
                     )
                     models.append(sft_wrapper)
                     model_names.append("sft")
-                    display_names.append(sft_display)
+                    display_names.append(sft_row_name)
 
             if should_eval_rl:
                 if rl_pinned_alias is not None:
-                    rl_label = f"GRPO @ alias :{rl_pinned_alias}"
+                    rl_row_name = f"rl-{suffix}-alias-{rl_pinned_alias}"
                     print(
                         f"Pinning rl row to artifact alias :{rl_pinned_alias} "
                         f"(collection latest is step {latest_step})"
                     )
                 elif rl_pinned_step is not None:
-                    rl_label = f"GRPO @ step {rl_pinned_step}"
+                    rl_row_name = f"rl-{suffix}-step{rl_pinned_step}"
                     if rl_pinned_step != latest_step:
-                        rl_label += f" (best, latest={latest_step})"
-                    print(
-                        f"Pinning rl row to checkpoint :step{rl_pinned_step} "
-                        f"(collection latest is step {latest_step})"
-                    )
+                        print(
+                            f"Pinning rl row to checkpoint :step{rl_pinned_step} "
+                            f"(best, collection latest is step {latest_step})"
+                        )
+                    else:
+                        print(f"Pinning rl row to checkpoint :step{rl_pinned_step}")
                 else:
-                    rl_label = f"GRPO @ step {latest_step}"
+                    rl_row_name = f"rl-{suffix}-step{latest_step}-latest"
                     print(f"No rl pin found; rl row defaults to :latest (step {latest_step})")
-                rl_display = f"{base_model} ({rl_label})"
                 rl_wrapper = Tau2BaseModelWrapper(
+                    name=rl_row_name,
                     model=trained_model,
-                    model_name=rl_display,
+                    model_name=rl_row_name,
                     domain=domain,
                     user_llm=user_llm,
                     user_llm_args=user_llm_args,
@@ -291,7 +403,7 @@ async def main(
                 )
                 models.append(rl_wrapper)
                 model_names.append("rl")
-                display_names.append(rl_display)
+                display_names.append(rl_row_name)
         except Exception as e:
             print(f"Could not load trained model {trained_name}: {e}")
     elif (should_eval_sft or should_eval_rl) and not trained_name:
@@ -302,12 +414,15 @@ async def main(
         )
 
     if not models:
-        print("\nNo models to evaluate.")
+        print("\nNo models to evaluate (base may have been auto-skipped).")
+        if base_eval_skipped:
+            print("(base sentinel exists; sft/rl rows still need a trained model.)")
         run.finish()
         return
 
     completed_rows: list[str] = []
     failed_rows: list[tuple[str, str]] = []
+    base_completed = False
     for idx, (model, name, display_name) in enumerate(zip(models, model_names, display_names), 1):
         print(f"\nEvaluating {idx}/{len(models)}: {display_name}")
         try:
@@ -326,6 +441,13 @@ async def main(
             continue
         print(f"Completed: {display_name}")
         completed_rows.append(display_name)
+        if name == "base":
+            base_completed = True
+
+    # Drop the sentinel ONLY after a successful base eval, so a base failure
+    # doesn't lock future iterations out of retrying it.
+    if base_completed:
+        _log_base_sentinel(run, base_short, base_model)
 
     print(f"\nRow status: {len(completed_rows)} completed, {len(failed_rows)} failed")
     for d in completed_rows:
@@ -333,6 +455,9 @@ async def main(
     for d, err in failed_rows:
         print(f"  failed: {d} ({err})")
 
+    # Always (re)publish the leaderboard. Weave content-hash dedup means this
+    # is a no-op when the spec hasn't changed; it ensures the leaderboard
+    # exists on first iteration without needing a special CLI flag.
     try:
         eval_ref_uri = get_ref(shared_evaluation).uri()
         lb_columns = [
@@ -352,13 +477,10 @@ async def main(
             description=f"tau2-bench {domain} held-out validation: binary success (headline) + shaped task_reward (diagnostic).",
             columns=lb_columns,
         )
-        if publish_leaderboard:
-            ref = weave.publish(leaderboard_spec)
-            print(f"\nLeaderboard published: {ref}")
-        else:
-            print("\nLeaderboard spec created but not published (results will appear in existing leaderboard).")
+        ref = weave.publish(leaderboard_spec)
+        print(f"\nLeaderboard ref (idempotent): {ref}")
     except Exception as e:
-        print(f"Failed to create leaderboard: {e}")
+        print(f"Failed to publish leaderboard spec: {e}")
         import traceback
         traceback.print_exc()
 
@@ -376,7 +498,9 @@ if __name__ == "__main__":
         help=(
             "Models to evaluate (default: all). 'sft' uses .sft_endpoint_step, "
             "'rl' uses .best_rl_step (or :latest fallback). 'trained' is a "
-            "deprecated alias for 'rl'."
+            "deprecated alias for 'rl'. The 'base' row is auto-skipped after "
+            "the first successful evaluation in this project (use --reevaluate-base "
+            "to force)."
         ),
     )
     parser.add_argument("--trained-model-name", type=str, default=None, help="Trained model name (overrides config)")
@@ -402,9 +526,13 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--publish-leaderboard",
+        "--reevaluate-base",
         action="store_true",
-        help="Publish/overwrite leaderboard definition (use only for first time or to update structure)",
+        help=(
+            "Force re-evaluation of the base model row, even if a previous "
+            "iteration already logged it. Useful when changing user_llm or "
+            "agent_llm_args in a way that should reflect on the base baseline."
+        ),
     )
     args = parser.parse_args()
     asyncio.run(main(
@@ -413,5 +541,5 @@ if __name__ == "__main__":
         trained_model_name=args.trained_model_name,
         trained_model_step=args.trained_model_step,
         trained_model_alias=args.trained_model_alias,
-        publish_leaderboard=args.publish_leaderboard,
+        reevaluate_base=args.reevaluate_base,
     ))

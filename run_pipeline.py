@@ -2,10 +2,15 @@
 
 Runs in order:
   1. snapshot      copy train_config.yaml + train_distill_config.yaml into
-                   pipeline_runs/<MMDDHHMM>/ and rewrite the `project` field
-                   in both copies. Source-of-truth YAMLs in the repo root are
-                   never mutated.
+                   pipeline_runs/<MMDDHHMM>/ and write a `group: pipeline-<MMDDHHMM>`
+                   field into both copies. Source-of-truth YAMLs in the repo root
+                   are never mutated. The W&B `project` field is NOT rewritten —
+                   every iteration logs to the same stable project (e.g.
+                   `tau2-ART-autoresearch-telecom`) so the Weave leaderboard can
+                   grow across iterations. Iteration isolation is via run-group.
   2. upload        upload_dataset_to_wandb.py against the snapshot config
+                   (idempotent: auto-skips if the dataset artifacts and Weave
+                   datasets already exist; pass --force to re-upload).
   3. sft           train_tau2_distill.py against the snapshot config
                    -> writes pipeline_runs/<tag>/.last_trained_model
   4. patch         (implicit, runs right before `rl`) read
@@ -19,23 +24,22 @@ Runs in order:
                    final step) and, on val improvement, .best_rl_step.
   5. rl            train_tau2.py against the snapshot config
   6. leaderboard   create_leaderboard_shaped_reward.py --models all
-                   (auto-discovers .sft_endpoint_step + .best_rl_step from
-                   the snapshot dir; produces three rows in one Weave eval:
-                   base, sft @ sft_endpoint_step, rl @ best_rl_step).
+                   (auto-discovers .sft_endpoint_step + .best_rl_step from the
+                   snapshot dir; first iteration produces three rows in one
+                   Weave eval — base, sft, rl; subsequent iterations append two
+                   rows — sft, rl — into the same shared evaluation).
 
 Usage:
   uv run python run_pipeline.py
   uv run python run_pipeline.py --skip upload sft
   uv run python run_pipeline.py --dry-run
   uv run python run_pipeline.py --project-suffix 04202030
-  uv run python run_pipeline.py --no-publish-leaderboard
   uv run python run_pipeline.py --resume pipeline_runs/04201530
 """
 from __future__ import annotations
 
 import argparse
 import json
-import re
 import shutil
 import subprocess
 import sys
@@ -80,23 +84,26 @@ def yaml_dump(data, path: Path) -> None:
         _pyyaml.safe_dump(data, f, sort_keys=False)
 
 
-def derive_project_name(current: str, suffix: str) -> str:
-    """Strip a trailing -NNNN(NNNN) date stamp, append -<suffix>."""
-    stripped = re.sub(r"-\d{4,8}$", "", current)
-    return f"{stripped}-{suffix}"
-
-
-def make_snapshot(suffix: str, resume_dir: Path | None) -> tuple[Path, str]:
-    """Create (or reuse) snapshot dir; return (snapshot_dir, project_name)."""
+def make_snapshot(suffix: str, resume_dir: Path | None) -> tuple[Path, str, str]:
+    """Create (or reuse) snapshot dir; return (snapshot_dir, project, group)."""
     if resume_dir is not None:
         snapshot = resume_dir.resolve()
         if not snapshot.exists():
             raise FileNotFoundError(f"--resume dir does not exist: {snapshot}")
         train_cfg = yaml_load(snapshot / "train_config.yaml")
         project = train_cfg["project"]
+        group = train_cfg.get("group") or f"pipeline-{snapshot.name}"
+        if "group" not in train_cfg:
+            # Backfill: older snapshots may not have a group field; persist one.
+            train_cfg["group"] = group
+            yaml_dump(train_cfg, snapshot / "train_config.yaml")
+            distill = yaml_load(snapshot / "train_distill_config.yaml")
+            distill["group"] = group
+            yaml_dump(distill, snapshot / "train_distill_config.yaml")
         print(f"[snapshot] resuming existing snapshot: {snapshot}")
         print(f"[snapshot] project (from snapshot)   : {project}")
-        return snapshot, project
+        print(f"[snapshot] group   (from snapshot)   : {group}")
+        return snapshot, project, group
 
     snapshot = RUNS_DIR / suffix
     snapshot.mkdir(parents=True, exist_ok=True)
@@ -104,10 +111,21 @@ def make_snapshot(suffix: str, resume_dir: Path | None) -> tuple[Path, str]:
     src_train = yaml_load(SRC_TRAIN_CONFIG)
     src_distill = yaml_load(SRC_DISTILL_CONFIG)
 
-    new_project = derive_project_name(src_train["project"], suffix)
+    # Pinned project (no rolling): every autoresearch iteration writes to the
+    # same W&B project so the Weave leaderboard accumulates rows across runs.
+    project = src_train["project"]
+    if src_distill["project"] != project:
+        raise ValueError(
+            f"train_config.yaml project ({project!r}) and "
+            f"train_distill_config.yaml project ({src_distill['project']!r}) "
+            f"must match so SFT/RL/leaderboard share artifacts and Weave entities."
+        )
 
-    src_train["project"] = new_project
-    src_distill["project"] = new_project
+    # Per-iteration group: collapses every wandb.init() in this pipeline run
+    # (upload, sft, rl, leaderboard) into one expandable bundle in the project.
+    group = f"pipeline-{suffix}"
+    src_train["group"] = group
+    src_distill["group"] = group
 
     yaml_dump(src_train, snapshot / "train_config.yaml")
     yaml_dump(src_distill, snapshot / "train_distill_config.yaml")
@@ -115,7 +133,8 @@ def make_snapshot(suffix: str, resume_dir: Path | None) -> tuple[Path, str]:
     manifest = {
         "created_at": datetime.now(ZoneInfo("America/Los_Angeles")).isoformat(),
         "suffix": suffix,
-        "project": new_project,
+        "project": project,
+        "group": group,
         "source_train_config": str(SRC_TRAIN_CONFIG),
         "source_distill_config": str(SRC_DISTILL_CONFIG),
         "ruamel_used": _HAS_RUAMEL,
@@ -123,14 +142,15 @@ def make_snapshot(suffix: str, resume_dir: Path | None) -> tuple[Path, str]:
     (snapshot / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     print(f"[snapshot] dir     : {snapshot}")
-    print(f"[snapshot] project : {new_project}")
+    print(f"[snapshot] project : {project}")
+    print(f"[snapshot] group   : {group}")
     if not _HAS_RUAMEL:
         print(
             "[snapshot] WARNING: ruamel.yaml not installed; comments are stripped "
             "from snapshot copies (originals at repo root are untouched). "
             "`uv add ruamel.yaml` to preserve them."
         )
-    return snapshot, new_project
+    return snapshot, project, group
 
 
 def run_stage(
@@ -214,11 +234,6 @@ def main() -> int:
         help="Override the MMDDHHMM suffix (default: now in America/Los_Angeles)",
     )
     parser.add_argument(
-        "--no-publish-leaderboard",
-        action="store_true",
-        help="Don't pass --publish-leaderboard to the leaderboard stage",
-    )
-    parser.add_argument(
         "--resume",
         type=Path,
         default=None,
@@ -227,7 +242,7 @@ def main() -> int:
     args = parser.parse_args()
 
     suffix = args.project_suffix or datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%m%d%H%M")
-    snapshot, project = make_snapshot(suffix, args.resume)
+    snapshot, project, group = make_snapshot(suffix, args.resume)
     train_cfg = snapshot / "train_config.yaml"
     distill_cfg = snapshot / "train_distill_config.yaml"
 
@@ -236,19 +251,20 @@ def main() -> int:
     print("=== pipeline plan ===")
     print(f"    snapshot         : {snapshot}")
     print(f"    project          : {project}")
+    print(f"    group            : {group}")
     print(f"    train_config     : {train_cfg}")
     print(f"    distill_config   : {distill_cfg}")
     print(f"    stages enabled   : {[s for s in ALL_STAGES if s not in skip]}")
     print(f"    stages skipped   : {sorted(skip)}")
-    print(f"    publish_lb (leaderboard): {not args.no_publish_leaderboard}")
 
+    # No --publish-leaderboard flag any more: create_leaderboard_shaped_reward.py
+    # auto-creates the Weave Dataset/Evaluation/Leaderboard on first invocation
+    # and reuses + appends to them on every subsequent invocation.
     leaderboard_cmd = [
         "uv", "run", "python", "create_leaderboard_shaped_reward.py",
         "--config", str(train_cfg),
         "--models", "all",
     ]
-    if not args.no_publish_leaderboard:
-        leaderboard_cmd.append("--publish-leaderboard")
 
     stage_cmds: dict[str, list[str]] = {
         "upload": ["uv", "run", "python", "upload_dataset_to_wandb.py", "--config", str(train_cfg)],
@@ -276,6 +292,7 @@ def main() -> int:
     print("=== done ===")
     print(f"    snapshot : {snapshot}")
     print(f"    project  : {project}")
+    print(f"    group    : {group}")
     if (snapshot / ".last_trained_model").exists():
         print(f"    sft model: {(snapshot / '.last_trained_model').read_text().strip()}")
     if (snapshot / ".sft_endpoint_step").exists():
