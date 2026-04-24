@@ -1,5 +1,5 @@
 # ART GRPO training configuration for tau2-bench
-# Override any value via CLI args (e.g. --num-tasks 5 --max-train-steps 2)
+# Override any value via CLI args (e.g. --num-tasks 5)
 
 # ── Model ────────────────────────────────────────────────────────────
 # project: "tau2-ART-proj-0419"
@@ -37,10 +37,14 @@ domain: "telecom"
 # Sampling args MUST set max_tokens — without it the W&B Inference default
 # is far too small for tool-using agents and rollouts truncate to ~30-500
 # tokens, producing reward 0 on every group and starving GRPO of signal.
-# Temperature 1.0 keeps exploration high so rollouts in a group differ.
+# 0.7: keep RL rollouts closer in style to the strong SFT policy (kwt/04231441
+# showed 70-tok RL practice vs ~1600-tok SFT/leaderboard — short give-ups
+# from temp 1.0). Temp 0.3 on teacher in 04231209 (bad SFT) is not the same
+# as here; we keep teacher 0.7 in distill. If num_groups_trainable
+# collapses again, try 0.8–0.9 instead of jumping back to 1.0.
 agent_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
 agent_llm_args:
-  temperature: 1.0
+  temperature: 0.7
   max_tokens: 16384
 # user_llm: "wandb/Qwen/Qwen3-235B-A22B-Instruct-2507" #as of 031226 there is issue with this model
 user_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -55,13 +59,21 @@ user_llm_args:
 # This is the cheapest fix for the "~99% of GRPO groups had zero variance"
 # pathology observed in run kwt/tau2-ART-distill-04211613/3kxgwhmp.
 groups_per_step: 4
-num_epochs: 1
-rollouts_per_group: 8
-# Lowered 1e-5 -> 5e-6: with no SFT KL anchor available in
-# ServerlessBackend.train(), a smaller LR is the only knob to limit drift
-# from the post-SFT policy.
-learning_rate: 5.0e-6
-max_orchestrator_steps: 30
+# Bumped 1 -> 3: re-use the small set of trainable groups (post-prefilter)
+# multiple times so GRPO sees more update steps from the same data.
+num_epochs: 3
+# Bumped 8 -> 16 after kwt/tau2-ART-distill-04221704 showed train/success=0
+# over 720 trajectories. More rollouts per group raises the chance that at
+# least one rollout actually solves the task, giving GRPO a positive
+# example to climb toward instead of optimizing partial credit only.
+rollouts_per_group: 16
+# Lowered 5e-6 -> 1e-6 -> 5e-7: with no SFT KL anchor available in
+# ServerlessBackend.train(), LR is the only knob to limit drift from the
+# post-SFT policy. With zero successful training rollouts in 04221704 we
+# halve LR again so RL stays even closer to SFT until positive examples
+# appear (either organically or via larger rollouts_per_group).
+learning_rate: 5.0e-7
+max_orchestrator_steps: 100
 # NOTE: kl_beta is currently NOT honored. The serverless ART backend's
 # train() API does not expose `beta`/`kl_penalty_coef`, so this value is
 # logged in the config snapshot but never wired into the loss. Kept here
@@ -74,7 +86,9 @@ kl_beta: 0.04
 validation_step_interval: 2
 # Stop training if val/reward has not improved for this many consecutive
 # validations. None / 0 disables. Used in train_tau2.py run_training.
-early_stop_patience_evals: 2
+# Bumped 2 -> 3: 04231441 had best val/reward at step 27 then noise/drift; one
+# extra "flat" val before stop avoids bailing on a single bad draw.
+early_stop_patience_evals: 3
 save_checkpoint_artifact: true
 
 # ── RL pre-filter (curriculum) ─────────────────────────────────────
@@ -85,7 +99,11 @@ save_checkpoint_artifact: true
 # Set rl_prefilter_tasks: false to disable.
 rl_prefilter_tasks: true
 rl_prefilter_k: 4
-rl_prefilter_keep_band: [0.25, 0.75]
+# Widened [0.25, 0.75] -> [0.10, 0.90] after observing only 7/55 trainable
+# groups in run kwt/tau2-ART-distill-04221526. Including tasks with weak
+# (10-25%) or strong (75-90%) probe signal still gives non-trivial GRPO
+# advantage and grows the learnable training set.
+rl_prefilter_keep_band: [0.10, 0.90]
 
 # ── Pre-GRPO checkpoint digest sanity check ────────────────────────
 # When true (and continue_from_model is set), before the first GRPO step
@@ -122,8 +140,12 @@ shaped_reward_weights:
 random_seed: 42
 
 # ── Leaderboard evaluation ──────────────────────────────────────────
+# Bumped num_trials 1 -> 3 after observing SFT leaderboard score swing
+# 17.5% -> 27.5% -> 7.5% across runs 04221526/04221704/04230729 on the
+# same 40-task test set. Three trials per (task, model) pair lets us
+# estimate variance and make RL-vs-SFT comparisons more trustworthy.
 leaderboard:
-  num_trials: 1
+  num_trials: 3
   max_steps: 100
   agent_llm_args:
     temperature: 0.0

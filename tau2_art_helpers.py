@@ -270,6 +270,7 @@ def compute_shaped_reward(
     domain: str,
     weights: Optional[dict] = None,
     max_steps: int = 30,
+    binary_reward: Optional[float] = None,
 ) -> tuple[float, dict]:
     """Compute a continuous shaped reward from tau2 sub-evaluators.
 
@@ -279,6 +280,11 @@ def compute_shaped_reward(
 
     Components with no evaluator data (None) are excluded and their weights
     redistributed proportionally so a perfect rollout always scores 1.0.
+
+    `binary_reward`, when supplied, is the unshaped 0/1 task reward from
+    `evaluate_simulation`. It is used to gate the termination bonus on
+    actual task success (preventing the "give up immediately and collect
+    the bonus" reward-hacking failure mode).
 
     Returns (shaped_reward, sub_metrics) where sub_metrics has per-component
     scores for observability.
@@ -317,7 +323,8 @@ def compute_shaped_reward(
         TerminationReason.AGENT_STOP,
         TerminationReason.USER_STOP,
     }
-    termination_bonus = 1.0 if proper_termination else 0.0
+    task_solved = binary_reward is not None and abs(binary_reward - 1.0) < 1e-6
+    termination_bonus = 1.0 if (proper_termination and task_solved) else 0.0
 
     total_tool_calls = 0
     tool_not_found = 0
@@ -330,8 +337,8 @@ def compute_shaped_reward(
                     tool_not_found += 1
                 else:
                     tool_other_errors += 1
-    tool_accuracy = (1.0 - tool_not_found / total_tool_calls) if total_tool_calls > 0 else 1.0
-    tool_arg_accuracy = (1.0 - tool_other_errors / total_tool_calls) if total_tool_calls > 0 else 1.0
+    tool_accuracy = (1.0 - tool_not_found / total_tool_calls) if total_tool_calls > 0 else None
+    tool_arg_accuracy = (1.0 - tool_other_errors / total_tool_calls) if total_tool_calls > 0 else None
 
     num_agent_steps = sum(1 for msg in simulation.messages if isinstance(msg, AssistantMessage))
     step_fraction = num_agent_steps / max_steps if max_steps > 0 else 0.0
@@ -370,8 +377,8 @@ def compute_shaped_reward(
         "communicate_fraction": communicate_fraction if communicate_fraction is not None else -1.0,
         "nl_fraction": nl_fraction if nl_fraction is not None else -1.0,
         "termination_bonus": termination_bonus,
-        "tool_accuracy": tool_accuracy,
-        "tool_arg_accuracy": tool_arg_accuracy,
+        "tool_accuracy": tool_accuracy if tool_accuracy is not None else -1.0,
+        "tool_arg_accuracy": tool_arg_accuracy if tool_arg_accuracy is not None else -1.0,
         "step_penalty": step_penalty,
         "shaped_reward": shaped_reward,
     }
@@ -704,6 +711,7 @@ async def tau2_rollout(
             simulation, task, task_scenario.domain,
             weights=shaped_reward_weights,
             max_steps=max_steps,
+            binary_reward=binary_reward,
         )
         reward = shaped_reward
         metrics.update(sub_metrics)

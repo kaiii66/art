@@ -338,7 +338,7 @@ async def prefilter_training_tasks(model, training_tasks, config):
 # Training mode
 # ─────────────────────────────────────────────────────────────────────
 
-async def run_training(model, backend, training_tasks, config, max_train_steps=None, validation_tasks=None, best_step_file=None):
+async def run_training(model, backend, training_tasks, config, validation_tasks=None, best_step_file=None):
     """GRPO training loop with optional validation every N steps and checkpoint metadata artifact (art-demo pattern).
 
     If `best_step_file` is provided and validation_tasks are non-empty, the step
@@ -383,8 +383,6 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
     print(f"val_interval     : {validation_interval}")
     if early_stop_patience > 0:
         print(f"early_stop_patience: {early_stop_patience} validations without val/reward improvement")
-    if max_train_steps:
-        print(f"max_train_steps  : {max_train_steps}")
     print(f"{'='*60}\n")
 
     training_scenarios = [
@@ -403,10 +401,6 @@ async def run_training(model, backend, training_tasks, config, max_train_steps=N
     evals_without_improvement = 0
     steps_completed = 0
     for batch in training_iterator:
-        if max_train_steps and steps_completed >= max_train_steps:
-            print(f"\nReached max_train_steps={max_train_steps}, stopping.")
-            break
-
         print(f"\n--- Step {batch.step} (epoch {batch.epoch}, epoch_step {batch.epoch_step}) ---")
 
         train_groups = []
@@ -718,6 +712,13 @@ async def main(args):
     # So create_leaderboard.py can find this run's model without --trained-model-name
     (config_path.resolve().parent / ".last_trained_model").write_text(model_name)
 
+    # Pin point for the leaderboard's "sft" row: when RL continues from an SFT
+    # collection, `starting_step` IS the final SFT step (the collection's head
+    # at the moment RL begins). The leaderboard auto-discovers this file next
+    # to the snapshot config to score the SFT checkpoint as a separate row.
+    if continue_from:
+        (config_path.resolve().parent / ".sft_endpoint_step").write_text(str(starting_step))
+
     domain = config["domain"]
     task_split = config.get("task_split_name", "train")
     num_tasks = config.get("_num_tasks")
@@ -746,7 +747,6 @@ async def main(args):
         backend,
         training_tasks,
         config,
-        max_train_steps=args.max_train_steps,
         validation_tasks=validation_tasks,
         best_step_file=best_step_file,
     )
@@ -758,7 +758,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ART GRPO training for tau2-bench")
     parser.add_argument("--config", default="train_config.yaml", help="Path to YAML config")
     parser.add_argument("--num-tasks", type=int, default=None, help="Limit number of training tasks")
-    parser.add_argument("--max-train-steps", type=int, default=None, help="Stop after N training steps")
     parser.add_argument("--groups-per-step", type=int, default=None, help="Override groups_per_step")
     parser.add_argument("--rollouts-per-group", type=int, default=None, help="Override rollouts_per_group")
     args = parser.parse_args()

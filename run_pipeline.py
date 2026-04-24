@@ -8,19 +8,20 @@ Runs in order:
   2. upload        upload_dataset_to_wandb.py against the snapshot config
   3. sft           train_tau2_distill.py against the snapshot config
                    -> writes pipeline_runs/<tag>/.last_trained_model
-  4. eval_sft      create_leaderboard_shaped_reward.py --models all
-                   --publish-leaderboard (publishes the leaderboard once for
-                   the new project, evaluates baseline + SFT)
-  5. patch         read pipeline_runs/<tag>/.last_trained_model and write it
-                   to the snapshot train_config.yaml's `continue_from_model`
-                   field. This is what wires SFT -> RL: train_tau2.py reads
+  4. patch         (implicit, runs right before `rl`) read
+                   pipeline_runs/<tag>/.last_trained_model and write it to the
+                   snapshot train_config.yaml's `continue_from_model` field.
+                   This is what wires SFT -> RL: train_tau2.py reads
                    continue_from_model, instantiates the same ART collection,
                    and `model.get_step()` returns the SFT's last step so RL
-                   appends step N+1, N+2, ... in the same collection.
-  6. rl            train_tau2.py against the snapshot config
-  7. eval_rl       create_leaderboard_shaped_reward.py --models trained
-                   (the leaderboard is already published; this just adds the
-                   RL row via Weave's accumulation)
+                   appends step N+1, N+2, ... in the same collection. RL also
+                   writes pipeline_runs/<tag>/.sft_endpoint_step (= the SFT
+                   final step) and, on val improvement, .best_rl_step.
+  5. rl            train_tau2.py against the snapshot config
+  6. leaderboard   create_leaderboard_shaped_reward.py --models all
+                   (auto-discovers .sft_endpoint_step + .best_rl_step from
+                   the snapshot dir; produces three rows in one Weave eval:
+                   base, sft @ sft_endpoint_step, rl @ best_rl_step).
 
 Usage:
   uv run python run_pipeline.py
@@ -47,7 +48,7 @@ SRC_TRAIN_CONFIG = REPO_ROOT / "train_config.yaml"
 SRC_DISTILL_CONFIG = REPO_ROOT / "train_distill_config.yaml"
 RUNS_DIR = REPO_ROOT / "pipeline_runs"
 
-ALL_STAGES = ["upload", "sft", "eval_sft", "rl", "eval_rl"]
+ALL_STAGES = ["upload", "sft", "rl", "leaderboard"]
 
 try:
     from ruamel.yaml import YAML  # type: ignore[import-not-found]
@@ -215,7 +216,7 @@ def main() -> int:
     parser.add_argument(
         "--no-publish-leaderboard",
         action="store_true",
-        help="Don't pass --publish-leaderboard to the eval_sft stage",
+        help="Don't pass --publish-leaderboard to the leaderboard stage",
     )
     parser.add_argument(
         "--resume",
@@ -239,32 +240,27 @@ def main() -> int:
     print(f"    distill_config   : {distill_cfg}")
     print(f"    stages enabled   : {[s for s in ALL_STAGES if s not in skip]}")
     print(f"    stages skipped   : {sorted(skip)}")
-    print(f"    publish_lb (eval_sft): {not args.no_publish_leaderboard}")
+    print(f"    publish_lb (leaderboard): {not args.no_publish_leaderboard}")
 
-    eval_sft_cmd = [
+    leaderboard_cmd = [
         "uv", "run", "python", "create_leaderboard_shaped_reward.py",
         "--config", str(train_cfg),
         "--models", "all",
     ]
     if not args.no_publish_leaderboard:
-        eval_sft_cmd.append("--publish-leaderboard")
+        leaderboard_cmd.append("--publish-leaderboard")
 
     stage_cmds: dict[str, list[str]] = {
         "upload": ["uv", "run", "python", "upload_dataset_to_wandb.py", "--config", str(train_cfg)],
         "sft": ["uv", "run", "python", "train_tau2_distill.py", "--config", str(distill_cfg)],
-        "eval_sft": eval_sft_cmd,
         "rl": ["uv", "run", "python", "train_tau2.py", "--config", str(train_cfg)],
-        "eval_rl": [
-            "uv", "run", "python", "create_leaderboard_shaped_reward.py",
-            "--config", str(train_cfg),
-            "--models", "trained",
-        ],
+        "leaderboard": leaderboard_cmd,
     }
 
     for idx, stage in enumerate(ALL_STAGES, start=2):
         if stage == "rl" and "rl" not in skip:
             print()
-            print("=== stage: patch (between eval_sft and rl) ===")
+            print("=== stage: patch (between sft and rl) ===")
             if args.dry_run:
                 print("    (dry-run; would read .last_trained_model and patch continue_from_model)")
             else:
@@ -282,7 +278,11 @@ def main() -> int:
     print(f"    project  : {project}")
     if (snapshot / ".last_trained_model").exists():
         print(f"    sft model: {(snapshot / '.last_trained_model').read_text().strip()}")
-    print(f"    re-run eval_rl alone: uv run python run_pipeline.py --resume {snapshot} --skip upload sft eval_sft rl")
+    if (snapshot / ".sft_endpoint_step").exists():
+        print(f"    sft step : {(snapshot / '.sft_endpoint_step').read_text().strip()}")
+    if (snapshot / ".best_rl_step").exists():
+        print(f"    best rl  : step {(snapshot / '.best_rl_step').read_text().strip()}")
+    print(f"    re-run leaderboard alone: uv run python run_pipeline.py --resume {snapshot} --skip upload sft rl")
     return 0
 
 

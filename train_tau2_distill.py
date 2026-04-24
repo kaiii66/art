@@ -310,8 +310,6 @@ async def main(args):
         config = yaml.safe_load(f)
 
     # CLI overrides
-    if args.num_training_tasks is not None:
-        config["num_training_tasks"] = args.num_training_tasks
     if args.num_validation_tasks is not None:
         config["num_validation_tasks"] = args.num_validation_tasks
     if args.sft_epochs is not None:
@@ -328,7 +326,7 @@ async def main(args):
     # ── W&B ──
     now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
     run_name = (
-        f"distill-{config['domain']}-tasks{config.get('num_training_tasks', '?')}"
+        f"distill-{config['domain']}-r{config.get('teacher_rollouts_per_task', 1)}"
         f"-ep{config.get('sft_epochs', 2)}"
         f"-{now_pt.strftime('%Y%m%d-%H%M')}"
     )
@@ -353,16 +351,18 @@ async def main(args):
     (config_path.resolve().parent / ".last_trained_model").write_text(model_name)
 
     # ── Tasks ──
+    # SFT always uses the full train split (`num_tasks=None`). Use --num-tasks
+    # to bound the size on the CLI for ad-hoc smoke tests.
     domain = config["domain"]
-    num_training = config.get("num_training_tasks")
     num_validation = config.get("num_validation_tasks")
+    cli_num_tasks = getattr(args, "num_tasks", None)
 
-    training_tasks = load_training_tasks_from_artifact(config, num_tasks=num_training)
+    training_tasks = load_training_tasks_from_artifact(config, num_tasks=cli_num_tasks)
     if training_tasks is None:
         training_tasks = get_tasks(
             task_set_name=domain,
             task_split_name="train",
-            num_tasks=num_training,
+            num_tasks=cli_num_tasks,
         )
         print(f"Loaded {len(training_tasks)} training tasks from {domain}/train")
     else:
@@ -408,8 +408,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ART SFT-distillation for tau2-bench")
     parser.add_argument("--config", default="train_distill_config.yaml",
                         help="Path to YAML config")
-    parser.add_argument("--num-training-tasks", type=int, default=None,
-                        help="Override number of training tasks for teacher rollouts")
+    parser.add_argument("--num-tasks", type=int, default=None,
+                        help="Cap training tasks for teacher rollouts (default: full train split)")
     parser.add_argument("--num-validation-tasks", type=int, default=None,
                         help="Override number of validation tasks")
     parser.add_argument("--sft-epochs", type=int, default=None,

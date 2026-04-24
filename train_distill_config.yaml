@@ -13,6 +13,9 @@ domain: "telecom"
 
 # ── LLM routing (litellm provider prefix) ──────────────────────────
 # Both teacher and user simulator use W&B Inference (WANDB_API_KEY from env).
+# Teacher temperature kept at 0.7 for trajectory diversity. Lowering it to
+# 0.3 in run kwt/tau2-ART-distill-04231209 produced redundant rollouts and
+# collapsed SFT leaderboard score to 0.83% (vs 7.5-27.5% with temp 0.7).
 teacher_llm: "wandb/MiniMaxAI/MiniMax-M2.5"
 teacher_llm_args:
   temperature: 0.7
@@ -22,10 +25,15 @@ user_llm_args:
   temperature: 1.0
 
 # ── Teacher data generation ────────────────────────────────────────
-num_training_tasks: 8
-teacher_rollouts_per_task: 1
+# Always uses the full train split from the loaded artifact (74 telecom tasks
+# at the time of writing). To bound size for a smoke test, pass
+# `--num-tasks N` on the train_tau2_distill.py CLI (kept for ad-hoc use).
+teacher_rollouts_per_task: 3
 num_validation_tasks: 4
-max_orchestrator_steps: 30
+# Bumped 30 -> 100 to match leaderboard.max_steps in train_config.yaml and
+# tau2's own default. Avoids train/eval mismatch where tasks needing 31-100
+# turns to succeed were silently dropped from the SFT training set.
+max_orchestrator_steps: 100
 filter_successful_only: true
 teacher_concurrency: 8
 # When true, first run 1 probe rollout per task to find solvable tasks, then
