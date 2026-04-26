@@ -31,6 +31,44 @@ Schema for each iteration entry:
 (no iterations recorded yet; the first run of the autoresearch loop will
 append below this line)
 
+## Iteration 3  —  2026-04-25 02:38 UTC
+- snapshot      : pipeline_runs/04241938
+- wandb_group   : pipeline-04241938
+- decision      : KEPT
+- sft_success   : 1.000
+- rl_best_step  : 43
+- rl_best_reward: 0.225
+- delta_vs_best : +0.025 (vs iter 2 best 0.200)
+- diff:
+    diff --git a/train_config.yaml b/train_config.yaml
+    --- a/train_config.yaml
+    +++ b/train_config.yaml
+    @@ -66,7 +66,7 @@
+     # Bumped 1 -> 3: re-use the small set of trainable groups (post-prefilter)
+     # multiple times so GRPO sees more update steps from the same data.
+    -num_epochs: 3
+    +num_epochs: 1
+- hypothesis (this iter):
+    Since RL reward peaked at step 41 (epoch 0) in iter 2 then regressed through
+    epoch 1, reducing num_epochs from 3 to 1 should lock in the epoch-0 gains before
+    the model overfits the 40-task training distribution.
+- mcp diagnosis:
+    With num_epochs=1 the RL prefilter retained 51/74 tasks (68.9%, up from 40/74 in
+    iter 2), reflecting a stronger SFT seed from the same recipe but different stochastic
+    teacher rollouts. Val/reward showed an early dip (0.125→0.050→0.075, triggering
+    early-stop 1/3 then 2/3 before counter reset at 0.150) then a clean monotonic climb:
+    0.150→0.175→0.225. Best val/reward=0.225 at step 43; epoch ended naturally when the
+    next validation also returned 0.225 (early-stop 1/3). No regression as seen in iter 2's
+    second epoch—removing epochs 2-3 prevented the oscillation. SFT validation oscillated
+    (best 1.000, final 1.000) across 9 validation chunks.
+- hypothesis (next iter):
+    The early val/reward dip (0.125→0.050 at steps 33-35) before recovery suggests initial
+    GRPO updates push the policy away from the SFT optimum; halving learning_rate from 5e-7
+    to 2e-7 should smooth early optimization and potentially reach a higher peak without the
+    initial regression.
+
+---
+
 ## Iteration 2  —  2026-04-25 01:50 UTC
 - snapshot      : pipeline_runs/04241419
 - wandb_group   : pipeline-04241419
