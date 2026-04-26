@@ -31,6 +31,40 @@ Schema for each iteration entry:
 (no iterations recorded yet; the first run of the autoresearch loop will
 append below this line)
 
+## Iteration 5  —  2026-04-26 07:08 UTC
+- snapshot      : pipeline_runs/04260008
+- wandb_group   : pipeline-04260008
+- decision      : DISCARDED
+- sft_success   : 0.750
+- rl_best_step  : 41
+- rl_best_reward: 0.225
+- delta_vs_best : +0.000 (ties iter 3 best 0.225 — not strictly greater, DISCARD)
+- diff:
+    diff --git a/train_config.yaml b/train_config.yaml
+    --- a/train_config.yaml
+    +++ b/train_config.yaml
+    @@ -73,7 +73,7 @@
+    -rollouts_per_group: 16
+    +rollouts_per_group: 24
+- hypothesis (this iter):
+    With LR confirmed optimal at 5e-7, increasing rollouts_per_group from 16 to 24
+    gives each GRPO step a larger, lower-variance advantage estimate, producing
+    cleaner gradient signal and potentially pushing past the 0.225 ceiling.
+- mcp diagnosis:
+    Rollouts_per_group=24 matched but did not exceed iter 3's best: final val/reward
+    reached exactly 0.225 at step 41 (last step of the single epoch). RL prefilter
+    retained only 44/74 tasks (59.5%, down from 51/74 in iter 3), suggesting a weaker
+    SFT seed this run (best SFT val/success=0.750 vs 1.000 in iter 3). The trajectory
+    was erratic early — 0.150→0.150(1/3)→0.175→0.175(1/3)→0.125(2/3) — before
+    recovering to 0.225 on the final validation. The larger batch gave no net lift:
+    the extra statistical power per step was offset by fewer trainable tasks. It is
+    unclear whether the SFT weakness or the rollout change was the limiting factor.
+    DISCARDED — reverted rollouts_per_group to 16; BEST remains iter 3 (0.225).
+- hypothesis (next iter):
+    N/A — iteration budget exhausted
+
+---
+
 ## Iteration 4  —  2026-04-26 03:03 UTC
 - snapshot      : pipeline_runs/04252003
 - wandb_group   : pipeline-04252003
