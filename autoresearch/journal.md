@@ -31,6 +31,42 @@ Schema for each iteration entry:
 (no iterations recorded yet; the first run of the autoresearch loop will
 append below this line)
 
+## Iteration 4  —  2026-04-26 03:03 UTC
+- snapshot      : pipeline_runs/04252003
+- wandb_group   : pipeline-04252003
+- decision      : DISCARDED
+- sft_success   : 1.000
+- rl_best_step  : 43
+- rl_best_reward: 0.125
+- delta_vs_best : -0.100 (vs iter 3 best 0.225)
+- diff:
+    diff --git a/train_config.yaml b/train_config.yaml
+    --- a/train_config.yaml
+    +++ b/train_config.yaml
+    @@ -80,7 +80,7 @@
+    -learning_rate: 5.0e-7
+    +learning_rate: 2.0e-7
+- hypothesis (this iter):
+    Halving learning_rate from 5e-7 to 2e-7 should smooth the early val/reward dip
+    (0.125→0.050 in iter 3) by reducing GRPO step size and keep the policy closer
+    to the SFT manifold throughout training.
+- mcp diagnosis:
+    Lower LR badly hurt RL training: prefilter retained only 46/74 tasks (62.2%, down
+    from 51/74 in iter 3), and val/reward peaked at just 0.125 (step 43) vs 0.225 in
+    iter 3. The trajectory showed two phases: an initial 0.075 peak that collapsed to
+    0.000/0.025 before recovering to 0.125, then decay to 0.100/0.075 as the epoch
+    ended. The smaller gradient steps kept the policy so close to the SFT point that
+    GRPO lacked enough push to reach higher-reward territory; the early dip from iter 3
+    was smoothed but at the cost of the eventual peak. SFT training was stable (best
+    val/success=1.000, 10 validation chunks), so the problem is purely in the RL phase.
+    DISCARDED — reverted learning_rate to 5.0e-7.
+- hypothesis (next iter):
+    With LR confirmed at 5e-7 as optimal, try increasing rollouts_per_group from 16 to
+    24 to give each GRPO step a larger, lower-variance advantage estimate, which should
+    produce cleaner gradient signal and potentially push past the 0.225 ceiling.
+
+---
+
 ## Iteration 3  —  2026-04-25 02:38 UTC
 - snapshot      : pipeline_runs/04241938
 - wandb_group   : pipeline-04241938
