@@ -68,6 +68,40 @@ append below this line)
 
 ---
 
+## Iteration 7  —  2026-04-27 18:48 UTC
+- snapshot      : pipeline_runs/04270927
+- wandb_group   : pipeline-04270927
+- decision      : DISCARDED
+- sft_success   : 0.000
+- rl_best_step  : 31
+- rl_best_reward: 0.075
+- delta_vs_best : -0.150 (vs iter 3 best 0.225)
+- diff:
+    diff --git a/train_config.yaml b/train_config.yaml
+    --- a/train_config.yaml
+    +++ b/train_config.yaml
+    @@ -96,7 +96,7 @@
+    -early_stop_patience_evals: 3
+    +early_stop_patience_evals: 5
+- hypothesis (this iter):
+    Increasing early_stop_patience_evals from 3 to 5 should allow RL to recover from
+    mid-training dips (as seen in iter 5's 0.125→0.225 trajectory) before stopping,
+    potentially reaching a higher peak reward.
+- mcp diagnosis:
+    Another bad-SFT draw: final SFT val/success=0.000 (model oscillated 1.000→0.000→
+    0.250→0.000 across 40 validation chunks), so RL prefilter retained only 5/74 tasks
+    (6.8%) — identical to the worst iter 1 outcome. With near-zero GRPO signal from
+    just 5 trainable tasks, only one RL validation fired (val/reward=0.075 at step 31).
+    early_stop_patience_evals played no role: the RL collapsed before the patience
+    logic could matter. The bottleneck remains SFT stochasticity, not RL patience.
+    DISCARDED — reverted early_stop_patience_evals to 3.
+- hypothesis (next iter):
+    Increase groups_per_step from 4 to 8 in train_config.yaml: more groups per step
+    covers a broader slice of trainable tasks per epoch, giving RL denser coverage
+    of the prefilter pool and potentially a more stable reward signal per step.
+
+---
+
 ## Iteration 5  —  2026-04-26 07:08 UTC
 - snapshot      : pipeline_runs/04260008
 - wandb_group   : pipeline-04260008
