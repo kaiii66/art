@@ -31,6 +31,43 @@ Schema for each iteration entry:
 (no iterations recorded yet; the first run of the autoresearch loop will
 append below this line)
 
+## Iteration 6  —  2026-04-27 04:16 UTC
+- snapshot      : pipeline_runs/04262116
+- wandb_group   : pipeline-04262116
+- decision      : DISCARDED
+- sft_success   : 0.750
+- rl_best_step  : 22
+- rl_best_reward: 0.150
+- delta_vs_best : -0.075 (vs iter 3 best 0.225)
+- diff:
+    diff --git a/train_distill_config.yaml b/train_distill_config.yaml
+    --- a/train_distill_config.yaml
+    +++ b/train_distill_config.yaml
+    @@ -47,7 +47,7 @@
+    -sft_epochs: 2
+    +sft_epochs: 1
+- hypothesis (this iter):
+    Reducing sft_epochs from 2 to 1 should stop the SFT before epoch 2 can oscillate
+    the val/success backward, producing a more consistently strong SFT checkpoint and
+    a larger RL prefilter pool — mirroring the num_epochs 3→1 fix that worked for RL.
+- mcp diagnosis:
+    sft_epochs=1 cut SFT training to half the gradient steps: only 5 validation chunks
+    (vs 9 with 2 epochs), best SFT val/success=0.750 (vs 1.000 in iter 3), and RL
+    prefilter fell from 51/74 to 40/74 tasks (54.1%). The weaker SFT starting point
+    propagated directly into RL: best val/reward peaked at only 0.150 (step 22) with
+    a shallow trajectory (0.050→0.125→0.125(1/3)→0.150→0.125(1/3)). The epoch-2
+    oscillation was not actually the problem in prior runs — the variation in SFT
+    val/success was stochastic, and epoch 2 provided net-positive gradient steps when
+    the run converged well (as in iter 3). Removing it reliably weakened the student.
+    DISCARDED — reverted sft_epochs to 2.
+- hypothesis (next iter):
+    Increase early_stop_patience_evals from 3 to 5: iter 5 showed val/reward 0.125→0.225
+    in consecutive steps right at early-stop 2/3, suggesting genuine mid-dip recovery
+    was being cut off — 2 extra patience slots should allow the RL to complete such
+    recoveries.
+
+---
+
 ## Iteration 5  —  2026-04-26 07:08 UTC
 - snapshot      : pipeline_runs/04260008
 - wandb_group   : pipeline-04260008
