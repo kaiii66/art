@@ -56,6 +56,9 @@ def _resolve_artifact_names(config: dict, domain: str) -> dict:
         "train": config.get(
             "training_dataset_artifact", f"tau2-{domain}-training-scenarios"
         ).split(":")[0],
+        "dev": config.get(
+            "dev_dataset_artifact", f"tau2-{domain}-dev-scenarios"
+        ).split(":")[0],
         "validation": config.get(
             "validation_dataset_artifact", f"tau2-{domain}-validation-scenarios"
         ).split(":")[0],
@@ -68,6 +71,9 @@ def _resolve_weave_names(config: dict, domain: str) -> dict:
     return {
         "train": config.get(
             "training_weave_dataset", f"tau2-{domain}-training-scenarios"
+        ),
+        "dev": config.get(
+            "dev_weave_dataset", f"tau2-{domain}-dev-scenarios"
         ),
         "validation": config.get(
             "validation_weave_dataset", f"tau2-{domain}-validation-scenarios"
@@ -157,7 +163,7 @@ def main(
         weave_ok, weave_missing = _all_weave_datasets_present(project, weave_names)
         if artifacts_ok and weave_ok:
             print(
-                f"[upload] All 3 W&B artifacts and 3 Weave datasets already exist in "
+                f"[upload] All 4 W&B artifacts and 4 Weave datasets already exist in "
                 f"project '{project}'. Skipping upload (no wandb.run created).\n"
                 f"         artifacts: {sorted(artifact_names.values())}\n"
                 f"         weave    : {sorted(weave_names.values())}\n"
@@ -171,10 +177,20 @@ def main(
                 f"         missing weave    : {weave_missing}"
             )
 
-    # Full splits from domain data (train/test/base); base can be limited by --num-base-tasks
+    # Full splits from domain data (train/dev/test/base); base can be limited by --num-base-tasks
+    # The "dev" split is sourced from tau2's `small` task split (disjoint from
+    # both train and test) and is what the train scripts use for mid-training
+    # validation. The "validation" dataset stays bound to the `test` split and
+    # is reserved exclusively for the leaderboard scripts so the published
+    # number is a true held-out estimate.
     training_tasks = get_tasks(
         task_set_name=domain,
         task_split_name="train",
+        num_tasks=None,
+    )
+    dev_tasks = get_tasks(
+        task_set_name=domain,
+        task_split_name="small",
         num_tasks=None,
     )
     validation_tasks = get_tasks(
@@ -189,11 +205,13 @@ def main(
     )
 
     training_data = [{"task_id": t.id, "domain": domain} for t in training_tasks]
+    dev_data = [{"task_id": t.id, "domain": domain} for t in dev_tasks]
     validation_data = [{"task_id": t.id, "domain": domain} for t in validation_tasks]
     base_data = [{"task_id": t.id, "domain": domain} for t in base_tasks]
 
     print(
         f"Domain: {domain} | Training: {len(training_tasks)} (train) | "
+        f"Dev: {len(dev_tasks)} (small) | "
         f"Validation: {len(validation_tasks)} (test) | Base: {len(base_tasks)}"
     )
 
@@ -211,9 +229,11 @@ def main(
     weave.init(project)
 
     run.summary["training_scenarios_count"] = len(training_tasks)
+    run.summary["dev_scenarios_count"] = len(dev_tasks)
     run.summary["validation_scenarios_count"] = len(validation_tasks)
     run.summary["base_scenarios_count"] = len(base_tasks)
     run.summary["training_split"] = "train"
+    run.summary["dev_split"] = "small"
     run.summary["validation_split"] = "test"
     run.summary["domain"] = domain
 
@@ -242,7 +262,36 @@ def main(
     )
     weave.publish(training_weave_dataset)
 
-    # ── Validation ──
+    # ── Dev (mid-training validation; sourced from `small`) ──
+    # Disjoint from both train and test. Used by train_tau2.py and
+    # train_tau2_distill.py for SFT chunk selection and RL early-stopping
+    # so the test split below stays untouched until the leaderboard runs.
+    dev_file = "dev_scenarios.json"
+    with open(dev_file, "w") as f:
+        json.dump(dev_data, f, indent=2)
+
+    dev_art_name = artifact_names["dev"]
+    dev_artifact = wandb.Artifact(
+        name=dev_art_name,
+        type="dataset",
+        description=f"Dev (mid-training val) scenarios for tau2-bench {domain} ({len(dev_tasks)} tasks from split small)",
+        metadata={
+            "split": "small",
+            "role": "dev",
+            "num_scenarios": len(dev_tasks),
+            "domain": domain,
+        },
+    )
+    dev_artifact.add_file(dev_file)
+    run.log_artifact(dev_artifact)
+
+    dev_weave_dataset = weave.Dataset(
+        name=weave_names["dev"],
+        rows=dev_data,
+    )
+    weave.publish(dev_weave_dataset)
+
+    # ── Validation (held-out test set; reserved for the leaderboard) ──
     validation_file = "validation_scenarios.json"
     with open(validation_file, "w") as f:
         json.dump(validation_data, f, indent=2)
@@ -293,7 +342,8 @@ def main(
     weave.publish(base_weave_dataset)
 
     print(
-        f"Uploaded training ({len(training_tasks)}) + validation ({len(validation_tasks)}) + base ({len(base_tasks)}) "
+        f"Uploaded training ({len(training_tasks)}) + dev ({len(dev_tasks)}) + "
+        f"validation ({len(validation_tasks)}) + base ({len(base_tasks)}) "
         f"to W&B and Weave"
     )
     run.finish()

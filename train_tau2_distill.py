@@ -177,14 +177,18 @@ async def run_student_validation(model, validation_tasks, config, step):
 
     Returns the mean val/success across the validation tasks (or None when
     validation could not run / produced no trajectories). The caller in
-    `run_distillation_sft` uses this to track the best chunk so the SFT
-    collection can be trimmed to the best-validating checkpoint at the end.
+    `run_distillation_sft` uses this to track the best chunk (recorded as
+    .best_sft_step for the leaderboard pin) and to drive early-stop.
     """
     if not validation_tasks:
         return None
     domain = config["domain"]
     user_llm = config["user_llm"]
     user_llm_args = config.get("user_llm_args", {"temperature": 1.0})
+    val_agent_llm_args = config.get(
+        "val_agent_llm_args",
+        config.get("agent_llm_args", {"temperature": 0.0, "max_tokens": 16384}),
+    )
     max_steps = config.get("max_orchestrator_steps", 30)
 
     print(f"\n  [validation] running student on {len(validation_tasks)} tasks...")
@@ -198,6 +202,7 @@ async def run_student_validation(model, validation_tasks, config, step):
                     scenario,
                     user_llm=user_llm,
                     user_llm_args=user_llm_args,
+                    agent_llm_args=val_agent_llm_args,
                     max_steps=max_steps,
                 )
             ])
@@ -230,18 +235,24 @@ async def run_student_validation(model, validation_tasks, config, step):
 # ─────────────────────────────────────────────────────────────────────
 
 async def run_distillation_sft(model, trajectories, validation_tasks, config):
-    """Run chunked SFT distillation, then trim the collection to the best chunk.
+    """Run chunked SFT distillation with dev-validation early-stop.
 
     Returns the ART step number (in the model's W&B collection) of the best
-    chunk by val/success, or None if no validation produced a usable signal.
-    Caller (`main`) records this to `.best_sft_step` for diagnostics.
+    chunk by val/success on dev, or None if no validation produced a usable
+    signal. Caller (`main`) records this to `.best_sft_step`, which the
+    leaderboard prefers over `.sft_endpoint_step` when pinning the "sft" row.
 
-    After all chunks finish, the SFT collection is trimmed in-place so that
-    only the best-validating checkpoint remains. This makes
-    `model.get_step()` return `best_step` for downstream consumers
-    (`train_tau2.py` for the next RL stage and `create_leaderboard*.py`),
-    so RL trains from and the leaderboard evaluates the same checkpoint
-    instead of whatever the final chunk happened to be.
+    Non-destructive: the collection is NOT trimmed. Every SFT chunk's
+    checkpoint stays available in W&B for inspection / ad-hoc re-evaluation.
+    Instead, `sft_early_stop_patience` (config) bounds how far past the best
+    dev step we keep training, so the collection's `:latest` -- which is
+    what RL continues from -- is at most `patience` chunks past `best_step`.
+
+    Hand-off summary (after this returns, in main):
+        .best_sft_step      = best_step                   (leaderboard pin)
+        .sft_endpoint_step  = collection :latest at RL start
+                            = best_step + slack, slack <= patience
+                            (written by train_tau2.py; leaderboard fallback)
     """
     epochs = config.get("sft_epochs", 2)
     batch_size = config.get("sft_batch_size", 2)
@@ -250,6 +261,7 @@ async def run_distillation_sft(model, trajectories, validation_tasks, config):
     schedule_type = config.get("sft_schedule_type", "cosine")
     chunk_size = config.get("sft_chunk_size", 2)
     val_every = config.get("validation_every_n_chunks", 1)
+    sft_early_stop_patience = int(config.get("sft_early_stop_patience") or 0)
 
     print(f"\n{'='*60}")
     print(f"Phase B: SFT distillation")
@@ -260,6 +272,8 @@ async def run_distillation_sft(model, trajectories, validation_tasks, config):
     print(f"Schedule         : {schedule_type} (warmup_ratio={warmup_ratio})")
     print(f"Chunk size       : {chunk_size} batches per train_sft call")
     print(f"Validation cadence: every {val_every} chunk(s)")
+    if sft_early_stop_patience > 0:
+        print(f"Early-stop patience: {sft_early_stop_patience} validations without val/success improvement")
     print(f"{'='*60}")
 
     # Run baseline validation BEFORE any SFT so we can see baseline-vs-trained
@@ -290,6 +304,8 @@ async def run_distillation_sft(model, trajectories, validation_tasks, config):
     # and a smaller divergence from the SFT seed for downstream RL).
     best_val_success = float("-inf")
     best_step: int | None = None
+    evals_without_improvement = 0
+    early_stopped = False
 
     chunks_done = 0
     last_validated_step = None
@@ -322,95 +338,62 @@ async def run_distillation_sft(model, trajectories, validation_tasks, config):
                 model, validation_tasks, config, step=chunk.step,
             )
             last_validated_step = chunk.step
-            if val_success is not None and val_success > best_val_success:
-                # Use ART's own step counter (not chunk.step, which is the
-                # internal sft batch counter) since the leaderboard pin and
-                # train_tau2.py's continue-from logic both key off
-                # model.get_step().
-                try:
-                    candidate_step = await model.get_step()
-                except Exception as e:
-                    print(f"  [best-chunk] could not read model.get_step(): {e}")
-                    continue
-                best_val_success = val_success
-                best_step = candidate_step
-                print(
-                    f"  [best-chunk] new best val/success={best_val_success:.3f} "
-                    f"@ ART step {best_step}"
-                )
-                if wandb.run is not None:
-                    wandb.run.summary["sft/best_step"] = best_step
-                    wandb.run.summary["sft/best_val_success"] = best_val_success
-                wandb.log({
-                    "sft/best_step": best_step,
-                    "sft/best_val_success": best_val_success,
-                })
+            if val_success is not None:
+                if val_success > best_val_success:
+                    # Use ART's own step counter (not chunk.step, which is the
+                    # internal sft batch counter) since the leaderboard pin and
+                    # train_tau2.py's continue-from logic both key off
+                    # model.get_step().
+                    try:
+                        candidate_step = await model.get_step()
+                    except Exception as e:
+                        print(f"  [best-chunk] could not read model.get_step(): {e}")
+                        continue
+                    best_val_success = val_success
+                    best_step = candidate_step
+                    evals_without_improvement = 0
+                    print(
+                        f"  [best-chunk] new best val/success={best_val_success:.3f} "
+                        f"@ ART step {best_step}"
+                    )
+                    if wandb.run is not None:
+                        wandb.run.summary["sft/best_step"] = best_step
+                        wandb.run.summary["sft/best_val_success"] = best_val_success
+                    wandb.log({
+                        "sft/best_step": best_step,
+                        "sft/best_val_success": best_val_success,
+                    })
+                else:
+                    evals_without_improvement += 1
+                    if sft_early_stop_patience > 0:
+                        print(
+                            f"  [early-stop] {evals_without_improvement}/{sft_early_stop_patience} "
+                            f"validations without val/success improvement "
+                            f"(best={best_val_success:.3f} @ step {best_step})"
+                        )
+                        if evals_without_improvement >= sft_early_stop_patience:
+                            print(
+                                f"\n[early-stop] no improvement for "
+                                f"{sft_early_stop_patience} consecutive validations; "
+                                f"stopping SFT after chunk {i+1}/{total_chunks}."
+                            )
+                            early_stopped = True
+                            break
 
-    print(f"\nSFT distillation complete. {chunks_done}/{total_chunks} chunks finished.")
-
-    # Trim the W&B collection so that only `best_step` remains. This makes
-    # the downstream `model.get_step()` calls in train_tau2.py and the
-    # leaderboard's `:step{N}` pin both resolve to the best checkpoint.
+    completion_label = "early-stopped" if early_stopped else "complete"
+    print(f"\nSFT distillation {completion_label}. {chunks_done}/{total_chunks} chunks finished.")
     if best_step is None:
         print(
             "  [best-chunk] no validation produced a usable val/success; "
-            "skipping collection trim. Downstream RL will start from the "
-            "final SFT chunk (legacy behavior)."
-        )
-        return None
-
-    try:
-        current_latest = await model.get_step()
-    except Exception as e:
-        print(f"  [best-chunk] could not read model.get_step() before trim: {e}")
-        return best_step
-
-    if current_latest == best_step:
-        print(
-            f"  [best-chunk] best step ({best_step}) is already the collection's "
-            f"latest; no trim needed."
-        )
-        return best_step
-
-    backend = model.backend()
-    delete_fn = getattr(backend, "_delete_checkpoint_files", None)
-    if delete_fn is None:
-        print(
-            "  [best-chunk] backend does not expose _delete_checkpoint_files; "
-            f"cannot trim. RL will use latest step={current_latest}, leaderboard "
-            f"will pin to step={current_latest}, but best step was {best_step}."
-        )
-        return best_step
-
-    print(
-        f"  [best-chunk] trimming SFT collection: keeping only :step{best_step} "
-        f"(was :step{current_latest})"
-    )
-    try:
-        await delete_fn(model, [best_step])
-    except Exception as e:
-        print(
-            f"  [best-chunk] trim FAILED ({type(e).__name__}: {e}). RL will use "
-            f"latest step={current_latest}; leaderboard will follow. Best step "
-            f"was {best_step} -- see .best_sft_step for the intended pin."
-        )
-        return best_step
-
-    try:
-        new_latest = await model.get_step()
-    except Exception as e:
-        print(f"  [best-chunk] could not verify post-trim model.get_step(): {e}")
-        return best_step
-    if new_latest != best_step:
-        print(
-            f"  [best-chunk] WARNING trim ran but new latest is {new_latest}, "
-            f"not best_step={best_step}. Downstream RL/leaderboard will use "
-            f"{new_latest}."
+            "downstream RL will start from the final SFT chunk and the "
+            "leaderboard sft row will pin to .sft_endpoint_step (legacy fallback)."
         )
     else:
         print(
-            f"  [best-chunk] trimmed collection: latest is now :step{best_step} "
-            f"(val/success={best_val_success:.3f})"
+            f"  [best-chunk] best dev val/success={best_val_success:.3f} @ "
+            f"ART step {best_step}; main() will write this to .best_sft_step "
+            f"as the leaderboard sft pin. Collection :latest is preserved as-is "
+            f"(no trim) so RL can continue from it."
         )
     return best_step
 
@@ -529,11 +512,11 @@ async def main(args):
         model, teacher_trajectories, validation_tasks, config
     )
 
-    # Diagnostics record. The leaderboard does not need to read this because
-    # `.sft_endpoint_step` (written by train_tau2.py from model.get_step())
-    # will already equal best_step after the post-SFT collection trim. Keeping
-    # this around lets us detect mismatches when the trim silently no-oped
-    # (e.g. private API removed in a future ART release).
+    # Authoritative leaderboard pin for the "sft" row. The collection is NOT
+    # trimmed (no _delete_checkpoint_files), so :latest at RL start may sit
+    # `sft_early_stop_patience` chunks past best_step. The leaderboard prefers
+    # this file over `.sft_endpoint_step` so the sft row evaluates the true
+    # best-on-dev checkpoint regardless of where SFT actually stopped.
     if best_step is not None:
         try:
             (config_path.resolve().parent / ".best_sft_step").write_text(str(best_step))

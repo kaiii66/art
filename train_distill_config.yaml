@@ -6,7 +6,7 @@
 # ── Model ───────────────────────────────────────────────────────────
 # Must match train_config.yaml's `project` so SFT and RL runs land in the
 # same W&B project (and the `continue_from_model` artifact path resolves).
-project: "tau2-ART-autoresearch-telecom"
+project: "tau2-ART-autoresearch-telecom-0428"
 # group: written by run_pipeline.py make_snapshot at runtime (e.g. pipeline-04241730)
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507"
@@ -26,16 +26,15 @@ teacher_llm_args:
 user_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
 user_llm_args:
   temperature: 1.0
+val_agent_llm_args:
+  temperature: 0.0
+  max_tokens: 16384
 
 # ── Teacher data generation ────────────────────────────────────────
 # Always uses the full train split from the loaded artifact (74 telecom tasks
 # at the time of writing). To bound size for a smoke test, pass
 # `--num-tasks N` on the train_tau2_distill.py CLI (kept for ad-hoc use).
 teacher_rollouts_per_task: 5
-# Bumped 4 -> 16 so the SFT validation signal is reliable enough to pick a
-# best-chunk checkpoint. With n=4, a single task flip swings val/success by
-# 0.25, which made the picker too noisy to distinguish 0.50 from 0.75.
-num_validation_tasks: 16
 # Bumped 30 -> 100 to match leaderboard.max_steps in train_config.yaml and
 # tau2's own default. Avoids train/eval mismatch where tasks needing 31-100
 # turns to succeed were silently dropped from the SFT training set.
@@ -56,9 +55,23 @@ sft_warmup_ratio: 0.1
 sft_schedule_type: "cosine"
 sft_chunk_size: 8          # batches per train_sft call (=> validation cadence)
 validation_every_n_chunks: 4
+# Stop SFT chunked training when val/success on dev hasn't improved for this
+# many consecutive validations. Mirrors train_config.yaml's
+# early_stop_patience_evals for RL. Without this, SFT runs every chunk and RL
+# would continue from the final chunk (potentially well past the best
+# dev-validated step). 0 / null disables and SFT runs every chunk.
+sft_early_stop_patience: 2
 
 # ── Datasets (W&B artifacts produced by upload_dataset_to_wandb.py) ─
 training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
+# Dev = mid-training validation set (tau2 `small` split, 20 tasks, disjoint
+# from train and test). Used by SFT chunk selection so the test split below
+# stays untouched until create_leaderboard*.py runs.
+dev_dataset_artifact: "tau2-ART-telecom-dev-scenarios:latest"
+dev_weave_dataset: "tau2-ART-telecom-dev-scenarios"
+dev_task_split: "small"
+# Validation = held-out test split (40 tasks). Reserved for the leaderboard
+# scripts; kept here as a back-compat fallback for load_validation_tasks.
 validation_dataset_artifact: "tau2-ART-telecom-validation-scenarios:latest"
 validation_task_split: "test"
 

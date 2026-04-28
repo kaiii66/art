@@ -174,18 +174,76 @@ async def main(
         if last_model_file.exists():
             trained_name = last_model_file.read_text().strip()
 
-    # Pin point for the "sft" row: the trained collection step at the moment
-    # RL began (== final SFT step). Auto-discovered from .sft_endpoint_step
-    # written by train_tau2.py next to the snapshot config when continue_from
-    # is set. If absent, the sft row is skipped (e.g. ad-hoc / non-pipeline run).
+    # ── On-prem mode detection ──
+    # The on-prem backend (run_pipeline.py --backend onprem) writes
+    # `.sft_lora_artifact_uri` and `.rl_lora_artifact_uri` next to the snapshot
+    # config. These point at W&B Inference type=lora artifacts (PEFT adapters
+    # over the base model). When present, we evaluate them via litellm's
+    # `wandb/<artifact-uri>` path instead of going through the ART
+    # TrainableModel infrastructure.
+    snapshot_dir = Path(config_path).resolve().parent
+    onprem_sft_uri = None
+    onprem_rl_uri = None
+    sft_uri_file = snapshot_dir / ".sft_lora_artifact_uri"
+    rl_uri_file = snapshot_dir / ".rl_lora_artifact_uri"
+    if sft_uri_file.exists():
+        onprem_sft_uri = sft_uri_file.read_text().strip() or None
+    if rl_uri_file.exists():
+        onprem_rl_uri = rl_uri_file.read_text().strip() or None
+    onprem_mode = bool(onprem_sft_uri or onprem_rl_uri)
+    if onprem_mode:
+        print(
+            f"  [leaderboard] on-prem mode: "
+            f"sft_uri={onprem_sft_uri or '(none)'} "
+            f"rl_uri={onprem_rl_uri or '(none)'}"
+        )
+
+    # Pin point for the "sft" row. Resolution order (highest precedence first):
+    #   1. .best_sft_step  -- written by train_tau2_distill.py when chunk
+    #      validation on dev produces a usable signal. This is the
+    #      authoritative leaderboard pin: the step that actually achieved the
+    #      highest val/success on dev, regardless of where SFT subsequently
+    #      stopped (with non-destructive early-stop, :latest may sit
+    #      `sft_early_stop_patience` chunks past best_step).
+    #   2. .sft_endpoint_step  -- back-compat fallback for old snapshots that
+    #      pre-date .best_sft_step. Written by train_tau2.py from
+    #      `await model.get_step()` at RL start, so it equals the SFT
+    #      collection's :latest at the moment RL began.
+    # If neither file exists the sft row is skipped (ad-hoc / non-pipeline runs).
     sft_pinned_step = None
-    sft_step_file = Path(config_path).resolve().parent / ".sft_endpoint_step"
-    if sft_step_file.exists():
+    snapshot_dir_for_sft = Path(config_path).resolve().parent
+    best_sft_file = snapshot_dir_for_sft / ".best_sft_step"
+    endpoint_file = snapshot_dir_for_sft / ".sft_endpoint_step"
+    sft_step_file: Path | None = None
+    sft_step_source: str | None = None
+    if best_sft_file.exists():
+        sft_step_file = best_sft_file
+        sft_step_source = "best (dev val)"
+    elif endpoint_file.exists():
+        sft_step_file = endpoint_file
+        sft_step_source = "endpoint (collection :latest at RL start)"
+    if sft_step_file is not None:
         try:
             sft_pinned_step = int(sft_step_file.read_text().strip())
-            print(f"  [leaderboard] sft pin = step {sft_pinned_step} (from {sft_step_file.name})")
+            print(
+                f"  [leaderboard] sft pin = step {sft_pinned_step} "
+                f"(from {sft_step_file.name}, source={sft_step_source})"
+            )
         except (ValueError, OSError) as e:
             print(f"  [leaderboard] could not read {sft_step_file}: {e}")
+
+    # Pin point for the NEW "sft-endpoint" row: the SFT collection's :latest
+    # at the moment RL began, i.e., where RL actually started training from.
+    # When SFT early-stops, this is `best_sft_step + slack` (slack <= patience),
+    # which differs from `.best_sft_step` (the headline sft row) and is the
+    # correct baseline for measuring "delta improvement RL made". Skipped
+    # downstream if equal to sft_pinned_step (no slack, would be a duplicate).
+    sft_endpoint_step: int | None = None
+    if endpoint_file.exists():
+        try:
+            sft_endpoint_step = int(endpoint_file.read_text().strip())
+        except (ValueError, OSError) as e:
+            print(f"  [leaderboard] could not read {endpoint_file}: {e}")
 
     # Pin point for the "rl" row. Resolution order (highest precedence first):
     #   1. CLI --trained-model-alias / --trained-model-step
@@ -304,10 +362,59 @@ async def main(
         model_names.append("base")
         display_names.append(base_row_name)
 
+    # ── On-prem leaderboard rows (W&B Inference type=lora artifacts) ──
+    # Each URI is a fully-resolved `wandb-artifact:///team/proj/name:version`
+    # that W&B Inference can serve directly. We wire it through tau2's
+    # LLMAgent path (agent_llm=...) by prefixing with `wandb/` so litellm
+    # routes the call to api.inference.wandb.ai.
+    if onprem_mode:
+        if should_eval_sft and onprem_sft_uri:
+            sft_row_name = f"sft-{suffix}-onprem"
+            print(f"\n[onprem] sft row -> {onprem_sft_uri}")
+            sft_wrapper = Tau2BaseModelWrapper(
+                name=sft_row_name,
+                model=None,
+                model_name=onprem_sft_uri,
+                domain=domain,
+                user_llm=user_llm,
+                user_llm_args=user_llm_args,
+                agent_llm_args=agent_llm_args,
+                max_steps=max_steps,
+                agent_llm=f"wandb/{onprem_sft_uri}",
+                **shaped_kwargs,
+            )
+            models.append(sft_wrapper)
+            model_names.append("sft")
+            display_names.append(sft_row_name)
+        elif should_eval_sft:
+            print("\n[onprem] sft row requested but .sft_lora_artifact_uri is missing; skipping.")
+
+        if should_eval_rl and onprem_rl_uri:
+            rl_row_name = f"rl-{suffix}-onprem"
+            print(f"\n[onprem] rl row -> {onprem_rl_uri}")
+            rl_wrapper = Tau2BaseModelWrapper(
+                name=rl_row_name,
+                model=None,
+                model_name=onprem_rl_uri,
+                domain=domain,
+                user_llm=user_llm,
+                user_llm_args=user_llm_args,
+                agent_llm_args=agent_llm_args,
+                max_steps=max_steps,
+                agent_llm=f"wandb/{onprem_rl_uri}",
+                **shaped_kwargs,
+            )
+            models.append(rl_wrapper)
+            model_names.append("rl")
+            display_names.append(rl_row_name)
+        elif should_eval_rl:
+            print("\n[onprem] rl row requested but .rl_lora_artifact_uri is missing; skipping.")
+
+    # ── Serverless leaderboard rows (ART TrainableModel) ──
     # Both "sft" and "rl" rows evaluate the SAME trained collection at
     # different LoRA checkpoint steps, so we register the TrainableModel once
     # and create one wrapper per requested role with its own pinned_step.
-    if (should_eval_sft or should_eval_rl) and trained_name:
+    if not onprem_mode and (should_eval_sft or should_eval_rl) and trained_name:
         try:
             print(f"\nLoading trained model: {trained_name}...")
             backend = ServerlessBackend()
@@ -369,6 +476,40 @@ async def main(
                     model_names.append("sft")
                     display_names.append(sft_row_name)
 
+                # Additional row: where RL actually started training from.
+                # When SFT early-stops, .sft_endpoint_step lags .best_sft_step
+                # by up to `sft_early_stop_patience` chunks. Evaluating this
+                # checkpoint gives the true baseline for `rl - sft-endpoint`,
+                # i.e., the value RL added on top of its actual starting point.
+                # Skipped when redundant (endpoint == best, no slack) or when
+                # .sft_endpoint_step is unavailable (ad-hoc runs without RL).
+                if (
+                    sft_endpoint_step is not None
+                    and sft_endpoint_step != sft_pinned_step
+                ):
+                    sft_endpoint_row_name = (
+                        f"sft-endpoint-{suffix}-step{sft_endpoint_step}"
+                    )
+                    print(
+                        f"Adding sft-endpoint row pinned to :step{sft_endpoint_step} "
+                        f"(where RL started; baseline for rl delta)"
+                    )
+                    sft_endpoint_wrapper = Tau2BaseModelWrapper(
+                        name=sft_endpoint_row_name,
+                        model=trained_model,
+                        model_name=sft_endpoint_row_name,
+                        domain=domain,
+                        user_llm=user_llm,
+                        user_llm_args=user_llm_args,
+                        agent_llm_args=agent_llm_args,
+                        max_steps=max_steps,
+                        pinned_step=sft_endpoint_step,
+                        **shaped_kwargs,
+                    )
+                    models.append(sft_endpoint_wrapper)
+                    model_names.append("sft-endpoint")
+                    display_names.append(sft_endpoint_row_name)
+
             if should_eval_rl:
                 if rl_pinned_alias is not None:
                     rl_row_name = f"rl-{suffix}-alias-{rl_pinned_alias}"
@@ -406,11 +547,12 @@ async def main(
                 display_names.append(rl_row_name)
         except Exception as e:
             print(f"Could not load trained model {trained_name}: {e}")
-    elif (should_eval_sft or should_eval_rl) and not trained_name:
+    elif not onprem_mode and (should_eval_sft or should_eval_rl) and not trained_name:
         print(
             "\nSkipping sft / rl rows (no trained model name available). "
             "Set leaderboard_trained_model_name in config, pass --trained-model-name, "
-            "or run train first to create .last_trained_model."
+            "or run train first to create .last_trained_model. "
+            "(For on-prem mode, ensure .sft_lora_artifact_uri / .rl_lora_artifact_uri exist.)"
         )
 
     if not models:
