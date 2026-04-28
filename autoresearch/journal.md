@@ -31,6 +31,48 @@ Schema for each iteration entry:
 (no iterations recorded yet; the first run of the autoresearch loop will
 append below this line)
 
+## Iteration 8  —  2026-04-28 02:54 UTC
+- snapshot      : pipeline_runs/04271414
+- wandb_group   : pipeline-04271414
+- decision      : KEPT
+- sft_success   : 1.000
+- rl_best_step  : 37
+- rl_best_reward: 0.825
+- delta_vs_best : +0.600 (vs iter 3 best 0.225)
+- diff:
+    diff --git a/train_tau2.py b/train_tau2.py
+    --- a/train_tau2.py
+    +++ b/train_tau2.py
+    @@ -479,6 +479,8 @@
+                         result = await backend.train(
+                             model,
+                             finished_groups,
+                             learning_rate=learning_rate,
+    +                        ppo=True,
+    +                        epsilon=0.2,
+                         )
+- hypothesis (this iter):
+    Adding PPO clipping (ppo=True, epsilon=0.2) to backend.train() constrains
+    GRPO policy updates within a trust region, preventing large destructive
+    updates and stabilizing the advantage signal for more consistent improvement.
+- mcp diagnosis:
+    SFT converged strongly this run (best val/success=1.000, endpoint_step=30),
+    giving RL a rich starting point. RL prefilter retained 30/74 tasks (40.5%).
+    PPO clipping produced a remarkable val/reward trajectory: 0.600 (step 33) →
+    0.575 (step 35, early-stop 1/3, counter reset on next improvement) → 0.825
+    (step 37). Best val/reward=0.825 is 3.7× the previous BEST of 0.225. The
+    early-stop counter reset when step 37 surpassed step 33's 0.600, indicating
+    PPO's trust-region constraint enabled genuine continued improvement past the
+    first local peak rather than oscillating. This is the largest single-iteration
+    gain in the campaign.
+- hypothesis (next iter):
+    Add importance_sampling_level="sequence" (GSPO sequence-level IS) on top of
+    PPO clipping to compute importance weights at the sequence level rather than
+    token level, potentially producing a tighter policy gradient signal and pushing
+    val/reward above 0.825.
+
+---
+
 ## Iteration 6  —  2026-04-27 04:16 UTC
 - snapshot      : pipeline_runs/04262116
 - wandb_group   : pipeline-04262116

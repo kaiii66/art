@@ -11,14 +11,14 @@ applies that patch first, then layers its single new edit on top.
 
 ## Best so far
 
-- snapshot         : 04241938
-- wandb_group      : pipeline-04241938
-- wandb_url        : https://wandb.ai/kwt/tau2-ART-autoresearch-telecom/groups/pipeline-04241938
-- iteration        : 3
-- recorded_at      : 2026-04-25T06:31 UTC
+- snapshot         : 04271414
+- wandb_group      : pipeline-04271414
+- wandb_url        : https://wandb.ai/kwt/tau2-ART-autoresearch-telecom/groups/pipeline-04271414
+- iteration        : 8
+- recorded_at      : 2026-04-28T02:54 UTC
 - sft_success      : 1.000
-- rl_best_step     : 43
-- rl_best_reward   : 0.225
+- rl_best_step     : 37
+- rl_best_reward   : 0.825
 - base_recipe_ref  : `feature/autoresearch` HEAD at loop start
 
 ## Cumulative diff (relative to base_recipe_ref)
@@ -43,4 +43,15 @@ diff --git a/train_config.yaml b/train_config.yaml
  # multiple times so GRPO sees more update steps from the same data.
 -num_epochs: 3
 +num_epochs: 1
+diff --git a/train_tau2.py b/train_tau2.py
+--- a/train_tau2.py
++++ b/train_tau2.py
+@@ -479,6 +479,8 @@
+                     result = await backend.train(
+                         model,
+                         finished_groups,
+                         learning_rate=learning_rate,
++                        ppo=True,
++                        epsilon=0.2,
+                     )
 ```

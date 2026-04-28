@@ -480,6 +480,8 @@ async def run_training(model, backend, training_tasks, config, validation_tasks=
                         model,
                         finished_groups,
                         learning_rate=learning_rate,
+                        ppo=True,
+                        epsilon=0.2,
                     )
                     await model.log(
                         finished_groups,
