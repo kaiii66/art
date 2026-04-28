@@ -31,6 +31,49 @@ Schema for each iteration entry:
 (no iterations recorded yet; the first run of the autoresearch loop will
 append below this line)
 
+## Iteration 9  —  2026-04-28 07:06 UTC
+- snapshot      : pipeline_runs/04271957
+- wandb_group   : pipeline-04271957
+- decision      : DISCARDED
+- sft_success   : 1.000
+- rl_best_step  : 35
+- rl_best_reward: 0.150
+- delta_vs_best : -0.675 (0.150 vs 0.825 iter-8 best)
+- diff:
+    diff --git a/train_tau2.py b/train_tau2.py
+    --- a/train_tau2.py
+    +++ b/train_tau2.py
+    @@ -479,6 +479,7 @@
+                         result = await backend.train(
+                             model,
+                             finished_groups,
+                             learning_rate=learning_rate,
+                             ppo=True,
+                             epsilon=0.2,
+    +                        importance_sampling_level="sequence",
+                         )
+- hypothesis (this iter):
+    Adding sequence-level importance sampling (GSPO) on top of PPO clipping
+    would reweight IS ratios at the sequence level rather than token level,
+    producing a tighter policy gradient signal and pushing val/reward above 0.825.
+- mcp diagnosis:
+    SFT was stronger than iter 8 (100% val success, sft_endpoint_step=28), and
+    the RL prefilter retained more tasks (40/74 = 54.1% vs 30/74 = 40.5%).
+    Despite the better SFT seed and larger trainable set, RL performance collapsed:
+    val/reward trajectory was 0.000 → 0.050 → 0.125 → 0.150 → 0.100, peaking at
+    0.150 (step 35) and early-stopping after 3 non-improvements. Sequence-level IS
+    computes log-prob ratios over entire sequences (product of all per-token ratios),
+    making the IS weight far smaller than 1 for long rollouts and effectively
+    discounting nearly all gradient updates. With ppo=True already epsilon-clipping
+    updates, the combined effect appears to have starved GRPO of usable gradient
+    magnitude, causing the policy to freeze near its initial SFT distribution.
+    SFT quality is NOT the limiting factor here — the constraint is in the RL update
+    rule itself.
+- hypothesis (next iter):
+    Campaign complete — this was the final requested iteration.
+
+---
+
 ## Iteration 8  —  2026-04-28 02:54 UTC
 - snapshot      : pipeline_runs/04271414
 - wandb_group   : pipeline-04271414
