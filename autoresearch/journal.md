@@ -31,6 +31,54 @@ Schema for each iteration entry:
 (no iterations recorded yet; the first run of the autoresearch loop will
 append below this line)
 
+## Iteration 10  —  2026-04-28 22:49 UTC
+- snapshot      : pipeline_runs/04281044
+- wandb_group   : pipeline-04281044
+- decision      : DISCARDED
+- sft_success   : 0.812  (best chunk step 20; trim failed → RL used step 30 at 62.5%)
+- rl_best_step  : 37
+- rl_best_reward: 0.100
+- delta_vs_best : -0.725 (0.100 vs 0.825 iter-8 best)
+- diff:
+    diff --git a/train_distill_config.yaml b/train_distill_config.yaml
+    --- a/train_distill_config.yaml
+    +++ b/train_distill_config.yaml
+    @@ -32,7 +32,7 @@
+    -num_validation_tasks: 4
+    +num_validation_tasks: 16
+    diff --git a/train_tau2_distill.py b/train_tau2_distill.py
+    --- a/train_tau2_distill.py
+    +++ b/train_tau2_distill.py
+    @@ run_student_validation: now returns val/success float (or None)
+    @@ run_distillation_sft: tracks best_val_success/best_step per chunk,
+    +    trims collection to best_step after all chunks via _delete_checkpoint_files
+    +    writes .best_sft_step; returns best_step
+    diff --git a/train_tau2.py b/train_tau2.py
+    --- a/train_tau2.py
+    +++ b/train_tau2.py
+    @@ main: warn if .best_sft_step != model.get_step() (trim failed)
+- hypothesis (this iter):
+    Best-chunk SFT selection with num_validation_tasks=16 would reliably identify
+    the peak SFT checkpoint and trim the collection so RL starts from the best
+    step rather than the final (potentially degraded) chunk.
+- mcp diagnosis:
+    SFT trained 30 chunks; best chunk was step 20 (81.2% val/success on 16 tasks),
+    but the ART API blocked the trim with "Cannot delete the last checkpoint
+    (step 30)". RL started from step 30 (62.5% val) instead of step 20, and the
+    diagnostic warning fired correctly. RL val/reward never exceeded 0.100:
+    trajectory was 7.5% → 5.0% → 5.0% → 10.0% (new best, reset early-stop) →
+    5.0% → 10.0% → 5.0% → 10.0%, oscillating around 5–10% without convergence.
+    Pipeline was manually terminated before leaderboard. Root cause: RL starting
+    from the weaker SFT checkpoint combined with no KL anchor produced an unstable
+    optimization that couldn't escape the low-reward basin. The best-chunk
+    machinery works correctly — the trim API limitation is the sole failure point.
+- hypothesis (next iter):
+    Fix the trim by re-uploading the best-chunk checkpoint artifacts as a new
+    latest step before RL begins, making the old last step no longer protected
+    and deletable; this ensures RL starts from the genuinely best SFT step.
+
+---
+
 ## Iteration 9  —  2026-04-28 07:06 UTC
 - snapshot      : pipeline_runs/04271957
 - wandb_group   : pipeline-04271957
