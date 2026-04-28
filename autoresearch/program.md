@@ -52,7 +52,7 @@ You may modify any of:
     `shaped_reward_weights`, `rl_prefilter_tasks`, `rl_prefilter_k`,
     `rl_prefilter_keep_band`, `max_orchestrator_steps`, `agent_llm_args`
 - `tau2_art_helpers.py`        — reward shaping internals (advanced)
-- `train_tau2.py` / `train_tau2_distill.py` — control flow (advanced; risky)
+- `train_tau2.py` / `train_tau2_distill.py` — control flow (advanced)
 
 ## The loop (run this every iteration)
 

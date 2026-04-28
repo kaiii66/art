@@ -693,6 +693,33 @@ async def main(args):
                 "the base LoRA. Verify the source collection actually has the "
                 "expected SFT checkpoint registered with the ART backend."
             )
+        # Diagnostic: the SFT distill stage trims the collection so :latest
+        # equals the best-validating chunk, and writes that step to
+        # `.best_sft_step`. If the two disagree, the trim silently no-oped
+        # (e.g. private ART API removed), which means RL is starting from
+        # the wrong checkpoint and the leaderboard's sft row will not match
+        # what RL actually trained from.
+        best_sft_step_file = config_path.resolve().parent / ".best_sft_step"
+        if best_sft_step_file.exists():
+            try:
+                expected_best = int(best_sft_step_file.read_text().strip())
+            except (ValueError, OSError) as e:
+                print(f"  [best-chunk] could not read .best_sft_step: {e}")
+            else:
+                if expected_best != starting_step:
+                    print(
+                        f"WARNING: .best_sft_step={expected_best} but the SFT "
+                        f"collection's latest is step {starting_step}. The SFT "
+                        f"trim apparently no-oped, so RL is starting from the "
+                        f"WRONG checkpoint (the last chunk, not the best). The "
+                        f"leaderboard sft row will pin to step {starting_step} "
+                        f"to stay consistent with what RL actually used."
+                    )
+                else:
+                    print(
+                        f"  [best-chunk] verified: starting_step matches "
+                        f".best_sft_step={expected_best}"
+                    )
         # The serverless ART backend's train() does not accept `beta`/
         # `kl_penalty_coef`, so config['kl_beta'] is silently ignored. Surface
         # a one-time warning when continuing from SFT, since the missing KL
