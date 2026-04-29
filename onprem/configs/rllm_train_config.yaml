@@ -13,11 +13,15 @@ lora_alpha: 32
 lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 
 # ----- algorithm -----
+# groups_per_step / rollouts_per_group lowered/raised from (4, 16) to (2, 32)
+# to soften the SFT -> RL handoff: more rollouts per group = lower-variance
+# advantage estimates, fewer groups per step = smaller weight delta per
+# optimizer step. Keeps total rollout budget per step the same (4*16 == 2*32).
 algorithm: grpo
 learning_rate: 5.0e-7
 num_epochs: 1
-groups_per_step: 4
-rollouts_per_group: 16
+groups_per_step: 2
+rollouts_per_group: 32
 
 # ----- rollout server (colocated vLLM) -----
 rollout:
@@ -40,6 +44,12 @@ user_llm_args:
   temperature: 1.0
   max_tokens: 16384
 shaped_reward: true
+# Telecom-specific: communicate_info and nl_assertions are null on every
+# telecom task (reward_basis = ENV_ASSERTION only), so those two components
+# get redistributed to action / termination / tool_accuracy / tool_arg_accuracy
+# inside compute_shaped_reward. step_penalty zeroed for the SFT -> RL handoff
+# to remove the trajectory-shortening pressure that could push the model to
+# skip verification tool calls.
 shaped_reward_weights:
   action: 0.35
   communicate: 0.10
@@ -47,7 +57,7 @@ shaped_reward_weights:
   termination: 0.15
   tool_accuracy: 0.15
   tool_arg_accuracy: 0.05
-  step_penalty: -0.10
+  step_penalty: 0.0
 
 # ----- dataset -----
 training_dataset_artifact: tau2-ART-telecom-training-scenarios:latest
