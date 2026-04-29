@@ -51,3 +51,4 @@ tea_debug.log
 #   02-upload.log, 03-sft.log, 04-rl.log, 05-leaderboard.log
 #   .last_trained_model, .sft_endpoint_step, .best_rl_step
 # Nothing in pipeline_runs/<MMDDHHMM>/ needs to be ignored today.
+pipeline_runs/
