@@ -1,0 +1,40 @@
+# Persistent storage for the tau2 on-prem stack.
+#
+# tau2-data       : SFT JSONL chat datasets, vLLM tokenizer cache,
+#                   HF model snapshots (read-mostly, ~100Gi headroom)
+# tau2-artifacts  : trained LoRA dirs (sft-lora, rl-lora), training
+#                   checkpoints, marker files like .sft_lora_artifact_uri
+#                   (read-write, larger because checkpoints can pile up)
+#
+# Storage class: leave unset to use the cluster default. On the cwb607-ray
+# CoreWeave cluster the default is typically a high-throughput block class
+# (e.g. `block-nvme-coreweave-us`); override here if you want a specific tier.
+#
+# Access mode: ReadWriteOnce is sufficient because both SFT and RL Jobs run
+# in the same single-node cluster. If you ever scale to multi-node and need
+# the same volume mounted in two pods at once, switch to ReadWriteMany +
+# a shared filesystem class (e.g. NFS / CephFS).
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tau2-data
+  namespace: tau2
+spec:
+  accessModes: [ReadWriteOnce]
+  # storageClassName: block-nvme-coreweave-us   # uncomment to pin
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tau2-artifacts
+  namespace: tau2
+spec:
+  accessModes: [ReadWriteOnce]
+  # storageClassName: block-nvme-coreweave-us   # uncomment to pin
+  resources:
+    requests:
+      storage: 500Gi

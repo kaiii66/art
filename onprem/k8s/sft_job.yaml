@@ -1,0 +1,64 @@
+# Templated K8s Job for the on-prem SFT stage.
+#
+# Placeholders (substituted by run_pipeline.py before kubectl apply):
+#   __JOB_NAME__                 e.g. tau2-sft-04270927
+#   __IMAGE__                    e.g. ghcr.io/<gh-user>/tau2-sft:abc1234
+#   __SFT_DATASET_ARTIFACT_URI__ e.g. wandb-artifact:///team/proj/name:latest
+#   __WANDB_PROJECT__            e.g. tau2-ART-autoresearch-telecom
+#   __WANDB_RUN_GROUP__          e.g. pipeline-04270927
+#   __WANDB_NAME__               e.g. sft-04270927
+#   __PIPELINE_SUFFIX__          e.g. 04270927
+#   __LORA_ARTIFACT_NAME__       e.g. tau2-sft-Qwen3-30B-A3B-Instruct-2507-04270927
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  namespace: tau2
+  labels:
+    app.kubernetes.io/part-of: tau2-onprem
+    app.kubernetes.io/component: sft
+    pipeline-suffix: "__PIPELINE_SUFFIX__"
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800   # 7 days
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: tau2-onprem
+        app.kubernetes.io/component: sft
+        pipeline-suffix: "__PIPELINE_SUFFIX__"
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr
+      containers:
+        - name: trainer
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: ["/workspace/scripts/run_axolotl_sft.sh"]
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+            requests:
+              cpu: "16"
+              memory: 200Gi
+              nvidia.com/gpu: 8
+          env:
+            - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: wandb, key: api } } }
+            - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: hf,    key: token } } }
+            - { name: WANDB_PROJECT,             value: "__WANDB_PROJECT__" }
+            - { name: WANDB_RUN_GROUP,           value: "__WANDB_RUN_GROUP__" }
+            - { name: WANDB_NAME,                value: "__WANDB_NAME__" }
+            - { name: SFT_DATASET_ARTIFACT_URI,  value: "__SFT_DATASET_ARTIFACT_URI__" }
+            - { name: PIPELINE_SUFFIX,           value: "__PIPELINE_SUFFIX__" }
+            - { name: LORA_ARTIFACT_NAME,        value: "__LORA_ARTIFACT_NAME__" }
+            - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
+            - { name: TOKENIZERS_PARALLELISM,    value: "false" }
+          volumeMounts:
+            - { name: artifacts, mountPath: /artifacts }
+            - { name: data,      mountPath: /data }
+            - { name: shm,       mountPath: /dev/shm }
+      volumes:
+        - { name: artifacts, persistentVolumeClaim: { claimName: tau2-artifacts } }
+        - { name: data,      persistentVolumeClaim: { claimName: tau2-data } }
+        - { name: shm,       emptyDir: { medium: Memory, sizeLimit: 64Gi } }

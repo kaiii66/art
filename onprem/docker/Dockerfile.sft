@@ -1,0 +1,43 @@
+# SFT trainer container.
+#
+# Base : axolotlai/axolotl:main-latest (CUDA 12.4 + PyTorch 2.5 + Axolotl + FlashAttention 2/3 baked in)
+# Adds : wandb, peft, python-dotenv, the small set of helper scripts shipped under onprem/scripts/
+#
+# This image deliberately does NOT install tau2 / openpipe-art. The teacher
+# rollouts (Phase A) run OUTSIDE the cluster on a CPU host (the dev laptop or a
+# tiny CPU pod), produce a JSONL chat dataset, and upload it as a W&B dataset
+# artifact. The SFT pod then just downloads that JSONL and runs Axolotl.
+#
+# Build (from repo root):
+#   docker buildx build --platform linux/amd64 \
+#     -t ghcr.io/<gh-user>/tau2-sft:$(git rev-parse --short HEAD) \
+#     -f onprem/docker/Dockerfile.sft --push .
+
+# ----- base layer (cached across iterations) -----
+FROM axolotlai/axolotl:main-latest AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HUB_ENABLE_HF_TRANSFER=1
+
+RUN pip install --no-cache-dir \
+        wandb>=0.18 \
+        peft>=0.14 \
+        python-dotenv>=1.0 \
+        hf_transfer>=0.1.8
+
+# ----- app layer (rebuilt on every code change) -----
+FROM base AS app
+
+WORKDIR /workspace
+
+# Only copy the onprem helpers; the dataset lives in W&B, not the image.
+COPY onprem/scripts/ /workspace/scripts/
+COPY onprem/configs/ /workspace/configs/
+
+RUN chmod +x /workspace/scripts/*.sh
+
+ENV PATH=/workspace/scripts:$PATH
+
+# Default command: the SFT entrypoint script.  K8s Job command can override.
+CMD ["/workspace/scripts/run_axolotl_sft.sh"]

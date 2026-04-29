@@ -1,0 +1,108 @@
+# Axolotl SFT recipe for the on-prem tau2 distillation stack.
+#
+# All hyperparameters mirror train_distill_config.yaml. The dataset path is
+# materialized at runtime by run_axolotl_sft.sh after downloading the W&B
+# dataset artifact written by onprem/scripts/prepare_sft_data.py.
+#
+# Hardware target: single node, 8x H100 80GB SXM5.
+# Distributed strategy: FSDP2 full_shard via `accelerate launch --num_processes 8`.
+
+# ----- model -----
+base_model: Qwen/Qwen3-30B-A3B-Instruct-2507
+model_type: AutoModelForCausalLM
+tokenizer_type: AutoTokenizer
+load_in_8bit: false
+load_in_4bit: false
+strict: false
+trust_remote_code: true
+
+# ----- LoRA -----
+# rank 16 = the maximum W&B Inference accepts for Qwen/Qwen3-30B-A3B-Instruct-2507.
+# attention-only target modules to keep adapter size small. Adding the per-expert
+# MLP projections (gate_proj/up_proj/down_proj) on a 128-expert MoE blows up both
+# adapter size and W&B Inference load time and is unnecessary for instruction
+# distillation.
+adapter: lora
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+lora_modules_to_save: []
+
+# ----- dataset -----
+# `chat_template: qwen3` consumes records of the form
+#   {"messages": [{role, content, tool_calls?}, ...], "tools": [...]}
+# which is exactly what onprem/scripts/trajectory_to_jsonl.py emits.
+chat_template: qwen3
+datasets:
+  - path: /data/sft.jsonl
+    type: chat_template
+    field_messages: messages
+    message_property_mappings:
+      role: role
+      content: content
+val_set_size: 0.0   # validation handled separately by the leaderboard stage
+
+# ----- sequence packing / context length -----
+# Sample packing avoids padding waste for the variable-length tool-using
+# rollouts. 8192 covers the bulk of telecom rollouts at max_orchestrator_steps=100.
+sequence_len: 8192
+sample_packing: true
+pad_to_sequence_len: true
+
+# ----- training schedule (mirrors train_distill_config.yaml) -----
+num_epochs: 2
+micro_batch_size: 2
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-4
+warmup_ratio: 0.1
+lr_scheduler: cosine
+optimizer: adamw_torch
+weight_decay: 0.0
+
+bf16: auto
+tf32: true
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+
+flash_attention: true
+
+# ----- FSDP (8-way full shard across the 8 H100s) -----
+fsdp:
+  - full_shard
+  - auto_wrap
+fsdp_config:
+  fsdp_version: 2
+  fsdp_limit_all_gathers: true
+  fsdp_sync_module_states: true
+  fsdp_offload_params: false
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  fsdp_transformer_layer_cls_to_wrap: Qwen3MoeDecoderLayer
+  fsdp_state_dict_type: SHARDED_STATE_DICT
+
+# ----- output -----
+# /artifacts is a PVC mounted into the pod. The post-train hook in
+# run_axolotl_sft.sh pulls the merged PEFT dir from here and uploads it
+# as a type=lora W&B Inference artifact.
+output_dir: /artifacts/sft-lora
+saves_per_epoch: 1
+save_total_limit: 2
+save_safetensors: true
+
+# ----- logging / W&B -----
+# wandb_project / wandb_name / wandb_group are set at runtime by
+# run_axolotl_sft.sh via env vars (WANDB_PROJECT, WANDB_NAME, WANDB_RUN_GROUP)
+# so the SFT run lands in the same group as the rest of the pipeline iteration.
+logging_steps: 1
+report_to:
+  - wandb
+
+# ----- reproducibility -----
+seed: 42
