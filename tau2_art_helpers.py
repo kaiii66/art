@@ -467,7 +467,11 @@ async def tau2_teacher_rollout(
     task_id = task_scenario.task_id
 
     def _run_sync():
-        tasks = registry.get_tasks_loader(domain)()
+        # task_split_name=None -> return ALL tasks in tasks.json so any task ID
+        # from any split (small / train / test / base / full) is findable.
+        # The default split filter ("base") would silently exclude small-split
+        # task IDs since `small ∩ base = ∅` for telecom.
+        tasks = registry.get_tasks_loader(domain)(task_split_name=None)
         task = None
         for t in tasks:
             if t.id == task_id:
@@ -600,7 +604,11 @@ async def tau2_rollout(
     task_id = task_scenario.task_id
 
     def _run_sync():
-        tasks = registry.get_tasks_loader(domain)()
+        # task_split_name=None -> return ALL tasks in tasks.json so any task ID
+        # from any split (small / train / test / base / full) is findable.
+        # The default split filter ("base") would silently exclude small-split
+        # task IDs since `small ∩ base = ∅` for telecom.
+        tasks = registry.get_tasks_loader(domain)(task_split_name=None)
         task = None
         for t in tasks:
             if t.id == task_id:
