@@ -38,7 +38,7 @@ if [ -z "${KUBECONFIG:-}" ]; then
 fi
 
 echo "==> namespace: $NAMESPACE"
-kubectl apply -f "$REPO_ROOT/onprem/k8s/namespace.yaml"
+kubectl apply -f "$REPO_ROOT/onprem/k8s/namespace.yaml" --validate=false
 
 # ---- helpers ----
 recreate_generic() {
@@ -81,7 +81,7 @@ recreate_docker_registry "ghcr" "ghcr.io" "${GHCR_USER:-}" "${GHCR_TOKEN:-}"
 
 # ---- PVCs ----
 echo "==> persistent volume claims"
-kubectl apply -f "$REPO_ROOT/onprem/k8s/pvcs.yaml"
+kubectl apply -f "$REPO_ROOT/onprem/k8s/pvcs.yaml" --validate=false
 
 # ---- summary ----
 echo
