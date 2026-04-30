@@ -42,9 +42,6 @@ datasets:
   - path: /data/sft.jsonl
     type: chat_template
     field_messages: messages
-    message_property_mappings:
-      role: role
-      content: content
 val_set_size: 0.0   # validation handled separately by the leaderboard stage
 
 # ----- sequence packing / context length -----
@@ -85,7 +82,7 @@ fsdp_config:
   fsdp_cpu_ram_efficient_loading: true
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
   fsdp_transformer_layer_cls_to_wrap: Qwen3MoeDecoderLayer
-  fsdp_state_dict_type: SHARDED_STATE_DICT
+  fsdp_state_dict_type: FULL_STATE_DICT
 
 # ----- output -----
 # /artifacts is a PVC mounted into the pod. The post-train hook in
