@@ -22,9 +22,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN pip install --no-cache-dir \
         wandb>=0.18 \
-        peft>=0.14 \
         python-dotenv>=1.0 \
         hf_transfer>=0.1.8
+# peft is intentionally omitted here — axolotl's base image ships its own
+# peft build that is pinned to match its transformers version. Installing a
+# different peft on top breaks the BloomPreTrainedModel import in older peft
+# releases (or vice-versa with newer transformers). wandb_lora_upload.py uses
+# peft only to inspect the adapter_config.json which is format-stable.
 
 # ----- app layer (rebuilt on every code change) -----
 FROM base AS app
