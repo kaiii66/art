@@ -1,7 +1,8 @@
 # SFT trainer container.
 #
-# Base : axolotlai/axolotl:main-latest (CUDA 12.4 + PyTorch 2.5 + Axolotl + FlashAttention 2/3 baked in)
-# Adds : wandb, peft, python-dotenv, the small set of helper scripts shipped under onprem/scripts/
+# Base : axolotlai/axolotl:main-20260325-py3.11-cu128-2.8.0
+#        (Python 3.11 + CUDA 12.8 + PyTorch 2.8.0 + Axolotl + FlashAttention 2/3 baked in)
+# Adds : wandb, python-dotenv, hf_transfer, the helper scripts shipped under onprem/scripts/
 #
 # This image deliberately does NOT install tau2 / openpipe-art. The teacher
 # rollouts (Phase A) run OUTSIDE the cluster on a CPU host (the dev laptop or a
@@ -14,7 +15,18 @@
 #     -f onprem/docker/Dockerfile.sft --push .
 
 # ----- base layer (cached across iterations) -----
-FROM axolotlai/axolotl:main-latest AS base
+#
+# Pinned to a specific dated tag (NOT main-latest) and locked by digest so
+# upstream re-pushes can't silently break us. The entire `cu128-2.9.1` line
+# (PyTorch 2.9.1) currently has a torch/torchvision ABI mismatch -- the
+# `torchvision::nms` operator isn't registered, which crashes the import
+# chain via peft -> transformers -> torchvision. Verified broken on at least
+# main-latest (pushed 2026-04-30) and main-20260429-py3.11-cu128-2.9.1.
+# We pin to the LAST cu128-2.8.0 build instead (PyTorch 2.8.0, CUDA 12.8,
+# Python 3.11), which predates the regression. To bump, pick a fresh dated
+# tag from https://hub.docker.com/r/axolotlai/axolotl/tags , verify the
+# smoke test below passes, and update both the tag and the digest.
+FROM axolotlai/axolotl:main-20260325-py3.11-cu128-2.8.0@sha256:8bb07600ce166bfbefea08deae069ba096f0cbfe328b4f0a859cacb2d8ca29c6 AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -29,6 +41,16 @@ RUN pip install --no-cache-dir \
 # different peft on top breaks the BloomPreTrainedModel import in older peft
 # releases (or vice-versa with newer transformers). wandb_lora_upload.py uses
 # peft only to inspect the adapter_config.json which is format-stable.
+
+# Smoke test: catch torch/torchvision ABI mismatch (and the downstream
+# ModuleNotFoundError: BloomPreTrainedModel cascade it triggers) at BUILD
+# time, not on an 8xGPU pod. Importing peft is enough because its constants
+# module pulls transformers -> image_utils -> torchvision -> register_fake
+# which is exactly where the ABI mismatch explodes.
+RUN python -c "import torch, torchvision; \
+    print('torch', torch.__version__, 'tv', torchvision.__version__, 'cuda', torch.version.cuda); \
+    assert torch.ops.torchvision.nms is not None; \
+    import peft, transformers; print('peft', peft.__version__, 'transformers', transformers.__version__)"
 
 # ----- app layer (rebuilt on every code change) -----
 FROM base AS app

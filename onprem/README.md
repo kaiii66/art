@@ -75,7 +75,40 @@ onprem/
    bash onprem/k8s/setup_secrets.sh
    ```
 
-4. Build + push the two images (from repo root):
+4. Log Docker in to GHCR (one-time per machine; needed before the first
+   `docker buildx ... --push`):
+
+   Create a GitHub **classic** PAT at <https://github.com/settings/tokens>
+   with scopes `write:packages`, `read:packages` (and `delete:packages` if
+   you want to be able to clean up old tags). If your account is in an org
+   that enforces SSO, click **Configure SSO → Authorize** next to the token
+   so GHCR will accept it.
+
+   ```bash
+   echo "ghp_xxxxxxxxxxxxxxxxxxxxxxxx" | docker login ghcr.io \
+     -u "$GHCR_USER" --password-stdin
+   ```
+
+   Without this step, `docker buildx ... --push` fails with
+   `ERROR: unauthorized: unauthenticated: User cannot be authenticated with
+   the token provided.` Credentials are cached in `~/.docker/config.json`
+   until the PAT expires.
+
+5. Build + push the two images (from repo root):
+
+   The build commands below reference `$GHCR_USER`, but `.env` is **not**
+   auto-loaded into your shell — you have to either source it or export the
+   var explicitly. Pick one:
+
+   ```bash
+   # option A: load everything from .env into the current shell
+   set -a; source .env; set +a
+
+   # option B: just set the one we need
+   export GHCR_USER=kaiii66
+   ```
+
+   Then build:
 
    ```bash
    TAG=$(git rev-parse --short HEAD)
@@ -86,6 +119,10 @@ onprem/
      -t ghcr.io/$GHCR_USER/tau2-rllm:$TAG \
      -f onprem/docker/Dockerfile.rl  --push .
    ```
+
+   If `$GHCR_USER` is unset, `docker buildx build` fails with
+   `invalid tag "ghcr.io//tau2-sft:..."` (note the double slash) — that's
+   the tell.
 
    (Mac users: cross-arch build is slow on first run. After the base layers
    cache, incremental pushes only ship the small app layer.)
