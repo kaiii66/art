@@ -78,6 +78,14 @@ RUN pip install --no-cache-dir \
 # no-op so profile_run skips the buggy dummy-LoRA activation.
 RUN python -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/lora_model_runner_mixin.py'); s = p.read_text(); marker = '            self._set_active_loras(tuple(prompt_lora_mapping),\n                                   tuple(token_lora_mapping), lora_requests)'; assert marker in s, 'maybe_select_dummy_loras patch marker not found'; p.write_text(s.replace(marker, '            # vLLM-0.11 + Qwen3-MoE FusedMoE LoRA dummy warmup is broken;\n            # skip the dummy activation. Real LoRA requests still go through\n            # set_active_loras() unmodified.\n            pass'))"
 
+# NGC PyTorch 25.08 ships a CUDA 13.0 toolkit (ptxas) alongside the
+# CUDA 12.8 PyTorch wheel. Triton 3.4 only knows CUDA 10/11/12, so any
+# torch.compile / Inductor invocation crashes with
+#   "Triton only support CUDA 10.0 or higher, but got CUDA version: 13.0".
+# Patch Triton's ptx_get_version to treat CUDA 13.x the same as 12.8
+# (PTX 8.8) until upstream Triton adds first-class CUDA 13 support.
+RUN python -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/compiler.py'); s = p.read_text(); marker = '    if major == 11:'; assert marker in s, 'triton ptx_get_version patch marker not found'; p.write_text(s.replace(marker, '    if major >= 13:\n        return 88  # CUDA 13.x -> map to CUDA 12.8 PTX (8.8); good enough for sm_90.\n    if major == 11:'))"
+
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
 
