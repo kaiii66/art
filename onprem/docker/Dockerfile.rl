@@ -58,9 +58,19 @@ WORKDIR /workspace/repo
 
 # Install the tau2 package + repo deps from pyproject.toml. Use --no-deps in a
 # follow-up if you want to keep this layer thin; for now full install.
+#
+# `--ignore-requires-python` is intentional: the NVIDIA NGC PyTorch base
+# (24.10-py3) ships Python 3.10.12 because NGC tags either go 3.10 (<=25.06)
+# or jump to 3.12 (>=25.08), with no 3.11 in between. tau2's pyproject.toml
+# declares requires-python = ">=3.11" but the actual code on the RL hot
+# path (tau2.orchestrator + tau2.environment + telecom domain) is plain
+# 3.10-compatible -- no PEP 695 type aliases, no exception groups, no
+# ExceptionGroup catches in the rollout helpers we exercise. Any 3.11-only
+# tau2 module that does sneak in would fail at import time, not silently,
+# so we'd catch it on the first RL pod run.
 COPY pyproject.toml pdm.lock README.md /workspace/repo/
 COPY src/ /workspace/repo/src/
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir --ignore-requires-python -e .
 
 # The pieces of the existing repo the rollout needs at runtime: the helpers,
 # the configs, the scripts. Code-only; no data.
