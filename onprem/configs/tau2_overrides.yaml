@@ -173,10 +173,10 @@ actor_rollout_ref:
       top_p: 0.95
       do_sample: true
     log_prob_micro_batch_size_per_gpu: 1
-    ref:
-      fsdp_config:
-        param_offload: false
-      log_prob_micro_batch_size_per_gpu: 1
+  ref:
+    fsdp_config:
+      param_offload: false
+    log_prob_micro_batch_size_per_gpu: 1
 
 # ----- rllm section (mirrors agent_ppo_trainer.yaml; inlined because we
 #       can't inherit it without triggering Hydra's searchpath restriction). -----
