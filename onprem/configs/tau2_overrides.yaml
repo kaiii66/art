@@ -129,8 +129,8 @@ actor_rollout_ref:
     tensor_model_parallel_size: 8
     gpu_memory_utilization: 0.85
     enforce_eager: false
-    enable_lora: true
-    max_lora_rank: 16
+    # NOTE: vLLM rollout LoRA is configured via the model section
+    # (model.lora_rank/lora_alpha/lora_adapter_path) in verl 0.6+, NOT here.
     max_model_len: 16384
     temperature: 0.7
     top_p: 0.95

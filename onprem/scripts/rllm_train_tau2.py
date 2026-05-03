@@ -142,15 +142,21 @@ def _init_wandb(config: DictConfig) -> Optional[str]:
 
 
 def _attach_lora(config: DictConfig, starting_lora: Optional[str]) -> None:
-    """Wire the starting LoRA into the verl model config so verl loads it."""
+    """Wire the starting LoRA into the verl model config so verl loads it.
+
+    verl 0.6+ exposes a single `model.lora_adapter_path` knob; the rollout
+    side reads it from the actor's PEFT model directly (no separate
+    rollout.lora_path / enable_lora arg). lora_rank / lora_alpha must
+    already be set in the static config so peft can construct the adapter.
+    """
     if not starting_lora:
         return
 
-    # verl's lora-init knob (added in 0.6+). If not present in the config
-    # tree we add it dynamically; verl reads it via OmegaConf attribute access.
-    OmegaConf.update(config, "actor_rollout_ref.model.lora_path", starting_lora, force_add=True)
-    OmegaConf.update(config, "actor_rollout_ref.rollout.lora_path", starting_lora, force_add=True)
-    logger.info("attached starting LoRA at %s to actor + rollout configs", starting_lora)
+    OmegaConf.update(
+        config, "actor_rollout_ref.model.lora_adapter_path",
+        starting_lora, force_add=True,
+    )
+    logger.info("attached starting LoRA at %s via actor_rollout_ref.model.lora_adapter_path", starting_lora)
 
 
 def _write_summary(config: DictConfig, output_dir: str, n_train: int, n_val: int) -> None:
