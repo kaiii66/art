@@ -34,11 +34,14 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
         "flash-attn>=2.7.0" --no-build-isolation
 
-# verl (gradient engine for GRPO) and rLLM (agent-RL wrapper).
-# Both move fast; if you need to pin to a known-good revision do it here.
+# rLLM (agent-RL wrapper) + verl (gradient engine for GRPO). rLLM is
+# GitHub-only -- no PyPI package -- and ships verl as an [verl] extra so
+# we install both with one git+ URL. Pinned to v0.2.1.post1 (latest stable
+# as of 2026-05) for reproducibility; bump deliberately. The previous
+# `pip install rllm>=0.1.0` failed at build time with "No matching
+# distribution" because the PyPI name `rllm` is squatted/empty.
 RUN pip install --no-cache-dir \
-        "verl>=0.4.0" \
-        "rllm>=0.1.0"
+        "rllm[verl] @ git+https://github.com/rllm-org/rllm.git@v0.2.1.post1"
 
 # Standard helpers used by the trainer + upload scripts.
 RUN pip install --no-cache-dir \
