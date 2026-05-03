@@ -93,6 +93,14 @@ flash_attention: true
 # transformers/loss/loss_utils.py:55 after fixing fragmentation. Using
 # CCE drops peak memory by roughly that whole amount with no quality
 # impact (it's mathematically equivalent, just streamed).
+#
+# IMPORTANT: `cut_cross_entropy: true` is silently ignored unless the
+# CutCrossEntropyPlugin is loaded via `plugins:`. The plugin registers
+# the field into Axolotl's config schema; without it, Axolotl drops the
+# key on the floor and your run still OOMs at the loss. The CCE package
+# itself is already pip-installed in our base image (axolotlai/axolotl).
+plugins:
+  - axolotl.integrations.cut_cross_entropy.CutCrossEntropyPlugin
 cut_cross_entropy: true
 
 # Defensive: use Axolotl's tiled MLP path which processes hidden states
