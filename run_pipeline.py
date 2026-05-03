@@ -266,6 +266,82 @@ def _wandb_entity() -> str | None:
     return os.environ.get("WANDB_ENTITY") or None
 
 
+def _parse_wandb_artifact_uri(uri: str) -> tuple[str, str, str, str]:
+    """Split `wandb-artifact:///<entity>/<project>/<name>:<alias>` -> 4-tuple.
+
+    Used by the onprem leaderboard bridge to translate the URI we wrote to
+    .sft_lora_artifact_uri / .rl_lora_artifact_uri (from the trainer pod's
+    wandb_lora_upload.py output) into the (--{sft|rl}-trained-model-name,
+    --{sft|rl}-model-alias) flag pair that create_leaderboard_shaped_reward.py
+    expects.
+    """
+    body = uri.strip().removeprefix("wandb-artifact:///")
+    path, _, alias = body.rpartition(":")
+    if not alias:
+        raise ValueError(
+            f"URI {uri!r} has no :alias suffix; expected wandb-artifact:///e/p/n:vX"
+        )
+    parts = path.split("/", 2)
+    if len(parts) != 3:
+        raise ValueError(
+            f"URI {uri!r} should have exactly entity/project/name (got {parts!r})"
+        )
+    entity, project, name = parts
+    return entity, project, name, alias
+
+
+def _build_leaderboard_cmd(
+    *,
+    train_cfg: Path,
+    snapshot: Path,
+    backend: str,
+) -> list[str]:
+    """Build the leaderboard subprocess argv, augmenting with onprem URI flags.
+
+    Serverless: returns the legacy `--config X --models all` invocation. The
+    leaderboard script auto-discovers the trained-model name + steps from
+    .last_trained_model / .sft_endpoint_step / .best_rl_step.
+
+    Onprem: also reads .sft_lora_artifact_uri (if present) and passes
+    --sft-trained-model-name + --sft-model-alias so the script can register
+    and pin the SFT row to the W&B artifact we uploaded from the cluster.
+    Same for RL via .rl_lora_artifact_uri -> --trained-model-name +
+    --trained-model-alias. Without these, onprem-uploaded LoRAs aren't
+    discoverable (they don't carry :step{N} aliases the serverless path
+    expects -- only :v0/:v1 W&B version aliases).
+    """
+    cmd = [
+        "uv", "run", "python", "create_leaderboard_shaped_reward.py",
+        "--config", str(train_cfg),
+        "--models", "all",
+    ]
+    if backend != "onprem":
+        return cmd
+
+    sft_uri_file = snapshot / ".sft_lora_artifact_uri"
+    rl_uri_file = snapshot / ".rl_lora_artifact_uri"
+
+    if sft_uri_file.exists():
+        try:
+            _, _, sft_name, sft_alias = _parse_wandb_artifact_uri(sft_uri_file.read_text())
+            cmd += ["--sft-trained-model-name", sft_name, "--sft-model-alias", sft_alias]
+            print(f"    [leaderboard] sft pin: --sft-trained-model-name {sft_name} "
+                  f"--sft-model-alias {sft_alias} (from {sft_uri_file.name})")
+        except ValueError as e:
+            print(f"    [leaderboard] WARNING: could not parse {sft_uri_file}: {e}")
+
+    if rl_uri_file.exists():
+        try:
+            _, _, rl_name, rl_alias = _parse_wandb_artifact_uri(rl_uri_file.read_text())
+            cmd += ["--trained-model-name", rl_name, "--trained-model-alias", rl_alias]
+            print(f"    [leaderboard] rl pin: --trained-model-name {rl_name} "
+                  f"--trained-model-alias {rl_alias} (from {rl_uri_file.name})")
+        except ValueError as e:
+            print(f"    [leaderboard] WARNING: could not parse {rl_uri_file}: {e}")
+
+    return cmd
+
+
 def _onprem_run_prepare_sft(snapshot: Path, dry_run: bool) -> str:
     """Run Phase A (teacher rollouts) locally and return the dataset URI.
 
@@ -483,11 +559,16 @@ def main() -> int:
     # No --publish-leaderboard flag any more: create_leaderboard_shaped_reward.py
     # auto-creates the Weave Dataset/Evaluation/Leaderboard on first invocation
     # and reuses + appends to them on every subsequent invocation.
-    leaderboard_cmd = [
-        "uv", "run", "python", "create_leaderboard_shaped_reward.py",
-        "--config", str(train_cfg),
-        "--models", "all",
-    ]
+    #
+    # For the onprem backend, also pass auto-derived SFT/RL collection names
+    # and W&B aliases so the leaderboard can find our PVC-uploaded LoRAs.
+    # Without these, the script falls back to .sft_endpoint_step / .best_rl_step
+    # files (serverless ART convention) that onprem doesn't write.
+    leaderboard_cmd = _build_leaderboard_cmd(
+        train_cfg=train_cfg,
+        snapshot=snapshot,
+        backend=args.backend,
+    )
 
     # ── stage: upload (shared) ──
     upload_cmd = ["uv", "run", "python", "upload_dataset_to_wandb.py", "--config", str(train_cfg)]

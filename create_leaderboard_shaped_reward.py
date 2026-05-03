@@ -141,8 +141,17 @@ async def main(
     trained_model_name: str = None,
     trained_model_step: int = None,
     trained_model_alias: str = None,
+    sft_trained_model_name: str = None,
+    sft_model_alias: str = None,
     reevaluate_base: bool = False,
 ):
+    # `trained_model_name` historically pinned BOTH the sft row and the rl
+    # row to the same ART model collection (different steps within it). The
+    # onprem backend uploads SFT and RL as separate W&B artifact collections
+    # (e.g. tau2-sft-... and tau2-rl-...), so we accept an extra
+    # `sft_trained_model_name` and `sft_model_alias` to register/pin the
+    # sft row to its own collection and W&B alias (typically `:v0`). Both
+    # default to the legacy single-collection behavior when unset.
     if models_to_eval is None:
         models_to_eval = ["all"]
     # Backwards-compat: --models trained is deprecated; map to "rl".
@@ -304,58 +313,101 @@ async def main(
         model_names.append("base")
         display_names.append(base_row_name)
 
-    # Both "sft" and "rl" rows evaluate the SAME trained collection at
-    # different LoRA checkpoint steps, so we register the TrainableModel once
-    # and create one wrapper per requested role with its own pinned_step.
-    if (should_eval_sft or should_eval_rl) and trained_name:
-        try:
-            print(f"\nLoading trained model: {trained_name}...")
+    # The "sft" and "rl" rows historically share ONE trained ART collection
+    # (different steps within it); onprem can also pass a separate SFT
+    # collection name + W&B alias via --sft-trained-model-name + --sft-model-alias.
+    # Resolve which collections we need to register for which rows:
+    #   - sft row: sft_trained_model_name (if set) else trained_name
+    #   - rl  row: trained_name
+    sft_collection_name = sft_trained_model_name or trained_name
+    rl_collection_name = trained_name
+    need_sft_register = should_eval_sft and bool(sft_collection_name)
+    need_rl_register = should_eval_rl and bool(rl_collection_name)
+
+    # Cache registered TrainableModels by name so we don't double-register the
+    # same collection (typical serverless case where sft and rl share it).
+    registered_models: dict[str, art.TrainableModel] = {}
+    backend = None
+    inference_base_override = lb_config.get(
+        "inference_base_url", "https://api.inference.wandb.ai/v1"
+    )
+
+    async def _register_collection(name: str) -> art.TrainableModel | None:
+        """Register an ART TrainableModel by name (with caching + inference URL override)."""
+        if name in registered_models:
+            return registered_models[name]
+        nonlocal backend
+        if backend is None:
             backend = ServerlessBackend()
-            trained_model = art.TrainableModel(
-                name=trained_name,
+        try:
+            print(f"\nLoading trained model: {name}...")
+            tm = art.TrainableModel(
+                name=name,
                 project=project,
                 base_model=base_model,
             )
-            await trained_model.register(backend)
-
+            await tm.register(backend)
             # Route trained-model inference through the public W&B Inference
-            # endpoint instead of the ART training backend. The training
-            # backend (api.training.wandb.ai) is the registration default and
-            # has been returning Cloudflare 524s under load; the public
-            # inference endpoint serves the same `wandb-artifact:///...:stepN`
-            # references and is the production-scaled path. Override is
+            # endpoint instead of the ART training backend (api.training.wandb.ai)
+            # which has been returning Cloudflare 524s under load. Override is
             # configurable via leaderboard.inference_base_url.
-            inference_base_override = lb_config.get(
-                "inference_base_url", "https://api.inference.wandb.ai/v1"
-            )
             if inference_base_override:
-                prev_url = trained_model.inference_base_url
-                trained_model.inference_base_url = inference_base_override
-                print(
-                    f"Overriding inference_base_url: {prev_url} -> "
-                    f"{trained_model.inference_base_url}"
-                )
-
-            latest_step = await trained_model.get_step()
-            print(f"Collection latest step: {latest_step}")
-
-            if should_eval_sft:
-                if sft_pinned_step is None:
+                prev_url = tm.inference_base_url
+                tm.inference_base_url = inference_base_override
+                if prev_url != tm.inference_base_url:
                     print(
-                        "Skipping sft row (no .sft_endpoint_step found). "
-                        "This is normal for ad-hoc runs without the pipeline."
+                        f"Overriding inference_base_url for {name}: {prev_url} -> "
+                        f"{tm.inference_base_url}"
                     )
-                else:
-                    # Stable, descriptive name: ties this leaderboard row back
-                    # to its W&B run group (`pipeline-<suffix>`) and to its
-                    # exact LoRA checkpoint step. Identical naming convention
-                    # used in `name=` on the Weave Model and `display_name=`
-                    # on the eval call so the two surfaces agree.
+            registered_models[name] = tm
+            return tm
+        except Exception as e:
+            print(f"Could not load trained model {name}: {e}")
+            return None
+
+    if need_sft_register or need_rl_register:
+        try:
+            sft_trained_model = await _register_collection(sft_collection_name) if need_sft_register else None
+            rl_trained_model = await _register_collection(rl_collection_name) if need_rl_register else None
+
+            latest_step = None
+            if rl_trained_model is not None:
+                latest_step = await rl_trained_model.get_step()
+                print(f"RL collection latest step: {latest_step}")
+
+            if should_eval_sft and sft_trained_model is not None:
+                # Resolution order for the sft pin (highest precedence first):
+                #   1. --sft-model-alias (e.g. "v0" for onprem-uploaded LoRAs)
+                #   2. .sft_endpoint_step (serverless ART path)
+                #   3. skip the sft row
+                if sft_model_alias is not None:
+                    # Onprem path: a single uploaded W&B artifact version,
+                    # no step{N} alias exists. Pin directly to the W&B alias.
+                    sft_row_name = f"sft-{suffix}-alias-{sft_model_alias}"
+                    print(f"Pinning sft row to artifact alias :{sft_model_alias} on collection {sft_collection_name}")
+                    sft_wrapper = Tau2BaseModelWrapper(
+                        name=sft_row_name,
+                        model=sft_trained_model,
+                        model_name=sft_row_name,
+                        domain=domain,
+                        user_llm=user_llm,
+                        user_llm_args=user_llm_args,
+                        agent_llm_args=agent_llm_args,
+                        max_steps=max_steps,
+                        pinned_alias=sft_model_alias,
+                        **shaped_kwargs,
+                    )
+                    models.append(sft_wrapper)
+                    model_names.append("sft")
+                    display_names.append(sft_row_name)
+                elif sft_pinned_step is not None:
+                    # Serverless path: ties this leaderboard row back to its
+                    # W&B run group and exact LoRA checkpoint step.
                     sft_row_name = f"sft-{suffix}-step{sft_pinned_step}"
                     print(f"Pinning sft row to checkpoint :step{sft_pinned_step}")
                     sft_wrapper = Tau2BaseModelWrapper(
                         name=sft_row_name,
-                        model=trained_model,
+                        model=sft_trained_model,
                         model_name=sft_row_name,
                         domain=domain,
                         user_llm=user_llm,
@@ -368,6 +420,13 @@ async def main(
                     models.append(sft_wrapper)
                     model_names.append("sft")
                     display_names.append(sft_row_name)
+                else:
+                    print(
+                        "Skipping sft row (no .sft_endpoint_step found and no "
+                        "--sft-model-alias passed). This is normal for ad-hoc runs."
+                    )
+            # Re-bind trained_model so the existing rl branch below still resolves.
+            trained_model = rl_trained_model
 
             if should_eval_rl:
                 if rl_pinned_alias is not None:
@@ -406,12 +465,13 @@ async def main(
                 display_names.append(rl_row_name)
         except Exception as e:
             print(f"Could not load trained model {trained_name}: {e}")
-    elif (should_eval_sft or should_eval_rl) and not trained_name:
-        print(
-            "\nSkipping sft / rl rows (no trained model name available). "
-            "Set leaderboard_trained_model_name in config, pass --trained-model-name, "
-            "or run train first to create .last_trained_model."
-        )
+    elif (should_eval_sft and not sft_collection_name) or (should_eval_rl and not rl_collection_name):
+        missing = []
+        if should_eval_sft and not sft_collection_name:
+            missing.append("sft (need --sft-trained-model-name or --trained-model-name)")
+        if should_eval_rl and not rl_collection_name:
+            missing.append("rl (need --trained-model-name)")
+        print(f"\nSkipping rows: {', '.join(missing)}")
 
     if not models:
         print("\nNo models to evaluate (base may have been auto-skipped).")
@@ -526,6 +586,29 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--sft-trained-model-name",
+        type=str,
+        default=None,
+        help=(
+            "Use a SEPARATE ART/W&B model collection for the sft row instead "
+            "of reusing --trained-model-name. Required for the onprem backend "
+            "where SFT and RL upload to different W&B artifact collections "
+            "(e.g. tau2-sft-... vs tau2-rl-...). Defaults to --trained-model-name."
+        ),
+    )
+    parser.add_argument(
+        "--sft-model-alias",
+        type=str,
+        default=None,
+        help=(
+            "Pin the sft row directly to a W&B artifact alias (e.g. 'v0'). "
+            "Required for onprem-uploaded LoRAs which carry W&B version aliases "
+            "(:v0, :v1) instead of the ART-style :step{N} aliases that "
+            ".sft_endpoint_step expects. Auto-derived from .sft_lora_artifact_uri "
+            "when invoked via run_pipeline.py --backend onprem."
+        ),
+    )
+    parser.add_argument(
         "--reevaluate-base",
         action="store_true",
         help=(
@@ -541,5 +624,7 @@ if __name__ == "__main__":
         trained_model_name=args.trained_model_name,
         trained_model_step=args.trained_model_step,
         trained_model_alias=args.trained_model_alias,
+        sft_trained_model_name=args.sft_trained_model_name,
+        sft_model_alias=args.sft_model_alias,
         reevaluate_base=args.reevaluate_base,
     ))
