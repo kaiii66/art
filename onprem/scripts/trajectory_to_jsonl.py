@@ -57,16 +57,39 @@ def _choice_to_assistant_dict(choice: Any) -> dict:
     return out
 
 
+def _ensure_string_content(msg: dict) -> dict:
+    """Guarantee `msg['content']` is a string.
+
+    The Qwen3 (and most other) chat templates dereference `message.content`
+    unconditionally for assistant/user/tool/system roles -- e.g.
+        {%- set content = message.content %}
+        {%- if '</think>' in message.content %}
+    A missing `content` key raises `jinja2.UndefinedError: 'dict object' has no
+    attribute 'content'` and crashes tokenization, which kills the entire
+    distributed run with a confusing rank-N exitcode 1. Common offenders:
+      * assistant turns that are pure tool_calls and omit `content` entirely
+      * tool results where `content` is None (or a non-str like dict/list)
+    Coerce all of these to a string so the template can render.
+    """
+    if "content" not in msg or msg["content"] is None:
+        msg["content"] = ""
+    elif not isinstance(msg["content"], str):
+        # Tool/function outputs are sometimes dicts or lists; the template
+        # concatenates them as strings, so JSON-serialize for readability.
+        msg["content"] = json.dumps(msg["content"], ensure_ascii=False)
+    return msg
+
+
 def _normalize_messages(messages_and_choices: Iterable[Any]) -> list[dict]:
     """Coerce mixed-type ART message list to OpenAI chat dicts."""
     out: list[dict] = []
     for item in messages_and_choices:
         if isinstance(item, dict):
-            out.append(item)
+            out.append(_ensure_string_content(dict(item)))
             continue
         # Best-effort: anything else we treat as an OpenAI Choice.
         if hasattr(item, "message"):
-            out.append(_choice_to_assistant_dict(item))
+            out.append(_ensure_string_content(_choice_to_assistant_dict(item)))
             continue
         raise TypeError(
             f"Unexpected item in messages_and_choices: {type(item).__name__}. "

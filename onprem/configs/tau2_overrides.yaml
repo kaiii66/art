@@ -1,0 +1,182 @@
+# Hydra overlay for the on-prem tau2-bench RL trainer.
+#
+# Layered on top of rllm's `agent_ppo_trainer` config (which itself layers on
+# verl's `ppo_trainer`). Only the values we actually want to deviate from
+# rllm/verl defaults live here -- everything else (most of `actor_rollout_ref`,
+# `critic`, `algorithm.kl_ctrl`, etc.) is inherited.
+#
+# Usage:
+#   python -m onprem.scripts.rllm_train_tau2 \
+#       --config-path /workspace/configs \
+#       --config-name tau2_overrides \
+#       trainer.n_gpus_per_node=8
+
+hydra:
+  searchpath:
+    - pkg://rllm.trainer.config
+    - pkg://verl.trainer.config
+
+defaults:
+  - agent_ppo_trainer
+  - _self_
+
+# ---------------------------------------------------------------------------
+# tau2-specific config (consumed by rllm_train_tau2.py only; not by verl).
+# ---------------------------------------------------------------------------
+tau2:
+  project: tau2-ART-autoresearch-telecom
+  group: null  # K8s sets WANDB_RUN_GROUP
+
+  workflow:
+    # Max agent turns per rollout. tau2's own DEFAULT_MAX_STEPS is 100, but
+    # for RL we keep it tighter to bound rollout length and OOM risk.
+    max_steps: 50
+
+  env:
+    domain: telecom
+    max_user_errors: 10
+    # Telecom-specific shaping: nl_assertions and communicate are mostly null
+    # for telecom (reward_basis = ENV_ASSERTION), so weight gets redistributed
+    # inside compute_shaped_reward. step_penalty 0 to avoid pushing the model
+    # to skip verification tools during the SFT->RL handoff.
+    shaped_reward_weights:
+      action: 0.35
+      communicate: 0.10
+      nl_assertions: 0.30
+      termination: 0.15
+      tool_accuracy: 0.15
+      tool_arg_accuracy: 0.05
+      step_penalty: 0.0
+
+  agent:
+    domain: telecom
+    parser_name: qwen
+
+  user:
+    model: wandb/Qwen/Qwen3-30B-A3B-Instruct-2507
+    llm_args:
+      temperature: 1.0
+      max_tokens: 16384
+
+  dataset:
+    name: tau2-telecom
+    training_artifact: tau2-ART-telecom-training-scenarios:latest
+    validation_artifact: tau2-ART-telecom-validation-scenarios:latest
+    validation_split: test
+    num_train_tasks: null     # full split
+    num_val_tasks: null
+
+# ---------------------------------------------------------------------------
+# verl/rllm overrides (mirrors the bash flags in rllm's example .sh recipes).
+# ---------------------------------------------------------------------------
+algorithm:
+  adv_estimator: grpo
+  kl_ctrl:
+    kl_coef: 0.001
+  use_kl_in_reward: false
+
+data:
+  train_batch_size: 32           # 2 groups * 16 rollouts (matches old config)
+  val_batch_size: 64
+  max_prompt_length: 12288       # 12k for tau2's long policy prompts
+  max_response_length: 4096
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: Qwen/Qwen3-30B-A3B-Instruct-2507
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+    lora_rank: 16
+    lora_alpha: 32
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+  actor:
+    optim:
+      lr: 5.0e-7
+    strategy: fsdp2
+    loss_agg_mode: token-mean
+    ppo_mini_batch_size: 32
+    use_dynamic_bsz: false
+    ppo_max_token_len_per_gpu: 24000
+    use_kl_loss: false
+    clip_ratio_high: 0.2
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    ulysses_sequence_parallel_size: 1
+    entropy_coeff: 0
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+  rollout:
+    name: vllm
+    mode: async
+    tensor_model_parallel_size: 8
+    gpu_memory_utilization: 0.85
+    enforce_eager: false
+    enable_lora: true
+    max_lora_rank: 16
+    max_model_len: 16384
+    temperature: 0.7
+    top_p: 0.95
+    n: 16                        # rollouts per group
+    val_kwargs:
+      n: 1
+      temperature: 0.7
+      top_p: 0.95
+      do_sample: true
+    log_prob_micro_batch_size_per_gpu: 1
+  ref:
+    fsdp_config:
+      param_offload: true
+    log_prob_micro_batch_size_per_gpu: 1
+
+rllm:
+  agent:
+    name: tau2_assistant
+    max_steps: ${tau2.workflow.max_steps}
+  env:
+    name: tau2_env
+  workflow:
+    use_workflow: true
+    name: multi_turn_workflow
+    workflow_args:
+      timeout: 1000000
+      gamma: 0.0
+      reward_bonus_coeff: 0.0
+    n_parallel_tasks: 32
+    retry_limit: 2
+  mask_truncated_samples: false
+  stepwise_advantage:
+    enable: false
+    mode: broadcast
+    normalize_by_steps: false
+  compact_filtering:
+    enable: true
+    mask_max_prompt_length_exceeded: true
+    mask_max_response_length_exceeded: true
+    mask_env_done: false
+    mask_max_turns_exceeded: false   # MAX_TURNS is signal for tau2; keep it
+    mask_timeout: true
+    mask_unknown: false
+    mask_error: true
+
+trainer:
+  project_name: tau2-ART-autoresearch-telecom
+  experiment_name: rl-${oc.env:PIPELINE_SUFFIX,manual}
+  logger:
+    - console
+    - wandb
+  n_gpus_per_node: 8
+  nnodes: 1
+  total_epochs: 1
+  save_freq: 100
+  test_freq: 25
+  val_before_train: false
+  critic_warmup: 0
+  default_local_dir: /artifacts/rl-lora
+  default_hdfs_dir: null
+  log_episodes: false

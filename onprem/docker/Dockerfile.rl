@@ -77,11 +77,11 @@ COPY train_tau2_distill.py /workspace/repo/
 COPY onprem/scripts/ /workspace/scripts/
 COPY onprem/configs/ /workspace/configs/
 COPY data/tau2/domains/telecom/ /workspace/repo/data/tau2/domains/telecom/
-# rllm_train_tau2.py imports `from onprem.scripts.tau2_rllm_rollout import ...`
-# (the K8s pod runs the script via /workspace/scripts/, but the import path
-# expects an `onprem` package on PYTHONPATH). We copy the whole onprem/
-# tree into /workspace/repo/onprem/ so Python's namespace-package machinery
-# (3.3+, no __init__.py needed) can resolve the import.
+# The Hydra entrypoint (`python -m onprem.scripts.rllm_train_tau2`) imports
+# `from onprem.scripts.tau2_rl_env import Tau2Env` and friends, so the
+# `onprem` namespace package needs to live on PYTHONPATH. We copy the whole
+# onprem/ tree into /workspace/repo/onprem/ so Python's namespace-package
+# machinery (3.3+, no __init__.py needed) can resolve the import.
 COPY onprem/ /workspace/repo/onprem/
 
 RUN chmod +x /workspace/scripts/*.sh

@@ -1,248 +1,259 @@
-"""
-On-prem GRPO RL trainer for tau2-bench.
+"""On-prem GRPO RL trainer for tau2-bench (rLLM v0.2.1.post1, verl backend).
 
-Replaces the ART ServerlessBackend GRPO loop in train_tau2.py with rLLM's
-AgentTrainer (verl backend) running on a single 8xH100 K8s pod. Colocated
-vLLM server (TP=8) hosts the in-training student LoRA; the user simulator
-keeps hitting W&B Inference.
+Hydra entry point. Build:
+  * the W&B run (so verl's `wandb` logger reuses it)
+  * the rLLM `Dataset` (train / val), registered into the parquet store
+    verl reads via `Dataset.get_verl_data_path()`
+  * the `AgentTrainer` with `workflow_class=MultiTurnWorkflow`, plumbing
+    in `Tau2Env` + `Tau2AssistantAgent` via `workflow_args`
+  * starting LoRA discovery (local dir or W&B artifact URI -> local dir)
 
-Inputs (env vars, set by the K8s Job):
-  WANDB_API_KEY, HF_TOKEN, RLLM_API_KEY
-  WANDB_PROJECT, WANDB_RUN_GROUP, WANDB_NAME, PIPELINE_SUFFIX
-  STARTING_LORA_DIR        (e.g. /artifacts/sft-lora -- already merged-in PEFT dir)
-  STARTING_LORA_URI        (optional fallback: wandb-artifact:///... ; downloaded if dir missing)
-  RL_OUTPUT_DIR            (default: /artifacts/rl-lora)
-  LORA_ARTIFACT_NAME       (e.g. tau2-rl-Qwen3-30B-A3B-Instruct-2507-04270927)
-  POLICY_BASE_URL          (default: http://127.0.0.1:8000/v1 -- the colocated vLLM)
-  POLICY_MODEL_NAME        (default: "policy")
+Run via the launcher (`onprem/scripts/run_rllm_rl.sh`):
 
-CLI:
-  python rllm_train_tau2.py \\
-      --config /workspace/configs/rllm_train_config.yaml \\
-      --starting-lora $STARTING_LORA_DIR \\
-      --output-dir   $RL_OUTPUT_DIR
+  python -m onprem.scripts.rllm_train_tau2 \
+      --config-path /workspace/configs \
+      --config-name tau2_overrides
+
+All Hydra/verl knobs (lr, n_gpus, max_prompt_length, ...) live in
+`onprem/configs/tau2_overrides.yaml` (a Hydra overlay on top of rllm's
+default `agent_ppo_trainer` config). Bash-side overrides still work via
+`+key=value` Hydra syntax.
 """
 from __future__ import annotations
 
-import argparse
-import asyncio
 import json
 import logging
 import os
 import sys
-from functools import partial
 from pathlib import Path
+from typing import Optional
 
-import yaml
-from dotenv import load_dotenv
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
-import wandb
-
+# Make the existing repo importable (the K8s pod ships /workspace/repo on
+# PYTHONPATH but a smoke `python -m onprem.scripts.rllm_train_tau2`
+# from a checkout needs the explicit insert too).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from train_tau2 import (
-    load_training_tasks_from_artifact,
-    load_validation_tasks,
-)
-from tau2.run import get_tasks
-
-from onprem.scripts.tau2_rllm_rollout import (
-    tau2_rl_rollout,
-    build_policy_client,
-    build_user_client,
-)
-
-load_dotenv()
 logger = logging.getLogger("rllm_train_tau2")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(name)s] %(message)s")
 
 
-def _import_agent_trainer():
-    """rLLM moves fast; try a couple of import paths for AgentTrainer."""
-    try:
-        from rllm.trainer import AgentTrainer  # type: ignore[import-not-found]
-        return AgentTrainer
-    except ImportError:
-        pass
-    try:
-        from rllm import AgentTrainer  # type: ignore[import-not-found]
-        return AgentTrainer
-    except ImportError:
-        pass
-    raise ImportError(
-        "Could not import rllm.trainer.AgentTrainer or rllm.AgentTrainer. "
-        "Verify the installed rllm version matches the one this script targets."
-    )
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
 
+def _resolve_starting_lora() -> Optional[str]:
+    """Return a local PEFT dir to start from, downloading from W&B if needed.
 
-def _resolve_starting_lora(starting_lora_arg: str | None) -> str:
-    """Return a local PEFT dir to start from. Download from W&B if needed."""
-    starting_dir = starting_lora_arg or os.environ.get("STARTING_LORA_DIR", "")
+    Returns None if neither a local dir nor a W&B URI is provided -- the
+    trainer will then start from the base model with a fresh LoRA.
+    """
+    starting_dir = os.environ.get("STARTING_LORA_DIR", "")
     if starting_dir and Path(starting_dir).is_dir():
-        logger.info("starting LoRA dir present locally: %s", starting_dir)
-        return starting_dir
+        contents = list(Path(starting_dir).iterdir())
+        if contents:
+            logger.info("starting LoRA dir present locally: %s (%d entries)", starting_dir, len(contents))
+            return starting_dir
+        logger.warning("starting LoRA dir %s exists but is empty; trying W&B fallback", starting_dir)
 
     uri = os.environ.get("STARTING_LORA_URI", "")
     if not uri:
-        raise RuntimeError(
-            "Neither --starting-lora / STARTING_LORA_DIR (existing dir) nor "
-            "STARTING_LORA_URI is set. RL needs an SFT LoRA to initialize from."
-        )
+        logger.info("no starting LoRA configured -- training from scratch on top of base")
+        return None
+
     prefix = "wandb-artifact:///"
     if not uri.startswith(prefix):
-        raise RuntimeError(f"unexpected STARTING_LORA_URI shape: {uri}")
+        raise RuntimeError(f"STARTING_LORA_URI must start with {prefix}; got {uri!r}")
     ref = uri[len(prefix):]
     target = Path(starting_dir or "/artifacts/sft-lora-from-wandb")
     target.mkdir(parents=True, exist_ok=True)
     logger.info("downloading starting LoRA artifact %s -> %s", ref, target)
+    import wandb
     api = wandb.Api()
     art = api.artifact(ref, type="lora")
     art.download(root=str(target))
     return str(target)
 
 
-def _build_train_dataset(config: dict, num_tasks: int | None) -> list[dict]:
-    """Return [{task_id, domain}, ...] rows for AgentTrainer.fit."""
-    tasks = load_training_tasks_from_artifact(config, num_tasks=num_tasks)
-    if tasks is None:
-        tasks = get_tasks(
-            task_set_name=config["domain"],
-            task_split_name="train",
-            num_tasks=num_tasks,
-        )
-        logger.info("loaded %d training tasks from %s/train (fallback)", len(tasks), config["domain"])
-    else:
-        logger.info(
-            "loaded %d training tasks from W&B artifact (%s)",
-            len(tasks), config.get("training_dataset_artifact"),
-        )
-    return [{"task_id": t.id, "domain": config["domain"]} for t in tasks]
+def _build_workflow_args(config: DictConfig, max_steps: int) -> dict:
+    """Construct the workflow_args dict for AgentTrainer."""
+    from onprem.scripts.tau2_rl_agent import Tau2AssistantAgent
+    from onprem.scripts.tau2_rl_env import Tau2Env
+
+    env_cfg = config.tau2.env
+    agent_cfg = config.tau2.agent
+    user_cfg = config.tau2.user
+
+    env_args = {
+        "domain": env_cfg.domain,
+        "max_steps": max_steps,
+        "user_llm": user_cfg.model,
+        "user_llm_args": OmegaConf.to_container(user_cfg.llm_args, resolve=True),
+        "shaped_reward_weights": OmegaConf.to_container(env_cfg.shaped_reward_weights, resolve=True),
+        "max_user_errors": int(env_cfg.get("max_user_errors", 10)),
+    }
+    agent_args = {
+        "domain": agent_cfg.domain,
+        "parser_name": agent_cfg.get("parser_name", "qwen"),
+    }
+
+    return {
+        "agent_cls": Tau2AssistantAgent,
+        "env_cls": Tau2Env,
+        "agent_args": agent_args,
+        "env_args": env_args,
+        "max_steps": max_steps,
+        "timeout": int(config.rllm.workflow.workflow_args.get("timeout", 1_000_000)),
+        "gamma": float(config.rllm.workflow.workflow_args.get("gamma", 0.0)),
+        "reward_bonus_coeff": float(
+            config.rllm.workflow.workflow_args.get("reward_bonus_coeff", 0.0)
+        ),
+    }
 
 
-async def main(args: argparse.Namespace) -> int:
-    config_path = Path(args.config)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
-    with config_path.open() as f:
-        config = yaml.safe_load(f)
+def _init_wandb(config: DictConfig) -> Optional[str]:
+    """Init the W&B run that verl's wandb logger reuses. Returns the run name."""
+    import wandb
 
-    # ----- W&B (the rllm 'wandb' logger reuses this run) -----
-    project = os.environ.get("WANDB_PROJECT") or config["project"]
-    group = os.environ.get("WANDB_RUN_GROUP") or config.get("group")
-    name = os.environ.get("WANDB_NAME") or f"rl-{os.environ.get('PIPELINE_SUFFIX','manual')}"
+    project = (
+        os.environ.get("WANDB_PROJECT")
+        or config.trainer.get("project_name", None)
+        or config.tau2.get("project")
+    )
+    group = os.environ.get("WANDB_RUN_GROUP") or config.tau2.get("group")
+    name = (
+        os.environ.get("WANDB_NAME")
+        or config.trainer.get("experiment_name")
+        or f"rl-{os.environ.get('PIPELINE_SUFFIX', 'manual')}"
+    )
+
     wandb.init(
         project=project,
         group=group,
         name=name,
-        config=config,
+        config=OmegaConf.to_container(config, resolve=True),
         job_type="rl-train",
     )
+    return name
 
-    # ----- starting LoRA (the SFT output) -----
-    starting_lora = _resolve_starting_lora(args.starting_lora)
 
-    # ----- dataset -----
-    train_rows = _build_train_dataset(config, num_tasks=args.num_tasks)
+def _attach_lora(config: DictConfig, starting_lora: Optional[str]) -> None:
+    """Wire the starting LoRA into the verl model config so verl loads it."""
+    if not starting_lora:
+        return
 
-    # ----- tracked clients passed into every rollout -----
-    policy_base_url = os.environ.get("POLICY_BASE_URL", "http://127.0.0.1:8000/v1")
-    policy_model_name = os.environ.get("POLICY_MODEL_NAME", "policy")
-    user_model_name = config.get("user_llm", "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507")
+    # verl's lora-init knob (added in 0.6+). If not present in the config
+    # tree we add it dynamically; verl reads it via OmegaConf attribute access.
+    OmegaConf.update(config, "actor_rollout_ref.model.lora_path", starting_lora, force_add=True)
+    OmegaConf.update(config, "actor_rollout_ref.rollout.lora_path", starting_lora, force_add=True)
+    logger.info("attached starting LoRA at %s to actor + rollout configs", starting_lora)
 
-    policy_client = build_policy_client(base_url=policy_base_url, api_key="EMPTY")
-    user_client = build_user_client()  # WANDB_API_KEY from env
 
-    # ----- bind rollout kwargs (rllm AgentTrainer takes a callable) -----
-    rollout_callable = partial(
-        tau2_rl_rollout,
-        policy_client=policy_client,
-        user_client=user_client,
-        policy_model_name=policy_model_name,
-        user_model_name=user_model_name,
-        domain=config["domain"],
-        max_steps=config.get("max_orchestrator_steps", 100),
-        user_llm_args=config.get("user_llm_args"),
-        agent_llm_args=config.get("agent_llm_args"),
-        shaped_reward_weights=config.get("shaped_reward_weights"),
-    )
-
-    # ----- AgentTrainer -----
-    AgentTrainer = _import_agent_trainer()
-
-    output_dir = args.output_dir or os.environ.get("RL_OUTPUT_DIR", "/artifacts/rl-lora")
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-    rollout_cfg = config.get("rollout", {})
-    trainer = AgentTrainer(
-        rollout=rollout_callable,
-        backend="verl",
-        model=config["base_model"],
-        starting_lora=starting_lora,
-        algorithm=config.get("algorithm", "grpo"),
-        lora={
-            "r":              config.get("lora_rank", 16),
-            "alpha":          config.get("lora_alpha", 32),
-            "target_modules": config.get("lora_target_modules", ["q_proj","k_proj","v_proj","o_proj"]),
-        },
-        rollouts_per_group=config.get("rollouts_per_group", 16),
-        groups_per_step=config.get("groups_per_step", 4),
-        learning_rate=float(config.get("learning_rate", 5e-7)),
-        num_epochs=config.get("num_epochs", 1),
-        rollout_server={
-            "name":                  rollout_cfg.get("name", "vllm"),
-            "tensor_parallel_size":  rollout_cfg.get("tensor_parallel_size", 8),
-            "gpu_memory_utilization": rollout_cfg.get("gpu_memory_utilization", 0.85),
-            "max_model_len":          rollout_cfg.get("max_model_len", 16384),
-            "enforce_eager":          rollout_cfg.get("enforce_eager", False),
-            "enable_lora":            rollout_cfg.get("enable_lora", True),
-            "max_lora_rank":          rollout_cfg.get("max_lora_rank", 16),
-        },
-        logger=config.get("loggers", ["console", "wandb", "ui"]),
-        project=project,
-        output_dir=output_dir,
-        seed=config.get("random_seed", 42),
-    )
-
-    logger.info(
-        "AgentTrainer ready. Starting fit() with %d training tasks; "
-        "groups_per_step=%s rollouts_per_group=%s lr=%s output=%s",
-        len(train_rows),
-        config.get("groups_per_step"),
-        config.get("rollouts_per_group"),
-        config.get("learning_rate"),
-        output_dir,
-    )
-
-    # rllm AgentTrainer.fit may be sync or async depending on version.
-    fit_result = trainer.fit(dataset=train_rows)
-    if asyncio.iscoroutine(fit_result):
-        await fit_result
-
-    # ----- write a small summary so the K8s entrypoint can publish the LoRA -----
+def _write_summary(config: DictConfig, output_dir: str, n_train: int, n_val: int) -> None:
+    """Drop a small summary the K8s entrypoint can read after training."""
     summary = {
         "output_dir": output_dir,
-        "starting_lora": starting_lora,
-        "train_rows": len(train_rows),
-        "config_path": str(config_path),
+        "domain": config.tau2.env.domain,
+        "base_model": config.actor_rollout_ref.model.path,
+        "n_train": n_train,
+        "n_val": n_val,
+        "lora_rank": config.actor_rollout_ref.model.get("lora_rank"),
+        "max_steps_per_episode": config.tau2.workflow.max_steps,
     }
-    Path(output_dir, "rl_summary.json").write_text(json.dumps(summary, indent=2))
-    logger.info("RL training finished. Output dir: %s", output_dir)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "rl_summary.json").write_text(json.dumps(summary, indent=2))
 
+
+# ---------------------------------------------------------------------------
+# Hydra entry
+# ---------------------------------------------------------------------------
+
+@hydra.main(
+    config_path="../configs",
+    config_name="tau2_overrides",
+    version_base=None,
+)
+def main(config: DictConfig) -> None:
+    from rllm.trainer.agent_trainer import AgentTrainer
+    from rllm.workflows.multi_turn_workflow import MultiTurnWorkflow
+
+    from onprem.scripts.tau2_rl_dataset import build_and_register
+
+    # ----- W&B -----
+    run_name = _init_wandb(config)
+    logger.info("W&B run initialised: %s", run_name)
+
+    # ----- starting LoRA (the SFT output) -----
+    starting_lora = _resolve_starting_lora()
+    _attach_lora(config, starting_lora)
+
+    # ----- output dir -----
+    output_dir = os.environ.get(
+        "RL_OUTPUT_DIR",
+        config.trainer.get("default_local_dir", "/artifacts/rl-lora"),
+    )
+    OmegaConf.update(config, "trainer.default_local_dir", output_dir, force_add=True)
+
+    # ----- dataset -----
+    train_ds, val_ds = build_and_register(
+        domain=config.tau2.env.domain,
+        project=config.trainer.get("project_name"),
+        artifact_name=config.tau2.dataset.get("training_artifact"),
+        val_artifact_name=config.tau2.dataset.get("validation_artifact"),
+        val_split=config.tau2.dataset.get("validation_split", "test"),
+        num_train_tasks=config.tau2.dataset.get("num_train_tasks"),
+        num_val_tasks=config.tau2.dataset.get("num_val_tasks"),
+        dataset_name=config.tau2.dataset.get("name", f"tau2-{config.tau2.env.domain}"),
+    )
+    logger.info(
+        "registered datasets: train=%d, val=%s",
+        len(train_ds.data),
+        len(val_ds.data) if val_ds is not None else "skipped",
+    )
+
+    # ----- workflow_args -----
+    max_steps = int(config.tau2.workflow.max_steps)
+    workflow_args = _build_workflow_args(config, max_steps=max_steps)
+
+    # Tell rllm that we are using a workflow (sets the trainer-side switch
+    # in train_agent_ppo.py around the AgentWorkflowPPOTrainer branch).
+    OmegaConf.update(config, "rllm.workflow.use_workflow", True, force_add=True)
+    OmegaConf.update(config, "rllm.workflow.name", "multi_turn_workflow", force_add=True)
+    OmegaConf.update(config, "rllm.agent.max_steps", max_steps, force_add=True)
+
+    # ----- train -----
+    trainer = AgentTrainer(
+        workflow_class=MultiTurnWorkflow,
+        workflow_args=workflow_args,
+        config=config,
+        train_dataset=train_ds,
+        val_dataset=val_ds,
+        backend="verl",
+    )
+    logger.info(
+        "AgentTrainer ready (workflow=MultiTurnWorkflow, max_steps=%d, train=%d, val=%s)",
+        max_steps,
+        len(train_ds.data),
+        len(val_ds.data) if val_ds is not None else "skipped",
+    )
+    trainer.train()
+
+    _write_summary(
+        config,
+        output_dir,
+        n_train=len(train_ds.data),
+        n_val=len(val_ds.data) if val_ds is not None else 0,
+    )
+
+    import wandb
     wandb.finish()
-    return 0
-
-
-def _cli() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", required=True, help="Path to rllm_train_config.yaml.")
-    parser.add_argument("--starting-lora", default=None, help="Local PEFT dir to start from (overrides STARTING_LORA_DIR).")
-    parser.add_argument("--output-dir",    default=None, help="Where to write the trained LoRA (default: /artifacts/rl-lora).")
-    parser.add_argument("--num-tasks", type=int, default=None, help="Cap training tasks (default: full train split).")
-    args = parser.parse_args()
-    raise SystemExit(asyncio.run(main(args)))
+    logger.info("RL training finished. Output dir: %s", output_dir)
 
 
 if __name__ == "__main__":
-    _cli()
+    main()
