@@ -53,6 +53,11 @@ export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 # colocated TP=8. Disable cuMem-based NCCL allocator + symmetric-memory so
 # vLLM falls back to plain NCCL collectives that play nicely with FSDP.
 export VLLM_USE_V1=1
+# vLLM's TP all-reduce path defaults to PyTorch symmetric-memory (cuMem),
+# which can't rendezvous when FSDP has already pinned the same devices.
+# Falling back to NCCL all-reduce (the default before 0.x) is the supported
+# escape hatch.
+export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 export NCCL_CUMEM_ENABLE=0
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
