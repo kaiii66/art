@@ -118,6 +118,17 @@ cut_cross_entropy: true
 # trade: slightly slower MLP, much smaller peak.
 tiled_mlp_use_original_mlp: false
 
+# Activation offloading: stream saved activations off-GPU to pinned CPU
+# memory during the forward pass and bring them back during backward.
+# After CCE eliminated the 10 GiB logits OOM in the loss, the next OOM
+# moved to backward (loss.backward()) at 73.97 GiB allocated / 78.35 GiB
+# used / 0.84 GiB free, asking for another 1 GiB. Activation
+# checkpointing alone wasn't enough -- some saved tensors at the FSDP2
+# wrap boundaries still pin >70 GiB on each H100. Offloading those to
+# CPU cuts peak by another 4-8 GiB on this model with a modest (~5-15%)
+# wallclock cost via overlapped streams. Cheap insurance for our case.
+activation_offloading: true
+
 # ----- FSDP (8-way full shard across the 8 H100s) -----
 fsdp:
   - full_shard
