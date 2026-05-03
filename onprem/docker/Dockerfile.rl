@@ -29,22 +29,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git build-essential ninja-build curl ca-certificates jq \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip setuptools wheel
+RUN pip install --upgrade pip setuptools wheel packaging ninja
 
-# vLLM + FlashAttention pinned to versions known to work with sm_90 + Qwen3 MoE.
-# Bump deliberately, not on every build.
-RUN pip install --no-cache-dir \
-        "vllm>=0.7.0,<0.9.0"
-
-RUN pip install --no-cache-dir \
-        "flash-attn>=2.7.0" --no-build-isolation
+# rllm[verl] v0.2.1 pulls vllm==0.11.0 and flash-attn>=2.8.1 (with their
+# own torch==2.11.0 pin). flash-attn's setup.py imports torch at build
+# time, so we install it FIRST with --no-build-isolation so it can see
+# the NGC base's torch. Then `rllm[verl]` sees flash-attn already
+# satisfied and skips the rebuild. Pinned to 2.8.3 to match what the
+# rllm v0.2.1 resolver picked previously; bump deliberately.
+RUN pip install --no-cache-dir --no-build-isolation "flash-attn==2.8.3"
 
 # rLLM (agent-RL wrapper) + verl (gradient engine for GRPO). rLLM is
-# GitHub-only -- no PyPI package -- and ships verl as an [verl] extra so
-# we install both with one git+ URL. Pinned to v0.2.1.post1 (latest stable
-# as of 2026-05) for reproducibility; bump deliberately. The previous
-# `pip install rllm>=0.1.0` failed at build time with "No matching
-# distribution" because the PyPI name `rllm` is squatted/empty.
+# GitHub-only (no PyPI package) and ships verl + vllm as the [verl] extra
+# so we install both with one git+ URL. Pinned to v0.2.1.post1 (latest
+# stable as of 2026-05) for reproducibility; bump deliberately.
 RUN pip install --no-cache-dir \
         "rllm[verl] @ git+https://github.com/rllm-org/rllm.git@v0.2.1.post1"
 
