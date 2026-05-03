@@ -1,8 +1,13 @@
 # RL trainer container.
 #
-# Base : nvcr.io/nvidia/pytorch:24.10-py3 (CUDA 12.6, PyTorch 2.5, NCCL, cuBLAS)
+# Base : nvcr.io/nvidia/pytorch:25.08-py3 (CUDA 12.x, PyTorch 2.7+, Ubuntu
+#        24.04, Python 3.12). 25.08 is the first NGC PyTorch container with
+#        Python 3.12; we previously tried 24.10 (Python 3.10) and hit the
+#        2026-ecosystem-wide Python>=3.11 floor in scikit-learn>=1.8 and
+#        pandas>=3.0 (both enforced inside meson.build, so
+#        --ignore-requires-python doesn't help).
 # Adds : vLLM (rollout serving with hot-swap LoRA), FlashAttention,
-#        verl (gradient engine), rllm (agent-RL wrapper), tau2 + this repo
+#        rllm[verl] (gradient engine + agent-RL wrapper), tau2 + this repo
 #        (so the @rllm.rollout function can drive the tau2 orchestrator).
 #
 # Hardware target: H100 (sm_90). FlashAttention is built for sm_90.
@@ -13,7 +18,7 @@
 #     -f onprem/docker/Dockerfile.rl --push .
 
 # ----- base layer (heavy GPU deps, cached across iterations) -----
-FROM nvcr.io/nvidia/pytorch:24.10-py3 AS base
+FROM nvcr.io/nvidia/pytorch:25.08-py3 AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -56,25 +61,12 @@ FROM base AS app
 
 WORKDIR /workspace/repo
 
-# Install the tau2 package + repo deps from pyproject.toml. Use --no-deps in a
-# follow-up if you want to keep this layer thin; for now full install.
-#
-# `--ignore-requires-python` handles tau2's own pyproject.toml marker
-# (`requires-python = ">=3.11"`). The NVIDIA NGC PyTorch base (24.10-py3)
-# ships Python 3.10.12 because NGC tags either go 3.10 (<=25.06) or jump
-# to 3.12 (>=25.08), with no 3.11 in between. tau2's actual hot-path code
-# (tau2.orchestrator + tau2.environment + telecom domain) is plain
-# 3.10-compatible.
-#
-# We ALSO need to pre-pin scikit-learn <1.8 because sklearn 1.8.0 enforces
-# Python>=3.11 inside its meson.build (NOT in pyproject.toml), which
-# `--ignore-requires-python` doesn't override. Pinning to >=1.6.1,<1.8
-# satisfies tau2's `scikit-learn>=1.6.1` constraint with the last release
-# series that builds on 3.10.
-RUN pip install --no-cache-dir "scikit-learn>=1.6.1,<1.8"
+# Install the tau2 package + repo deps from pyproject.toml. The Python 3.12
+# base (NGC 25.08+) satisfies tau2's `requires-python = ">=3.11"` natively
+# so no --ignore-requires-python escape hatch is needed.
 COPY pyproject.toml pdm.lock README.md /workspace/repo/
 COPY src/ /workspace/repo/src/
-RUN pip install --no-cache-dir --ignore-requires-python -e .
+RUN pip install --no-cache-dir -e .
 
 # The pieces of the existing repo the rollout needs at runtime: the helpers,
 # the configs, the scripts. Code-only; no data.
