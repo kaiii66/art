@@ -48,7 +48,9 @@ export NCCL_P2P_DISABLE=0
 export NCCL_DEBUG=WARN
 export TOKENIZERS_PARALLELISM=false
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-export VLLM_USE_V1=1
+# vLLM v1's SymmMemCommunicator collides with FSDP's existing allocations
+# under colocated TP=8; v0's plain NCCL device-communicator path works fine.
+export VLLM_USE_V1=0
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 
