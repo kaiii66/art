@@ -48,9 +48,12 @@ export NCCL_P2P_DISABLE=0
 export NCCL_DEBUG=WARN
 export TOKENIZERS_PARALLELISM=false
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-# vLLM v1's SymmMemCommunicator collides with FSDP's existing allocations
-# under colocated TP=8; v0's plain NCCL device-communicator path works fine.
-export VLLM_USE_V1=0
+# verl's async rollout path requires VLLM_USE_V1=1, but v1's
+# SymmMemCommunicator + custom_all_reduce collide with FSDP allocations on
+# colocated TP=8. Disable cuMem-based NCCL allocator + symmetric-memory so
+# vLLM falls back to plain NCCL collectives that play nicely with FSDP.
+export VLLM_USE_V1=1
+export NCCL_CUMEM_ENABLE=0
 export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 

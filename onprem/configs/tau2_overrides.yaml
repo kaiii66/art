@@ -128,7 +128,15 @@ actor_rollout_ref:
       num_workers: 0              # workflow concurrency lives in n_parallel_tasks
     tensor_model_parallel_size: 8
     gpu_memory_utilization: 0.85
-    enforce_eager: false
+    # enforce_eager skips CUDA graph capture, which is the path that triggers
+    # vLLM's SymmMemCommunicator allocations colliding with FSDP shards on
+    # colocated TP=8. Slower per-token but unblocks the rollout init.
+    enforce_eager: true
+    engine_kwargs:
+      vllm:
+        # Disable vLLM's custom all-reduce (uses cuMem); fall back to NCCL,
+        # which co-exists with FSDP-allocated buffers under colocated TP.
+        disable_custom_all_reduce: true
     # NOTE: vLLM rollout LoRA is configured via the model section
     # (model.lora_rank/lora_alpha/lora_adapter_path) in verl 0.6+, NOT here.
     max_model_len: 16384
