@@ -131,12 +131,19 @@ actor_rollout_ref:
     # enforce_eager skips CUDA graph capture, which is the path that triggers
     # vLLM's SymmMemCommunicator allocations colliding with FSDP shards on
     # colocated TP=8. Slower per-token but unblocks the rollout init.
-    enforce_eager: true
+    # CUDA-graph capture is fine now that VLLM_ALLREDUCE_USE_SYMM_MEM=0; keep
+    # eager off for throughput.
+    enforce_eager: false
     engine_kwargs:
       vllm:
         # Disable vLLM's custom all-reduce (uses cuMem); fall back to NCCL,
         # which co-exists with FSDP-allocated buffers under colocated TP.
         disable_custom_all_reduce: true
+        # Profile-run dummy LoRA in vLLM 0.10+ chokes on the q_proj/k_proj/
+        # v_proj split when the underlying layer is the qkv_proj fused one,
+        # surfacing as `module_lora.lora_a is None` during _dummy_run.
+        # Disabling the LoRA extra-vocab path skips the dummy LoRA setup.
+        lora_extra_vocab_size: 0
     # NOTE: vLLM rollout LoRA is configured via the model section
     # (model.lora_rank/lora_alpha/lora_adapter_path) in verl 0.6+, NOT here.
     max_model_len: 16384
