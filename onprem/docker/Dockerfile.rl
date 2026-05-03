@@ -68,6 +68,16 @@ RUN pip install --no-cache-dir \
         hf_transfer>=0.1.8 \
         litellm>=1.65.0
 
+# vLLM 0.11's Qwen3-MoE LoRA dummy-warmup path crashes during
+# determine_available_memory()/profile_run() with
+#   AttributeError: 'NoneType' object has no attribute 'shape'
+# because PackedLoRA.set_lora() on the FusedMoE expert layers receives a
+# packed list whose lora_a is None (mismatch between the dummy LoRA generator
+# and the layer wrapper class for FusedMoE). The actual rollout LoRA path
+# works fine; only the warmup is broken. Patch maybe_select_dummy_loras to a
+# no-op so profile_run skips the buggy dummy-LoRA activation.
+RUN python -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/lora_model_runner_mixin.py'); s = p.read_text(); marker = '            self._set_active_loras(tuple(prompt_lora_mapping),\n                                   tuple(token_lora_mapping), lora_requests)'; assert marker in s, 'maybe_select_dummy_loras patch marker not found'; p.write_text(s.replace(marker, '            # vLLM-0.11 + Qwen3-MoE FusedMoE LoRA dummy warmup is broken;\n            # skip the dummy activation. Real LoRA requests still go through\n            # set_active_loras() unmodified.\n            pass'))"
+
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
 
