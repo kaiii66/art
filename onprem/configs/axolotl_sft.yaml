@@ -127,6 +127,15 @@ tiled_mlp_use_original_mlp: false
 # wrap boundaries still pin >70 GiB on each H100. Offloading those to
 # CPU cuts peak by another 4-8 GiB on this model with a modest (~5-15%)
 # wallclock cost via overlapped streams. Cheap insurance for our case.
+#
+# Axolotl's pydantic validator hard-requires `gradient_checkpointing`
+# whenever `activation_offloading` is set, even though we already enable
+# it via `fsdp_activation_checkpointing: true` inside fsdp_config. We
+# pass both -- they're functionally redundant under FSDP2 (both end up
+# calling apply_activation_checkpointing) but the validator demands the
+# top-level flag. The earlier "use fsdp_activation_checkpointing instead"
+# warning is informational; setting both does NOT double-wrap.
+gradient_checkpointing: true
 activation_offloading: true
 
 # ----- FSDP (8-way full shard across the 8 H100s) -----
