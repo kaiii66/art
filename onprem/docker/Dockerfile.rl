@@ -46,6 +46,12 @@ RUN pip install --no-cache-dir --no-build-isolation "flash-attn==2.8.3"
 RUN pip install --no-cache-dir \
         "rllm[verl] @ git+https://github.com/rllm-org/rllm.git@v0.2.1.post1"
 
+# NGC PyTorch 25.08 ships transformers 5.x and verl's `transformers` requirement
+# is unpinned, so pip happily lets the 5.x installation stand. verl 0.6.1's
+# trainer code still uses the 4.x AutoModelForVision2Seq import path
+# (removed in transformers 5.0). Pin to the last working 4.x stable.
+RUN pip install --no-cache-dir "transformers==4.55.4"
+
 # Standard helpers used by the trainer + upload scripts.
 RUN pip install --no-cache-dir \
         wandb>=0.18 \
