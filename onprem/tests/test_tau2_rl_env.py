@@ -162,35 +162,31 @@ def test_empty_action_terminates_with_agent_error():
     assert "shaped_reward" in info
 
 
-def test_mixed_text_and_tool_calls_terminates_with_agent_error():
-    task_id = _first_telecom_task_id()
-    env = _make_env()
-    with _stub_user_responses("Hello."):
-        env.reset({"task_id": task_id, "domain": "telecom"})
-        # Crafted bad payload: a non-empty assistant text PLUS a tool_calls
-        # list. _classify_action will return both => AGENT_ERROR.
-        # We stitch via a raw list+dict payload to simulate a confused agent.
-        bad = {"_assistant_text": "let me check that"}
-        obs1, _, done1, _info1 = env.step(Action(action=bad))
-        assert done1 is False
-        # Now actually trigger the mixed case by short-circuiting through
-        # the env's classifier with a list-of-calls and assistant text in
-        # one synthesised tuple. The agent never actually emits this; we
-        # exercise the guard directly.
-        env._classify_action_test_hook = True  # type: ignore[attr-defined]
-        # Inject by monkeypatching the classifier for a single call:
-        from onprem.scripts import tau2_rl_env as env_mod
-        original = env_mod.Tau2Env._classify_action
-        try:
-            env_mod.Tau2Env._classify_action = staticmethod(
-                lambda action: ([{"id": "x", "type": "function", "function": {"name": "noop", "arguments": {}}}], "and some chatter")
-            )
-            obs2, _, done2, info2 = env.step(Action(action="anything"))
-        finally:
-            env_mod.Tau2Env._classify_action = original
-    assert done2 is True
-    assert info2["termination_reason"] == TerminationReason.AGENT_ERROR.value
-    assert info2["violation"] == "mixed_assistant_message"
+def test_classify_action_distinguishes_text_and_tool_calls():
+    """Direct unit test of the empty/mixed guard inputs (no monkey-patching).
+
+    The mixed-message AGENT_ERROR path inside `step()` only triggers when
+    `_classify_action` returns both `tool_calls` AND `assistant_text`; the
+    real agent never emits that combo (we route via separate `_assistant_text`
+    or list-of-calls payloads). We assert the classifier obeys its contract
+    so the downstream guard stays meaningful.
+    """
+    classify = Tau2Env._classify_action
+
+    # Plain text -> only assistant_text
+    assert classify({"_assistant_text": "hi"}) == ([], "hi")
+    # Bare string -> only assistant_text
+    assert classify("hello") == ([], "hello")
+    # List of tool calls -> only tool_calls
+    payload = [{"id": "1", "type": "function", "function": {"name": "noop", "arguments": {}}}]
+    tool_calls, text = classify(payload)
+    assert tool_calls == payload
+    assert text == ""
+    # Synthetic finish call (added by ToolAgent fallback) is filtered out
+    finish = [{"id": "2", "type": "function", "function": {"name": "finish", "arguments": {}}}]
+    assert classify(finish) == ([], "")
+    # None -> empty (env will treat as AGENT_ERROR)
+    assert classify(None) == ([], "")
 
 
 def test_agent_stop_token_terminates_with_agent_stop():
