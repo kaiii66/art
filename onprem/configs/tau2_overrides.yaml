@@ -98,11 +98,11 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
     lora_rank: 16
     lora_alpha: 32
-    target_modules:
-      - q_proj
-      - k_proj
-      - v_proj
-      - o_proj
+    # verl 0.6.1's HFModelConfig.target_modules is typed as Optional[str] and
+    # rejects list literals via OmegaConf merge. Pass a peft regex matching
+    # the same modules our SFT LoRA targets (o/q/k/v_proj) so the rollout
+    # adapter shape stays compatible.
+    target_modules: "(q_proj|k_proj|v_proj|o_proj)"
   actor:
     optim:
       lr: 5.0e-7
