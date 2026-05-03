@@ -98,11 +98,15 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
     lora_rank: 16
     lora_alpha: 32
-    # verl 0.6.1's HFModelConfig.target_modules is typed as Optional[str] and
-    # rejects list literals via OmegaConf merge. Pass a peft regex matching
-    # the same modules our SFT LoRA targets (o/q/k/v_proj) so the rollout
-    # adapter shape stays compatible.
-    target_modules: "(q_proj|k_proj|v_proj|o_proj)"
+    # verl 0.6.1's HFModelConfig.target_modules is typed as Optional[str].
+    # The SFT adapter has weights for q/k/v/o_proj separately but vLLM's
+    # Qwen3-MoE model uses fused qkv_proj. Passing q_proj|k_proj|v_proj as a
+    # regex tricks vLLM's PackedLoRA generator into emitting None subloras
+    # for the qkv_proj packed module (-> AttributeError in dummy_run).
+    # Using "all-linear" lets peft pick all linear layers (it only loads
+    # weights for layers actually present in the adapter, leaving the rest
+    # zero); vLLM resolves the same string to its full LoRA layer set.
+    target_modules: "all-linear"
   actor:
     optim:
       lr: 5.0e-7
