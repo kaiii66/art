@@ -77,6 +77,10 @@ COPY train_tau2_distill.py /workspace/repo/
 COPY onprem/scripts/ /workspace/scripts/
 COPY onprem/configs/ /workspace/configs/
 COPY data/tau2/domains/telecom/ /workspace/repo/data/tau2/domains/telecom/
+# UserSimulator.system_prompt reads data/tau2/user_simulator/*.md at runtime
+# (the user-sim guidelines are domain-agnostic). Bake them in too so the
+# rollout doesn't crash with FileNotFoundError on the first reset.
+COPY data/tau2/user_simulator/ /workspace/repo/data/tau2/user_simulator/
 # The Hydra entrypoint (`python -m onprem.scripts.rllm_train_tau2`) imports
 # `from onprem.scripts.tau2_rl_env import Tau2Env` and friends, so the
 # `onprem` namespace package needs to live on PYTHONPATH. We copy the whole
