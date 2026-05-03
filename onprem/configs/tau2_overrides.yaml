@@ -120,18 +120,28 @@ actor_rollout_ref:
     clip_ratio_high: 0.2
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
-    ulysses_sequence_parallel_size: 1
-    entropy_coeff: 0
-    fsdp_config:
-      param_offload: true
-      optimizer_offload: true
+      ulysses_sequence_parallel_size: 1
+      entropy_coeff: 0
+      fsdp_config:
+        # CPU offload of FSDP shards + optimizer state inflates host RAM by
+        # ~120GB per rank (model + optimizer pinned), which combined with
+        # vLLM's sleep-mode pinned-memory copy pushes the 8-rank node past
+        # its 2TB host-RAM ceiling. Keep everything on GPU; H100 80GB has
+        # enough headroom for sharded LoRA training of 30B-MoE.
+        param_offload: false
+        optimizer_offload: false
   rollout:
     name: vllm
     mode: async                   # required by rllm AgentWorkflowEngine
     agent:
       num_workers: 0              # workflow concurrency lives in n_parallel_tasks
     tensor_model_parallel_size: 8
-    gpu_memory_utilization: 0.85
+    # Lower GPU mem util from default 0.85 to 0.6 so we leave headroom for
+    # FSDP actor weights + optimizer (now also on GPU after disabling CPU
+    # offload). vLLM rollout still gets ~48GB per H100 for KV cache + LoRA.
+    gpu_memory_utilization: 0.6
+    free_cache_engine: true
+    multi_stage_wake_up: true
     # enforce_eager skips CUDA graph capture, which is the path that triggers
     # vLLM's SymmMemCommunicator allocations colliding with FSDP shards on
     # colocated TP=8. Slower per-token but unblocks the rollout init.
@@ -163,10 +173,10 @@ actor_rollout_ref:
       top_p: 0.95
       do_sample: true
     log_prob_micro_batch_size_per_gpu: 1
-  ref:
-    fsdp_config:
-      param_offload: true
-    log_prob_micro_batch_size_per_gpu: 1
+    ref:
+      fsdp_config:
+        param_offload: false
+      log_prob_micro_batch_size_per_gpu: 1
 
 # ----- rllm section (mirrors agent_ppo_trainer.yaml; inlined because we
 #       can't inherit it without triggering Hydra's searchpath restriction). -----
