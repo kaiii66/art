@@ -267,7 +267,24 @@ def _wandb_entity() -> str | None:
 
 
 def _onprem_run_prepare_sft(snapshot: Path, dry_run: bool) -> str:
-    """Run Phase A (teacher rollouts) locally and return the dataset URI."""
+    """Run Phase A (teacher rollouts) locally and return the dataset URI.
+
+    Short-circuits if the snapshot already has a `.sft_dataset_artifact_uri`
+    marker file -- typically because a previous prepare-sft run already
+    rolled out the teacher trajectories and uploaded them to W&B. Reusing
+    the existing artifact saves ~10-20 minutes of teacher rollouts on every
+    SFT-only retry. To force a fresh rollout, delete the marker file
+    (`rm <snapshot>/.sft_dataset_artifact_uri`) before re-running.
+    """
+    marker = snapshot / ".sft_dataset_artifact_uri"
+    if marker.exists() and not dry_run:
+        existing_uri = marker.read_text().strip()
+        print("\n=== stage: prepare-sft (skipped — reusing existing artifact) ===")
+        print(f"    marker file  : {marker}")
+        print(f"    artifact URI : {existing_uri}")
+        print("    (delete the marker file to force a fresh teacher rollout)")
+        return existing_uri
+
     distill_cfg = snapshot / "train_distill_config.yaml"
     cmd = [
         "uv", "run", "python", "-m", "onprem.scripts.prepare_sft_data",
@@ -278,7 +295,6 @@ def _onprem_run_prepare_sft(snapshot: Path, dry_run: bool) -> str:
     run_stage("prepare-sft", cmd, log_path, dry_run=dry_run)
     if dry_run:
         return "wandb-artifact:///DRY-RUN/DRY-RUN/DRY-RUN:latest"
-    marker = snapshot / ".sft_dataset_artifact_uri"
     if not marker.exists():
         raise FileNotFoundError(
             f"{marker} not found after prepare-sft stage. "

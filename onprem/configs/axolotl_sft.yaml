@@ -46,15 +46,25 @@ val_set_size: 0.0   # validation handled separately by the leaderboard stage
 
 # ----- sequence packing / context length -----
 # Sample packing avoids padding waste for the variable-length tool-using
-# rollouts. 8192 covers the bulk of telecom rollouts at max_orchestrator_steps=100.
-sequence_len: 8192
+# rollouts. Tau2 telecom rollouts at max_orchestrator_steps=100 routinely
+# exceed 8192 tokens (observed: min ~7.9K, median ~9.7K, max ~14.7K tokens
+# across 228 records). Anything that exceeds `sequence_len` is silently
+# dropped by axolotl's "Drop Invalid Sequences" pass, so 8192 produced
+# `num_samples=0` and crashed the trainer. 16384 covers the full observed
+# distribution with headroom for chat-template overhead (tool schemas,
+# <think> blocks, im_start/im_end tokens).
+sequence_len: 16384
 sample_packing: true
 pad_to_sequence_len: true
 
 # ----- training schedule (mirrors train_distill_config.yaml) -----
+# Doubling sequence_len doubles activation memory, so halve micro_batch_size
+# (2 -> 1) and double gradient_accumulation_steps (4 -> 8) to keep the
+# effective per-step batch at micro * grad_accum * world_size = 1*8*8 = 64,
+# matching the previous 2*4*8 = 64.
 num_epochs: 2
-micro_batch_size: 2
-gradient_accumulation_steps: 4
+micro_batch_size: 1
+gradient_accumulation_steps: 8
 learning_rate: 1.0e-4
 warmup_ratio: 0.1
 lr_scheduler: cosine
