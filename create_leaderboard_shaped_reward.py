@@ -428,7 +428,7 @@ async def main(
             # Re-bind trained_model so the existing rl branch below still resolves.
             trained_model = rl_trained_model
 
-            if should_eval_rl:
+            if should_eval_rl and rl_trained_model is not None:
                 if rl_pinned_alias is not None:
                     rl_row_name = f"rl-{suffix}-alias-{rl_pinned_alias}"
                     print(
