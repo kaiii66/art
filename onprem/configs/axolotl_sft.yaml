@@ -86,6 +86,22 @@ tf32: true
 
 flash_attention: true
 
+# Cut Cross Entropy: fused CE kernel that computes loss without ever
+# materializing the (seq_len, vocab_size) logits tensor in fp32. With
+# seq_len=16384 and Qwen3 vocab=151,936, naive `logits.float()` allocates
+# ~9.94 GiB by itself -- which is exactly the 9.27 GiB we OOM'd on at
+# transformers/loss/loss_utils.py:55 after fixing fragmentation. Using
+# CCE drops peak memory by roughly that whole amount with no quality
+# impact (it's mathematically equivalent, just streamed).
+cut_cross_entropy: true
+
+# Defensive: use Axolotl's tiled MLP path which processes hidden states
+# in chunks instead of materializing the full (S, hidden) MLP activation
+# at once. Notable for big MoE models like Qwen3-30B-A3B where the per-
+# token expert activations dominate. This is a no-quality-impact memory
+# trade: slightly slower MLP, much smaller peak.
+tiled_mlp_use_original_mlp: false
+
 # ----- FSDP (8-way full shard across the 8 H100s) -----
 fsdp:
   - full_shard
