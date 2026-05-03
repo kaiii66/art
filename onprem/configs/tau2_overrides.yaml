@@ -16,8 +16,12 @@ hydra:
     - pkg://rllm.trainer.config
     - pkg://verl.trainer.config
 
+# Hydra disallows overriding hydra.searchpath from non-primary configs, so we
+# can't inherit `agent_ppo_trainer` (it declares its own searchpath). Instead
+# we inherit from `ppo_trainer` (verl's primary trainer config) and inline
+# the rllm-specific defaults agent_ppo_trainer would have layered on top.
 defaults:
-  - agent_ppo_trainer
+  - ppo_trainer
   - _self_
 
 # ---------------------------------------------------------------------------
@@ -80,6 +84,11 @@ data:
   val_batch_size: 64
   max_prompt_length: 12288       # 12k for tau2's long policy prompts
   max_response_length: 4096
+  # gen_batch_size = train_batch_size * rejection_sample.multiplier. The
+  # `mul` resolver gets registered by rllm's TaskRunner; we use a literal
+  # here so this config also loads cleanly in offline smoke tests.
+  gen_batch_size: ${data.train_batch_size}
+  return_multi_modal_inputs: false
 
 actor_rollout_ref:
   hybrid_engine: true
@@ -113,7 +122,9 @@ actor_rollout_ref:
       optimizer_offload: true
   rollout:
     name: vllm
-    mode: async
+    mode: async                   # required by rllm AgentWorkflowEngine
+    agent:
+      num_workers: 0              # workflow concurrency lives in n_parallel_tasks
     tensor_model_parallel_size: 8
     gpu_memory_utilization: 0.85
     enforce_eager: false
@@ -134,22 +145,36 @@ actor_rollout_ref:
       param_offload: true
     log_prob_micro_batch_size_per_gpu: 1
 
+# ----- rllm section (mirrors agent_ppo_trainer.yaml; inlined because we
+#       can't inherit it without triggering Hydra's searchpath restriction). -----
 rllm:
   agent:
     name: tau2_assistant
     max_steps: ${tau2.workflow.max_steps}
+    trajectory_timeout: null
+    overlong_filter: false
+    agent_args: {}
+    engine_args: {}
   env:
     name: tau2_env
+    env_args: {}
   workflow:
     use_workflow: true
     name: multi_turn_workflow
     workflow_args:
+      agent_cls: null
+      agent_args: {}
+      env_cls: null
+      env_args: {}
       timeout: 1000000
       gamma: 0.0
       reward_bonus_coeff: 0.0
     n_parallel_tasks: 32
     retry_limit: 2
+  disable_thinking: false
+  accumulate_reasoning: false
   mask_truncated_samples: false
+  filter_token_mismatch: true
   stepwise_advantage:
     enable: false
     mode: broadcast
@@ -163,6 +188,27 @@ rllm:
     mask_timeout: true
     mask_unknown: false
     mask_error: true
+  rejection_sample:
+    enable: false
+    multiplier: 1
+  sdk:
+    store:
+      path: ~/.rllm/traces.db
+    processing:
+      groupby_key: null
+      traj_name_key: null
+    proxy:
+      host: 127.0.0.1
+      port: 4000
+      mode: subprocess
+      admin_token: my-shared-secret
+
+# fireworks block is required by rllm's CLI / config validators even when we
+# don't use the fireworks backend; copy the agent_ppo_trainer defaults verbatim.
+fireworks:
+  deployment_id: null
+  model_id_prefix: test-model
+  concurrency: 32
 
 trainer:
   project_name: tau2-ART-autoresearch-telecom
