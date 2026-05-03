@@ -54,6 +54,12 @@ spec:
             - { name: LORA_ARTIFACT_NAME,        value: "__LORA_ARTIFACT_NAME__" }
             - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
             - { name: TOKENIZERS_PARALLELISM,    value: "false" }
+            # Use PyTorch's expandable_segments allocator to avoid the
+            # ~15 GiB of fragmentation we hit at sequence_len=16384 on the
+            # MoE layers (see prior OOM at grouped_mm_experts_forward).
+            # This alone has reclaimed enough memory in similar setups to
+            # turn an OOM-on-step-0 into a stable run.
+            - { name: PYTORCH_CUDA_ALLOC_CONF,   value: "expandable_segments:True" }
           volumeMounts:
             - { name: artifacts, mountPath: /artifacts }
             - { name: data,      mountPath: /data }

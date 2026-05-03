@@ -73,9 +73,16 @@ weight_decay: 0.0
 
 bf16: auto
 tf32: true
-gradient_checkpointing: true
-gradient_checkpointing_kwargs:
-  use_reentrant: false
+
+# Activation checkpointing belongs in `fsdp_config` under FSDP2, NOT as a
+# top-level `gradient_checkpointing: true`. The HF Trainer warns:
+#   "When using FSDP full shard, instead of using `gradient_checkpointing`
+#    in TrainingArguments, please use `activation_checkpointing` in
+#    `fsdp_config`. The former introduces a redundant AllGather operation
+#    in backward pass."
+# Using the wrong path (a) wastes memory by holding extra all-gathered
+# shards during backward, and (b) is exactly what triggered our prior OOM
+# at grouped_mm_experts_forward on the MoE layer.
 
 flash_attention: true
 
@@ -93,6 +100,7 @@ fsdp_config:
   fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
   fsdp_transformer_layer_cls_to_wrap: Qwen3MoeDecoderLayer
   fsdp_state_dict_type: FULL_STATE_DICT
+  fsdp_activation_checkpointing: true
 
 # ----- output -----
 # /artifacts is a PVC mounted into the pod. The post-train hook in
