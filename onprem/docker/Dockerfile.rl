@@ -67,12 +67,16 @@ COPY src/ /workspace/repo/src/
 RUN pip install --no-cache-dir -e .
 
 # The pieces of the existing repo the rollout needs at runtime: the helpers,
-# the configs, the scripts. Code-only; no data.
+# the configs, the scripts, and the tau2 task/policy data files (telecom
+# subset only -- ~30MB; the SFT pod doesn't need them because it works
+# off a pre-rolled-out W&B JSONL artifact, but the RL pod runs the
+# orchestrator inside the container and needs telecom/tasks.json).
 COPY tau2_art_helpers.py /workspace/repo/
 COPY train_tau2.py /workspace/repo/
 COPY train_tau2_distill.py /workspace/repo/
 COPY onprem/scripts/ /workspace/scripts/
 COPY onprem/configs/ /workspace/configs/
+COPY data/tau2/domains/telecom/ /workspace/repo/data/tau2/domains/telecom/
 # rllm_train_tau2.py imports `from onprem.scripts.tau2_rllm_rollout import ...`
 # (the K8s pod runs the script via /workspace/scripts/, but the import path
 # expects an `onprem` package on PYTHONPATH). We copy the whole onprem/
