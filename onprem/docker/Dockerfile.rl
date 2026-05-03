@@ -52,6 +52,11 @@ RUN pip install --no-cache-dir \
 # (removed in transformers 5.0). Pin to the last working 4.x stable.
 RUN pip install --no-cache-dir "transformers==4.55.4"
 
+# peft 0.19's lora dispatcher eagerly checks torchao>=0.16.0 even for plain
+# nn.Linear targets and raises ImportError on the NGC-shipped torchao 0.12.x.
+# Bump torchao to satisfy the version gate (no actual quant ops required).
+RUN pip install --no-cache-dir "torchao>=0.16.0"
+
 # Standard helpers used by the trainer + upload scripts.
 RUN pip install --no-cache-dir \
         wandb>=0.18 \
