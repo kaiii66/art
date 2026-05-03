@@ -7,8 +7,9 @@ Responsibilities:
   - kubectl apply / kubectl wait --for=condition=complete (or --for=condition=failed).
   - Stream pod logs with `kubectl logs -f` while the job runs so the user
     sees training output in their terminal in real time.
-  - Read the artifact URI written by the pod into the artifacts PVC, by
-    `kubectl cp`-ing it out to the local snapshot dir.
+  - Read the artifact URI the trainer wrote to the tau2-artifacts PVC by
+    spawning a tiny ephemeral busybox pod that mounts the same PVC and
+    `cat`s the marker file (we read the result via `kubectl logs`).
 
 Assumptions:
   - The local kubectl is configured to talk to the on-prem cluster via
@@ -17,16 +18,30 @@ Assumptions:
   - All Jobs run in the `tau2` namespace.
   - Jobs write their LoRA URI to /artifacts/.<sft|rl>_lora_artifact_uri-<suffix>
     on the tau2-artifacts PVC.
+
+Why an ephemeral reader pod instead of `kubectl cp`/`exec`:
+  Both `cp` and `exec` require the source pod's container to still be
+  running (cp is implemented as `tar | exec` under the hood). The trainer
+  pod almost always reaches Completed before we get a chance to read the
+  marker, and Kubernetes refuses `exec` against Completed pods with
+  "cannot exec into a container in a completed pod". The PVC, however,
+  outlives the pod -- so we just mount it again from a new pod for ~5s.
 """
 from __future__ import annotations
 
 import os
 import subprocess
+import textwrap
 import time
+import uuid
 from pathlib import Path
 
 NAMESPACE = "tau2"
 KUBECONFIG_DEFAULT = "/Users/ktan/.kube/config-cwb607-ray"
+ARTIFACTS_PVC = "tau2-artifacts"
+# Small, ubiquitous image with `sh` and `cat`. Tag pinned for reproducibility;
+# this only ever runs `cat` so any maintained busybox release works.
+READER_IMAGE = "busybox:1.36"
 
 
 def _kubectl_env() -> dict:
@@ -137,7 +152,13 @@ def wait_for_job_done(job_name: str, *, timeout: str = "24h") -> str:
 
 
 def cp_from_pod(pod_name: str, src_path: str, dst_path: Path) -> bool:
-    """`kubectl cp <pod>:<src> <dst>`. Returns True iff the file was copied."""
+    """`kubectl cp <pod>:<src> <dst>`. Returns True iff the file was copied.
+
+    NOTE: This requires the source pod to still be Running -- `kubectl cp`
+    is implemented as `tar | kubectl exec`, and `exec` is rejected on
+    Completed/Failed pods. For reading marker files written by a finished
+    Job, use `read_marker_from_pvc` instead.
+    """
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["kubectl", "-n", NAMESPACE, "cp",
            f"{pod_name}:{src_path}", str(dst_path), "-c", "trainer"]
@@ -148,19 +169,150 @@ def cp_from_pod(pod_name: str, src_path: str, dst_path: Path) -> bool:
     return dst_path.exists()
 
 
-def read_uri_from_pod(pod_name: str, suffix: str, kind: str, snapshot_dir: Path) -> str | None:
-    """Pull the artifact URI marker file the pod wrote to /artifacts.
+def _reader_pod_manifest(pod_name: str, marker_path: str, pvc_name: str) -> str:
+    """YAML for an ephemeral pod that cats one file off a PVC and exits.
 
-    Returns the URI string, or None if the file isn't present.
+    The pod is restartPolicy: Never, prints the file (or a sentinel) to
+    stdout, then exits. We capture stdout via `kubectl logs`.
+
+    A unique sentinel ('<<<MARKER_MISSING>>>') is used instead of an
+    empty stdout so we can distinguish "file not found" from "file
+    exists but is empty" -- both are bugs, but they call for different
+    diagnostics.
+    """
+    return textwrap.dedent(f"""
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: {pod_name}
+          namespace: {NAMESPACE}
+          labels:
+            app.kubernetes.io/part-of: tau2-onprem
+            app.kubernetes.io/component: marker-reader
+        spec:
+          restartPolicy: Never
+          # Tolerate any common GPU-node taints so we can land on the same
+          # nodes the trainer used (the PVC is RWX so this isn't strictly
+          # required, but it avoids surprises on tightly-tainted clusters).
+          tolerations:
+            - operator: Exists
+          containers:
+            - name: reader
+              image: {READER_IMAGE}
+              imagePullPolicy: IfNotPresent
+              command: ["sh", "-c"]
+              args:
+                - 'if [ -f "{marker_path}" ]; then cat "{marker_path}"; else echo "<<<MARKER_MISSING>>>"; fi'
+              resources:
+                requests: {{ cpu: "10m", memory: "16Mi" }}
+                limits:   {{ cpu: "100m", memory: "64Mi" }}
+              volumeMounts:
+                - name: artifacts
+                  mountPath: /artifacts
+                  readOnly: true
+          volumes:
+            - name: artifacts
+              persistentVolumeClaim:
+                claimName: {pvc_name}
+                readOnly: true
+        """).lstrip()
+
+
+def read_marker_from_pvc(
+    marker_path: str,
+    *,
+    pvc_name: str = ARTIFACTS_PVC,
+    timeout_seconds: int = 120,
+) -> str | None:
+    """Read a single text file off a PVC by spawning a one-shot reader pod.
+
+    Returns the file contents stripped of trailing whitespace, or None
+    if the file does not exist on the PVC.
+
+    The reader pod is always deleted, even on error.
+    """
+    pod_name = f"marker-reader-{uuid.uuid4().hex[:8]}"
+    manifest = _reader_pod_manifest(pod_name, marker_path, pvc_name)
+    print(f"[k8s] spawning marker-reader pod {pod_name} to read {marker_path} from PVC {pvc_name}")
+    try:
+        # apply via stdin so we don't have to write a temp file
+        proc = subprocess.run(
+            ["kubectl", "-n", NAMESPACE, "apply", "-f", "-"],
+            input=manifest, text=True, env=_kubectl_env(),
+            capture_output=True, check=False,
+        )
+        if proc.returncode != 0:
+            print(f"[k8s] failed to create reader pod: {proc.stderr.strip()}")
+            return None
+
+        # Wait for the pod to finish (Succeeded or Failed). We don't use
+        # `kubectl wait --for=condition=Ready` because the container exits
+        # so quickly it may never be observed Ready -- it goes straight
+        # from Pending to Succeeded.
+        deadline = time.time() + timeout_seconds
+        terminal_phase = None
+        while time.time() < deadline:
+            phase_proc = _run(
+                ["kubectl", "-n", NAMESPACE, "get", "pod", pod_name,
+                 "-o", "jsonpath={.status.phase}"],
+                capture=True, check=False,
+            )
+            phase = phase_proc.stdout.strip()
+            if phase in {"Succeeded", "Failed"}:
+                terminal_phase = phase
+                break
+            time.sleep(1)
+        if terminal_phase is None:
+            print(f"[k8s] reader pod {pod_name} did not finish within {timeout_seconds}s")
+            return None
+
+        logs = _run(
+            ["kubectl", "-n", NAMESPACE, "logs", pod_name],
+            capture=True, check=False,
+        )
+        if logs.returncode != 0:
+            print(f"[k8s] kubectl logs {pod_name} failed: {logs.stderr.strip()}")
+            return None
+        out = logs.stdout.strip()
+        if out == "<<<MARKER_MISSING>>>":
+            print(f"[k8s] marker {marker_path} not found on PVC {pvc_name}")
+            return None
+        if not out:
+            print(f"[k8s] marker {marker_path} exists but is empty")
+            return None
+        return out
+    finally:
+        # Best-effort cleanup. Wait=false so we don't block on graceful term.
+        _run(
+            ["kubectl", "-n", NAMESPACE, "delete", "pod", pod_name,
+             "--ignore-not-found", "--wait=false"],
+            check=False, capture=True,
+        )
+
+
+def read_uri_from_pod(pod_name: str, suffix: str, kind: str, snapshot_dir: Path) -> str | None:
+    """Read the artifact URI marker file the trainer wrote to /artifacts.
+
+    `pod_name` is accepted for backwards compatibility / diagnostics but is
+    no longer used for the read path: by the time we call this, the trainer
+    pod is almost always Completed and `kubectl cp`/`exec` would fail with
+    "cannot exec into a container in a completed pod". We mount the PVC
+    via an ephemeral reader pod instead. The result is also cached to
+    `snapshot_dir/.{kind}_lora_artifact_uri` so reruns of the orchestrator
+    can find it without round-tripping to the cluster.
+
+    Returns the URI string, or None if the marker file isn't present on
+    the PVC.
     """
     if kind not in {"sft", "rl"}:
         raise ValueError(f"unexpected kind: {kind}")
-    pod_path = f"/artifacts/.{kind}_lora_artifact_uri-{suffix}"
-    local_path = snapshot_dir / f".{kind}_lora_artifact_uri"
-    if cp_from_pod(pod_name, pod_path, local_path):
-        uri = local_path.read_text().strip()
-        return uri or None
-    return None
+    marker_path = f"/artifacts/.{kind}_lora_artifact_uri-{suffix}"
+    uri = read_marker_from_pvc(marker_path)
+    if uri:
+        local_path = snapshot_dir / f".{kind}_lora_artifact_uri"
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_text(uri + "\n")
+    return uri
 
 
 def submit_and_wait(
