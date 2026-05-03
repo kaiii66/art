@@ -14,7 +14,15 @@ tokenizer_type: AutoTokenizer
 load_in_8bit: false
 load_in_4bit: false
 strict: false
-trust_remote_code: true
+# Qwen3-MoE (model_type: qwen3_moe) is natively supported by transformers
+# -- no remote modeling code needed. Setting trust_remote_code: true makes
+# Axolotl tell the CCE patcher to treat the model as "remote" (dynamic
+# Hub code) and try to read it from /root/.cache/huggingface/modules/...,
+# which doesn't exist. That manifested as
+#   FileNotFoundError: '/root/.cache/huggingface/modules/transformers.models.qwen3_moe.modeling_qwen3_moe'
+# inside cut_cross_entropy/transformers/qwen3_moe.py:patch_qwen3_moe.
+# Setting this to false routes CCE through the built-in patch path.
+trust_remote_code: false
 
 # ----- LoRA -----
 # rank 16 = the maximum W&B Inference accepts for Qwen/Qwen3-30B-A3B-Instruct-2507.
