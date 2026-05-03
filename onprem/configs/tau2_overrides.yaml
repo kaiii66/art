@@ -135,9 +135,11 @@ actor_rollout_ref:
     # enforce_eager skips CUDA graph capture, which is the path that triggers
     # vLLM's SymmMemCommunicator allocations colliding with FSDP shards on
     # colocated TP=8. Slower per-token but unblocks the rollout init.
-    # CUDA-graph capture is fine now that VLLM_ALLREDUCE_USE_SYMM_MEM=0; keep
-    # eager off for throughput.
-    enforce_eager: false
+    # CUDA-graph capture triggers torch.compile / Triton, which breaks on
+    # NGC's CUDA 13.0 toolkit (Triton's ptx version table only goes up to
+    # CUDA 12.x). enforce_eager skips compilation; throughput hit is
+    # acceptable for the smoke run, will revisit before production.
+    enforce_eager: true
     engine_kwargs:
       vllm:
         # Disable vLLM's custom all-reduce (uses cuMem); fall back to NCCL,
