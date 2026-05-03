@@ -109,6 +109,7 @@ actor_rollout_ref:
     strategy: fsdp2
     loss_agg_mode: token-mean
     ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 1
     use_dynamic_bsz: false
     ppo_max_token_len_per_gpu: 24000
     use_kl_loss: false
