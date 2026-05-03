@@ -235,6 +235,21 @@ def main(config: DictConfig) -> None:
         val_dataset=val_ds,
         backend="verl",
     )
+    # AgentTrainer only writes data.val_files when val_dataset is not None, so
+    # for runs without a val split (and most smoke runs) verl falls back to
+    # its built-in default path (~/data/rlhf/gsm8k/test.parquet) and crashes
+    # on FileNotFoundError. Point val_files at the train parquet as a no-op
+    # fallback (with val_before_train=false + a high test_freq, verl never
+    # actually evaluates).
+    if val_ds is None:
+        OmegaConf.update(
+            config, "data.val_files",
+            train_ds.get_verl_data_path(), force_add=True,
+        )
+        # Push test_freq above total_epochs so verl never schedules a val pass.
+        OmegaConf.update(config, "trainer.test_freq", 10**9, force_add=True)
+        OmegaConf.update(config, "trainer.val_before_train", False, force_add=True)
+        logger.info("no val dataset -> reusing train parquet for data.val_files; test_freq disabled")
     logger.info(
         "AgentTrainer ready (workflow=MultiTurnWorkflow, max_steps=%d, train=%d, val=%s)",
         max_steps,
