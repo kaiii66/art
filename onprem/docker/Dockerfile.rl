@@ -86,6 +86,16 @@ RUN python -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-
 # (PTX 8.8) until upstream Triton adds first-class CUDA 13 support.
 RUN python -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/compiler.py'); s = p.read_text(); marker = '    if major == 11:'; assert marker in s, 'triton ptx_get_version patch marker not found'; p.write_text(s.replace(marker, '    if major >= 13:\n        return 88  # CUDA 13.x -> map to CUDA 12.8 PTX (8.8); good enough for sm_90.\n    if major == 11:'))"
 
+# verl 0.6.1 loads the actor model via HF `from_pretrained` without
+# `low_cpu_mem_usage=True`, so EVERY rank materializes the full
+# Qwen3-30B-A3B (~60GB bf16) on CPU before FSDP shards it. With 8 ranks
+# that's 480GB of pre-shard host RAM, plus optimizer/grad replicates
+# during init -> ~1.8TB peak, which OOMs the 2TB host node during
+# rollout_engine.wake_up(). Patch fsdp_workers to add the kwarg so HF
+# uses meta init + lazy load and only the rank-0 broadcast path holds
+# real weights.
+RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/verl/workers/fsdp_workers.py'); s = p.read_text(); old = '            actor_module = actor_module_class.from_pretrained(\n                pretrained_model_name_or_path=local_path,\n                torch_dtype=torch_dtype,\n                config=actor_model_config,\n                trust_remote_code=trust_remote_code,\n                attn_implementation=attn_implementation,\n            )\n'; assert old in s, 'verl actor from_pretrained anchor not found'; new = '            actor_module = actor_module_class.from_pretrained(\n                pretrained_model_name_or_path=local_path,\n                torch_dtype=torch_dtype,\n                config=actor_model_config,\n                trust_remote_code=trust_remote_code,\n                attn_implementation=attn_implementation,\n                low_cpu_mem_usage=True,\n            )\n'; p.write_text(s.replace(old, new))"
+
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
 
