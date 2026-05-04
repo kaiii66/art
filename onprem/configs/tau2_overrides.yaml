@@ -139,10 +139,14 @@ actor_rollout_ref:
     # Lower GPU mem util from default 0.85 to 0.5 so vLLM weights + KV cache
     # fit alongside the FSDP actor weights (LoRA-only training, both on GPU
     # permanently). free_cache_engine=false disables vLLM sleep-mode (which
-    # otherwise pins ~230GB of weights per rank in CPU RAM during wake_up
-    # and OOMs the 2TB host node when run colocated with 8 ranks).
+    # otherwise pins ~230GB of weights per rank in CPU RAM during wake_up).
+    # layered_summon=true forces verl's FSDP->vLLM weight sync to summon one
+    # layer at a time instead of the full base model on CPU per rank
+    # (the LoRA __collect_lora_params path gathers .full_tensor().cpu() and
+    # OOMs the host with 8 ranks * 60GB pinned each).
     gpu_memory_utilization: 0.5
     free_cache_engine: false
+    layered_summon: true
     # enforce_eager skips CUDA graph capture, which is the path that triggers
     # vLLM's SymmMemCommunicator allocations colliding with FSDP shards on
     # colocated TP=8. Slower per-token but unblocks the rollout init.
