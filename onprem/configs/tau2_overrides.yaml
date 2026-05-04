@@ -146,7 +146,12 @@ actor_rollout_ref:
     # OOMs the host with 8 ranks * 60GB pinned each).
     gpu_memory_utilization: 0.5
     free_cache_engine: false
+    # layered_summon requires the base model to be preloaded into vLLM (so
+    # the per-layer DTensor.full_tensor() shards can replace base weights
+    # in-place). load_format=safetensors makes vLLM read the HF safetensors
+    # file at init instead of taking weights from FSDP's first sync.
     layered_summon: true
+    load_format: safetensors
     # enforce_eager skips CUDA graph capture, which is the path that triggers
     # vLLM's SymmMemCommunicator allocations colliding with FSDP shards on
     # colocated TP=8. Slower per-token but unblocks the rollout init.
