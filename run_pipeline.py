@@ -76,6 +76,7 @@ ONPREM_SFT_TEMPLATE = REPO_ROOT / "onprem" / "k8s" / "sft_job.yaml"
 ONPREM_RL_TEMPLATE = REPO_ROOT / "onprem" / "k8s" / "rl_job.yaml"
 ONPREM_BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 ONPREM_BASE_MODEL_SHORT = ONPREM_BASE_MODEL.split("/")[-1]
+WANDB_PROJECT_BASE = "tau2-ART-autoresearch-telecom-"
 
 try:
     from ruamel.yaml import YAML  # type: ignore[import-not-found]
@@ -107,8 +108,20 @@ def yaml_dump(data, path: Path) -> None:
         _pyyaml.safe_dump(data, f, sort_keys=False)
 
 
-def make_snapshot(suffix: str, resume_dir: Path | None) -> tuple[Path, str, str]:
-    """Create (or reuse) snapshot dir; return (snapshot_dir, project, group)."""
+def make_snapshot(
+    suffix: str,
+    resume_dir: Path | None,
+    *,
+    computed_project: str | None = None,
+) -> tuple[Path, str, str]:
+    """Create (or reuse) snapshot dir; return (snapshot_dir, project, group).
+
+    When `computed_project` is provided it overrides the `project:` field in
+    both source YAMLs before writing the snapshot copies, so neither
+    train_config.yaml nor train_distill_config.yaml need to be edited between
+    pipeline runs.  On --resume the project is always read from the existing
+    snapshot (which already has the correct value baked in).
+    """
     if resume_dir is not None:
         snapshot = resume_dir.resolve()
         if not snapshot.exists():
@@ -134,15 +147,12 @@ def make_snapshot(suffix: str, resume_dir: Path | None) -> tuple[Path, str, str]
     src_train = yaml_load(SRC_TRAIN_CONFIG)
     src_distill = yaml_load(SRC_DISTILL_CONFIG)
 
-    # Pinned project (no rolling): every autoresearch iteration writes to the
-    # same W&B project so the Weave leaderboard accumulates rows across runs.
-    project = src_train["project"]
-    if src_distill["project"] != project:
-        raise ValueError(
-            f"train_config.yaml project ({project!r}) and "
-            f"train_distill_config.yaml project ({src_distill['project']!r}) "
-            f"must match so SFT/RL/leaderboard share artifacts and Weave entities."
-        )
+    # Use the auto-derived project when provided; otherwise fall back to the
+    # value baked into train_config.yaml.  Both snapshot copies are always
+    # written with the same project so SFT/RL/leaderboard share artifacts.
+    project = computed_project or src_train["project"]
+    src_train["project"] = project
+    src_distill["project"] = project
 
     # Per-iteration group: collapses every wandb.init() in this pipeline run
     # (upload, sft, rl, leaderboard) into one expandable bundle in the project.
@@ -524,7 +534,10 @@ def main() -> int:
     args = parser.parse_args()
 
     suffix = args.project_suffix or datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%m%d%H%M")
-    snapshot, project, group = make_snapshot(suffix, args.resume)
+    # Auto-derive project from MMDD so every pipeline run automatically lands
+    # in the correct W&B project without requiring manual YAML edits.
+    computed_project = WANDB_PROJECT_BASE + suffix[:4]
+    snapshot, project, group = make_snapshot(suffix, args.resume, computed_project=computed_project)
     train_cfg = snapshot / "train_config.yaml"
     distill_cfg = snapshot / "train_distill_config.yaml"
 

@@ -26,10 +26,13 @@ trust_remote_code: false
 
 # ----- LoRA -----
 # rank 16 = the maximum W&B Inference accepts for Qwen/Qwen3-30B-A3B-Instruct-2507.
-# attention-only target modules to keep adapter size small. Adding the per-expert
-# MLP projections (gate_proj/up_proj/down_proj) on a 128-expert MoE blows up both
-# adapter size and W&B Inference load time and is unnecessary for instruction
-# distillation.
+# Target modules now include the per-expert MLP projections (gate_proj /
+# up_proj / down_proj) in addition to attention. Tau2 telecom is heavily
+# tool-using and benefits from MLP/expert adaptation; attention-only LoRA was
+# capacity-limited (val success 0.0833). Adapter size grows but stays within
+# W&B Inference's load budget for rank 16, and the on-prem RL stack already
+# uses target_modules=all-linear (peft picks all linear layers), so this
+# brings SFT into parity with RL's adaptable surface.
 adapter: lora
 lora_r: 16
 lora_alpha: 32
@@ -39,6 +42,9 @@ lora_target_modules:
   - k_proj
   - v_proj
   - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
 lora_modules_to_save: []
 
 # ----- dataset -----
@@ -50,18 +56,28 @@ datasets:
   - path: /data/sft.jsonl
     type: chat_template
     field_messages: messages
-val_set_size: 0.0   # validation handled separately by the leaderboard stage
+# Reserve 5% of the SFT JSONL as an in-training validation slice so axolotl
+# emits eval/loss curves alongside training loss. The leaderboard stage is
+# still the ground-truth evaluator (binary success on tau2 tasks), but with
+# small success-filtered datasets (~13-200 trajectories) overfitting can
+# happen well before leaderboard catches it -- the prior "2e-4 was overfitting
+# on small (~13 traj) datasets" note in train_distill_config.yaml is a
+# documented example. 5% is a tradeoff: small enough to keep the train set
+# rich, large enough that eval/loss is not pure noise.
+val_set_size: 0.05
 
 # ----- sequence packing / context length -----
 # Sample packing avoids padding waste for the variable-length tool-using
 # rollouts. Tau2 telecom rollouts at max_orchestrator_steps=100 routinely
 # exceed 8192 tokens (observed: min ~7.9K, median ~9.7K, max ~14.7K tokens
 # across 228 records). Anything that exceeds `sequence_len` is silently
-# dropped by axolotl's "Drop Invalid Sequences" pass, so 8192 produced
-# `num_samples=0` and crashed the trainer. 16384 covers the full observed
-# distribution with headroom for chat-template overhead (tool schemas,
-# <think> blocks, im_start/im_end tokens).
-sequence_len: 16384
+# dropped by axolotl's "Drop Invalid Sequences" pass.
+# Bumped 16384 -> 24576: the previous cap left almost no headroom above the
+# observed max (14.7K) for chat-template overhead (tool schemas, <think>
+# blocks, im_start/im_end tokens) and was likely silently dropping the
+# longest successful trajectories. 24576 gives 1.6x headroom above the
+# observed max while staying well within Qwen3's native context.
+sequence_len: 24576
 sample_packing: true
 pad_to_sequence_len: true
 

@@ -7,7 +7,7 @@
 # run_pipeline.py into the snapshot config), NOT via project name. This keeps
 # all autoresearch runs collapsible under one project page and lets the Weave
 # leaderboard grow with one row per (sft|rl) checkpoint per iteration.
-project: "tau2-ART-autoresearch-telecom"
+project: "tau2-ART-autoresearch-telecom-0430"
 # group: written by run_pipeline.py make_snapshot at runtime (e.g. pipeline-04241730)
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_name: "tau2-ART-telecom-Qwen3-30B-A3B-Instruct-2507"

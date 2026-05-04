@@ -6,7 +6,7 @@
 # ── Model ───────────────────────────────────────────────────────────
 # Must match train_config.yaml's `project` so SFT and RL runs land in the
 # same W&B project (and the `continue_from_model` artifact path resolves).
-project: "tau2-ART-autoresearch-telecom"
+project: "tau2-ART-autoresearch-telecom-0430"
 # group: written by run_pipeline.py make_snapshot at runtime (e.g. pipeline-04241730)
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507"

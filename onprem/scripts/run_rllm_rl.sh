@@ -86,9 +86,32 @@ python -m onprem.scripts.rllm_train_tau2 \
 # runs. We also need to copy the tokenizer files (saved separately under
 # .../actor/huggingface/) into the upload dir because W&B Inference requires
 # them alongside the adapter for LoRA serving.
+# ----- pick the best checkpoint step -----
+# rllm_train_tau2.py writes .best_rl_step.json after training completes with
+# the global_step that had the highest val/success (or val/reward) among
+# saved checkpoints. Use it when available so we publish the peak checkpoint
+# rather than always the last (often post-peak / regressed) one.
+# Falls back to the highest global_step dir if the file is absent (smoke runs,
+# or runs where no val pass happened).
+BEST_STEP_JSON="$RL_OUTPUT_DIR/.best_rl_step.json"
 LORA_PARENT=""
-if compgen -G "$RL_OUTPUT_DIR/global_step_*/actor/lora_adapter" >/dev/null; then
-    LORA_PARENT="$(ls -d "$RL_OUTPUT_DIR"/global_step_*/actor/lora_adapter 2>/dev/null | sort -V | tail -n1)"
+if [ -f "$BEST_STEP_JSON" ]; then
+    BEST_STEP="$(python -c "import json,sys; print(json.load(open('$BEST_STEP_JSON'))['best_step'])" 2>/dev/null || true)"
+    if [ -n "$BEST_STEP" ]; then
+        CANDIDATE="$RL_OUTPUT_DIR/global_step_${BEST_STEP}/actor/lora_adapter"
+        if [ -f "$CANDIDATE/adapter_config.json" ]; then
+            LORA_PARENT="$CANDIDATE"
+            log "using best RL step=$BEST_STEP from $BEST_STEP_JSON"
+        else
+            log "WARN: best_step=$BEST_STEP from $BEST_STEP_JSON but $CANDIDATE not found; falling back to latest"
+        fi
+    fi
+fi
+if [ -z "$LORA_PARENT" ]; then
+    if compgen -G "$RL_OUTPUT_DIR/global_step_*/actor/lora_adapter" >/dev/null; then
+        LORA_PARENT="$(ls -d "$RL_OUTPUT_DIR"/global_step_*/actor/lora_adapter 2>/dev/null | sort -V | tail -n1)"
+        log "using latest checkpoint: $LORA_PARENT"
+    fi
 fi
 if [ -z "$LORA_PARENT" ] || [ ! -f "$LORA_PARENT/adapter_config.json" ]; then
     log "WARN: no verl LoRA checkpoint found under $RL_OUTPUT_DIR/global_step_*/actor/lora_adapter"

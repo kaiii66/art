@@ -32,17 +32,26 @@ tau2:
   group: null  # K8s sets WANDB_RUN_GROUP
 
   workflow:
-    # Max agent turns per rollout. tau2's own DEFAULT_MAX_STEPS is 100, but
-    # for RL we keep it tighter to bound rollout length and OOM risk.
-    max_steps: 50
+    # Max agent turns per rollout. Matches tau2's own DEFAULT_MAX_STEPS and
+    # the leaderboard config (`leaderboard.max_steps: 100` in train_config.yaml).
+    # Bumped 50 -> 100: the previous tighter cap was truncating solvable
+    # telecom episodes mid-task (median rollout length is ~9.7K tokens / many
+    # turns), which gave GRPO truncated trajectories with reward 0 even when
+    # the agent was on track. The OOM concerns that motivated 50 are mitigated
+    # by max_response_length=4096 + compact_filtering masking the long ones.
+    max_steps: 100
 
   env:
     domain: telecom
     max_user_errors: 10
     # Telecom-specific shaping: nl_assertions and communicate are mostly null
     # for telecom (reward_basis = ENV_ASSERTION), so weight gets redistributed
-    # inside compute_shaped_reward. step_penalty 0 to avoid pushing the model
-    # to skip verification tools during the SFT->RL handoff.
+    # inside compute_shaped_reward.
+    # step_penalty restored to -0.10 (was 0.0): with 0.0 the model had no
+    # pressure to terminate efficiently and tended to inflate trajectories
+    # with redundant verification calls -- a known failure mode that
+    # contributed to the on-prem RL run regressing below SFT (0.0667 < 0.0833).
+    # Matches the serverless config that produced 7.5-27.5% leaderboard scores.
     shaped_reward_weights:
       action: 0.35
       communicate: 0.10
@@ -50,7 +59,7 @@ tau2:
       termination: 0.15
       tool_accuracy: 0.15
       tool_arg_accuracy: 0.05
-      step_penalty: 0.0
+      step_penalty: -0.10
 
   agent:
     domain: telecom
@@ -69,6 +78,26 @@ tau2:
     validation_split: test
     num_train_tasks: null     # full split
     num_val_tasks: null
+
+  prefilter:
+    # Curriculum prefilter: probe each training task k times with the SFT model
+    # (probe_llm) and keep only tasks whose success rate falls in keep_band.
+    # Tasks at 0% success have no learnable advantage signal for GRPO; tasks at
+    # 100% have zero variance. Focusing on [0.10, 0.90] is the single biggest
+    # lever to fix RL regressing below SFT (documented in serverless comments as
+    # "only 7/55 trainable groups" in run kwt/tau2-ART-distill-04221526).
+    #
+    # probe_llm: auto-derived from STARTING_LORA_URI env var when null
+    # (-> wandb/<artifact-name>, the SFT LoRA served via W&B Inference).
+    # Set explicitly to override (e.g. a different W&B Inference endpoint).
+    enable: true
+    probe_llm: null
+    probe_llm_args:
+      temperature: 0.7
+      max_tokens: 4096
+    k_probe: 4
+    keep_band: [0.10, 0.90]
+    concurrency: 8
 
 # ---------------------------------------------------------------------------
 # verl/rllm overrides (mirrors the bash flags in rllm's example .sh recipes).
@@ -259,6 +288,12 @@ trainer:
   logger:
     - console
     - wandb
+    # rLLM UI: streams per-episode trajectories + metrics to ui.rllm-project.com.
+    # RLLM_API_KEY is already mounted into the pod via the rllmui K8s secret
+    # (rl_job.yaml line 49). Adding "ui" here is the only missing piece --
+    # UILogger registers only when present in this list. Without it the key is
+    # read but never connected to anything, which is why traces were absent.
+    - ui
   n_gpus_per_node: 8
   nnodes: 1
   total_epochs: 1
@@ -268,12 +303,22 @@ trainer:
   # (adapter_config.json + adapter_model.safetensors) when the actor is a
   # PeftModel, which our wandb_lora_upload.py reads.
   save_freq: 1
-  # Keep at most 2 checkpoints on the PVC (latest + previous) so the smoke
-  # disk doesn't fill up across resubmissions.
-  max_actor_ckpt_to_keep: 2
-  test_freq: 25
-  val_before_train: false
+  # Raised from 2 -> 8 so that in-train best-step selection (rllm_train_tau2.py)
+  # can keep enough historical checkpoints to upload the actual best step rather
+  # than always the last one. 8 steps * ~10GB adapter = ~80GB, well within the
+  # tau2-artifacts PVC. Smoke runs with total_epochs=1 typically only produce
+  # 1-3 checkpoints anyway so this has no cost there.
+  max_actor_ckpt_to_keep: 8
+  # Tighter validation cadence: was 25 (too coarse for typical ~30-50 step runs
+  # where the peak often occurs at step 10-27). Every 5 steps gives enough
+  # resolution to catch the peak and trigger early stopping in rllm_train_tau2.py.
+  test_freq: 5
+  # Baseline val at step 0 so we can compare all subsequent steps against the
+  # starting SFT checkpoint (required for meaningful early-stop logic).
+  val_before_train: true
   critic_warmup: 0
   default_local_dir: /artifacts/rl-lora
   default_hdfs_dir: null
-  log_episodes: false
+  # Enable per-episode trajectory logging to rLLM UI. Without this only
+  # aggregate metrics stream and the trajectory inspector is empty.
+  log_episodes: true

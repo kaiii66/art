@@ -175,6 +175,110 @@ def _write_summary(config: DictConfig, output_dir: str, n_train: int, n_val: int
     (out / "rl_summary.json").write_text(json.dumps(summary, indent=2))
 
 
+def _select_and_write_best_step(output_dir: str) -> Optional[int]:
+    """Scan W&B run history for the best val step, then write .best_rl_step.json.
+
+    Queries the *current* wandb run's history for validation success/reward
+    metrics (tries several common key names used by verl + rLLM), finds the
+    global_step with the highest value among steps that also have a saved
+    lora_adapter checkpoint on disk, and writes the result to
+    `output_dir/.best_rl_step.json` so run_rllm_rl.sh can upload the right
+    checkpoint instead of always the last one.
+
+    Falls back to the highest available step if W&B query fails or returns no
+    matching rows (e.g. smoke run with no val pass, or all steps pruned).
+    Returns the selected best step, or None if no checkpoints exist at all.
+    """
+    import wandb
+
+    out = Path(output_dir)
+
+    # Discover steps that have a saved lora_adapter on disk.
+    available_steps: set[int] = set()
+    for p in out.glob("global_step_*/actor/lora_adapter/adapter_config.json"):
+        try:
+            available_steps.add(int(p.parts[-4].split("_")[-1]))
+        except (ValueError, IndexError):
+            pass
+
+    if not available_steps:
+        logger.warning(
+            "no lora_adapter checkpoints found under %s; skipping best-step selection",
+            output_dir,
+        )
+        return None
+
+    best_step: Optional[int] = None
+    best_val: float = -float("inf")
+
+    # Try to extract per-step val metrics from the current W&B run.
+    # verl + rLLM can log under several key patterns depending on version.
+    _VAL_METRIC_CANDIDATES = [
+        "val/reward",
+        "val/success",
+        "val/success_rate",
+        "val/mean_reward",
+        "critic/val/reward",
+    ]
+    try:
+        api = wandb.Api()
+        run_path = f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.id}"
+        wb_run = api.run(run_path)
+
+        for metric_key in _VAL_METRIC_CANDIDATES:
+            rows = list(wb_run.scan_history(keys=["trainer/global_step", metric_key]))
+            if not rows:
+                continue
+            for row in rows:
+                step = row.get("trainer/global_step")
+                val = row.get(metric_key)
+                if step is None or val is None:
+                    continue
+                step = int(step)
+                if step not in available_steps:
+                    continue
+                # Higher is better; break ties by preferring the earlier step.
+                if val > best_val or (val == best_val and (best_step is None or step < best_step)):
+                    best_val = float(val)
+                    best_step = step
+            if best_step is not None:
+                logger.info(
+                    "best-step selected from W&B metric %r: step=%d val=%.4f",
+                    metric_key, best_step, best_val,
+                )
+                break
+        else:
+            logger.warning(
+                "no val metric rows found for keys %s on run %s",
+                _VAL_METRIC_CANDIDATES, run_path,
+            )
+    except Exception as exc:
+        logger.warning("W&B history query failed (%s); falling back to highest step", exc)
+
+    if best_step is None:
+        best_step = max(available_steps)
+        logger.warning(
+            "no val metrics matched on-disk steps; falling back to highest available step %d",
+            best_step,
+        )
+        best_val_out: Optional[float] = None
+    else:
+        best_val_out = best_val
+
+    result = {
+        "best_step": best_step,
+        "best_val_success": best_val_out,
+        "available_steps": sorted(available_steps),
+    }
+    best_step_file = out / ".best_rl_step.json"
+    best_step_file.write_text(json.dumps(result, indent=2))
+    logger.info(
+        "wrote best RL step -> %s  (step=%d, val=%s)",
+        best_step_file, best_step, f"{best_val_out:.4f}" if best_val_out is not None else "N/A",
+    )
+    return best_step
+
+
 # ---------------------------------------------------------------------------
 # Hydra entry
 # ---------------------------------------------------------------------------
@@ -206,21 +310,58 @@ def main(config: DictConfig) -> None:
     OmegaConf.update(config, "trainer.default_local_dir", output_dir, force_add=True)
 
     # ----- dataset -----
+    from onprem.scripts.tau2_rl_dataset import prefilter_tasks
+
+    domain = config.tau2.env.domain
+    dataset_name = config.tau2.dataset.get("name", f"tau2-{domain}")
+
     train_ds, val_ds = build_and_register(
-        domain=config.tau2.env.domain,
+        domain=domain,
         project=config.trainer.get("project_name"),
         artifact_name=config.tau2.dataset.get("training_artifact"),
         val_artifact_name=config.tau2.dataset.get("validation_artifact"),
         val_split=config.tau2.dataset.get("validation_split", "test"),
         num_train_tasks=config.tau2.dataset.get("num_train_tasks"),
         num_val_tasks=config.tau2.dataset.get("num_val_tasks"),
-        dataset_name=config.tau2.dataset.get("name", f"tau2-{config.tau2.env.domain}"),
+        dataset_name=dataset_name,
     )
     logger.info(
         "registered datasets: train=%d, val=%s",
         len(train_ds.data),
         len(val_ds.data) if val_ds is not None else "skipped",
     )
+
+    # ----- curriculum prefilter (optional) -----
+    prefilter_cfg = config.tau2.get("prefilter", {})
+    if OmegaConf.is_config(prefilter_cfg):
+        prefilter_cfg = OmegaConf.to_container(prefilter_cfg, resolve=True)
+    if prefilter_cfg.get("enable", False):
+        keep_band_raw = prefilter_cfg.get("keep_band", [0.10, 0.90])
+        filtered_rows = prefilter_tasks(
+            list(train_ds.data),
+            domain=domain,
+            probe_llm=prefilter_cfg.get("probe_llm") or None,
+            probe_llm_args=prefilter_cfg.get("probe_llm_args") or {},
+            k_probe=int(prefilter_cfg.get("k_probe", 4)),
+            keep_band=(float(keep_band_raw[0]), float(keep_band_raw[1])),
+            env_kwargs={
+                "domain": domain,
+                "user_llm": config.tau2.user.model,
+                "user_llm_args": OmegaConf.to_container(config.tau2.user.llm_args, resolve=True),
+                "max_steps": int(config.tau2.workflow.max_steps),
+            },
+            cache_path=Path(output_dir) / ".prefilter_cache.json",
+            concurrency=int(prefilter_cfg.get("concurrency", 8)),
+        )
+        if len(filtered_rows) < len(train_ds.data):
+            # Re-register the filtered task list so verl reads only those tasks.
+            from onprem.scripts.tau2_rl_dataset import register_dataset
+            train_ds = register_dataset(dataset_name, filtered_rows, split="train")
+            logger.info(
+                "prefilter applied: train=%d -> %d tasks kept",
+                len(filtered_rows) + (len(train_ds.data) - len(filtered_rows)),
+                len(train_ds.data),
+            )
 
     # ----- workflow_args -----
     max_steps = int(config.tau2.workflow.max_steps)
@@ -271,7 +412,12 @@ def main(config: DictConfig) -> None:
         n_val=len(val_ds.data) if val_ds is not None else 0,
     )
 
+    # Select and persist the best checkpoint step based on val metrics so the
+    # upload step in run_rllm_rl.sh publishes the peak checkpoint instead of
+    # always the last (often post-peak / regressed) one.
     import wandb
+    _select_and_write_best_step(output_dir)
+
     wandb.finish()
     logger.info("RL training finished. Output dir: %s", output_dir)
 
