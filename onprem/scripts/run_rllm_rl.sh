@@ -77,26 +77,46 @@ python -m onprem.scripts.rllm_train_tau2 \
     "${EXTRA_OVERRIDES[@]}"
 
 # ----- 3. publish the LoRA to W&B Inference -----
-# verl's FSDPCheckpointManager.save_checkpoint writes the LoRA adapter to
-#   $RL_OUTPUT_DIR/global_step_<N>/lora_adapter/{adapter_config.json,
+# verl's FSDPCheckpointManager.save_checkpoint + the actor-worker LoRA save
+# block write the LoRA adapter to:
+#   $RL_OUTPUT_DIR/global_step_<N>/actor/lora_adapter/{adapter_config.json,
 #   adapter_model.safetensors}
 # (only when the actor is a PeftModel and trainer.save_freq > 0). We pick the
 # highest global_step folder, which is the final checkpoint for our 1-epoch
-# runs.
+# runs. We also need to copy the tokenizer files (saved separately under
+# .../actor/huggingface/) into the upload dir because W&B Inference requires
+# them alongside the adapter for LoRA serving.
 LORA_PARENT=""
-if compgen -G "$RL_OUTPUT_DIR/global_step_*/lora_adapter" >/dev/null; then
-    LORA_PARENT="$(ls -d "$RL_OUTPUT_DIR"/global_step_*/lora_adapter 2>/dev/null | sort -V | tail -n1)"
+if compgen -G "$RL_OUTPUT_DIR/global_step_*/actor/lora_adapter" >/dev/null; then
+    LORA_PARENT="$(ls -d "$RL_OUTPUT_DIR"/global_step_*/actor/lora_adapter 2>/dev/null | sort -V | tail -n1)"
 fi
 if [ -z "$LORA_PARENT" ] || [ ! -f "$LORA_PARENT/adapter_config.json" ]; then
-    log "WARN: no verl LoRA checkpoint found under $RL_OUTPUT_DIR/global_step_*/lora_adapter"
-    log "      verl save_checkpoint did not run (trainer.save_freq <= 0?) or PeftModel branch was skipped."
-    log "      Skipping W&B upload. Training metrics are still in the W&B run."
+    log "WARN: no verl LoRA checkpoint found under $RL_OUTPUT_DIR/global_step_*/actor/lora_adapter"
+    log "      verl save_checkpoint did not run (trainer.save_freq <= 0?) or the actor"
+    log "      isn't a PeftModel (model.lora_rank == 0?). Skipping W&B upload."
+    log "      Training metrics are still in the W&B run."
     exit 0
 fi
 
-log "publishing verl LoRA from $LORA_PARENT to W&B Inference: $LORA_ARTIFACT_NAME"
+# Stage the upload dir: adapter files from lora_adapter/ + tokenizer/config
+# from the sibling huggingface/ dir (W&B Inference needs both).
+UPLOAD_DIR="$RL_OUTPUT_DIR/upload"
+rm -rf "$UPLOAD_DIR" && mkdir -p "$UPLOAD_DIR"
+cp "$LORA_PARENT"/adapter_config.json "$UPLOAD_DIR/"
+cp "$LORA_PARENT"/adapter_model.safetensors "$UPLOAD_DIR/"
+HF_DIR="$(dirname "$LORA_PARENT")/huggingface"
+if [ -d "$HF_DIR" ]; then
+    cp "$HF_DIR"/tokenizer*.json "$UPLOAD_DIR/" 2>/dev/null || true
+    cp "$HF_DIR"/special_tokens_map.json "$UPLOAD_DIR/" 2>/dev/null || true
+    cp "$HF_DIR"/added_tokens.json "$UPLOAD_DIR/" 2>/dev/null || true
+    cp "$HF_DIR"/merges.txt "$UPLOAD_DIR/" 2>/dev/null || true
+    cp "$HF_DIR"/vocab.json "$UPLOAD_DIR/" 2>/dev/null || true
+    cp "$HF_DIR"/chat_template.jinja "$UPLOAD_DIR/" 2>/dev/null || true
+fi
+
+log "publishing verl LoRA from $UPLOAD_DIR to W&B Inference: $LORA_ARTIFACT_NAME"
 python /workspace/scripts/wandb_lora_upload.py \
-    --lora-dir "$LORA_PARENT" \
+    --lora-dir "$UPLOAD_DIR" \
     --artifact-name "$LORA_ARTIFACT_NAME" \
     --base-model "Qwen/Qwen3-30B-A3B-Instruct-2507" \
     --project   "$WANDB_PROJECT" \
