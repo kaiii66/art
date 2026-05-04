@@ -73,7 +73,7 @@ RUN pip install --no-cache-dir \
         python-dotenv>=1.0 \
         hf_transfer>=0.1.8 \
         "litellm>=1.83.0" \
-    && pip install --no-cache-dir --force-reinstall --no-deps "transformers==4.55.4"
+    && pip install --no-cache-dir --force-reinstall --no-deps "transformers==4.55.4" "tokenizers>=0.21,<0.22"
 
 # vLLM 0.11's Qwen3-MoE LoRA dummy-warmup path crashes during
 # determine_available_memory()/profile_run() with
