@@ -77,8 +77,14 @@ RUN pip install --no-cache-dir \
 
 # Tokenizers must be downgraded to <0.22 to satisfy transformers 4.55.4's
 # version pin. We do this in a separate RUN as the last layer to ensure no
-# subsequent pip install can pull in tokenizers>=0.22 transitively.
-RUN pip uninstall -y tokenizers && pip install --no-cache-dir --no-deps "tokenizers>=0.21,<0.22"
+# subsequent pip install can pull in tokenizers>=0.22 transitively. The
+# explicit rm + assert + pinned version are belt-and-suspenders because
+# buildx/cache-mount sometimes leaves the old dist-info directory on disk.
+RUN pip uninstall -y tokenizers \
+    && rm -rf /usr/local/lib/python3.12/dist-packages/tokenizers \
+                /usr/local/lib/python3.12/dist-packages/tokenizers-*.dist-info \
+    && pip install --no-cache-dir --no-deps "tokenizers==0.21.4" \
+    && python3 -c "import tokenizers; assert tokenizers.__version__ == '0.21.4', tokenizers.__version__"
 
 # vLLM 0.11's Qwen3-MoE LoRA dummy-warmup path crashes during
 # determine_available_memory()/profile_run() with
