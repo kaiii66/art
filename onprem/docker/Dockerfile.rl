@@ -124,15 +124,22 @@ WORKDIR /workspace/repo
 # so no --ignore-requires-python escape hatch is needed.
 COPY pyproject.toml pdm.lock README.md /workspace/repo/
 COPY src/ /workspace/repo/src/
-# tau2 / litellm transitively depend on tokenizers >= 0.21 and pip's resolver
-# happily upgrades to >= 0.22 here, breaking the transformers 4.55.4 pin in
-# the base layer. Re-apply the same downgrade after the editable install.
+# tau2 / litellm transitively depend on huggingface-hub >= 1.0 and
+# tokenizers >= 0.22; pip's resolver happily upgrades both here, breaking
+# the transformers 4.55.4 pin in the base layer (which requires
+# huggingface-hub <1.0 and tokenizers <0.22). Re-apply both downgrades
+# after the editable install and assert.
 RUN pip install --no-cache-dir -e . \
-    && pip uninstall -y tokenizers \
+    && pip uninstall -y tokenizers huggingface-hub \
     && rm -rf /usr/local/lib/python3.12/dist-packages/tokenizers \
                 /usr/local/lib/python3.12/dist-packages/tokenizers-*.dist-info \
-    && pip install --no-cache-dir --no-deps "tokenizers==0.21.4" \
+                /usr/local/lib/python3.12/dist-packages/huggingface_hub \
+                /usr/local/lib/python3.12/dist-packages/huggingface_hub-*.dist-info \
+    && pip install --no-cache-dir --no-deps \
+            "tokenizers==0.21.4" \
+            "huggingface-hub==0.34.4" \
     && python3 -c "import tokenizers; assert tokenizers.__version__ == '0.21.4', tokenizers.__version__" \
+    && python3 -c "import huggingface_hub; assert huggingface_hub.__version__ == '0.34.4', huggingface_hub.__version__" \
     && python3 -c "from transformers import AutoModelForVision2Seq" \
     && python3 -c "from verl.workers.config import ActorConfig"
 
