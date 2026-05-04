@@ -56,6 +56,12 @@ spec:
             - { name: PIPELINE_SUFFIX,           value: "__PIPELINE_SUFFIX__" }
             - { name: LORA_ARTIFACT_NAME,        value: "__LORA_ARTIFACT_NAME__" }
             - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
+            # Persist the HF Hub cache on the artifacts PVC so the 60GB
+            # Qwen3-30B-A3B-Instruct-2507 weights survive pod restarts and
+            # don't get re-downloaded every K8s job (which also occasionally
+            # races / 429s and trips OSError "no model files found").
+            - { name: HF_HOME,                   value: "/artifacts/hf-cache" }
+            - { name: HUGGINGFACE_HUB_CACHE,     value: "/artifacts/hf-cache/hub" }
             - { name: TOKENIZERS_PARALLELISM,    value: "false" }
             - { name: NCCL_P2P_DISABLE,          value: "0" }
             - { name: NCCL_DEBUG,                value: "WARN" }
