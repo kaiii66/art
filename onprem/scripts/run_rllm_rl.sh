@@ -77,9 +77,26 @@ python -m onprem.scripts.rllm_train_tau2 \
     "${EXTRA_OVERRIDES[@]}"
 
 # ----- 3. publish the LoRA to W&B Inference -----
-log "uploading RL LoRA to W&B Inference: $LORA_ARTIFACT_NAME"
+# verl's FSDPCheckpointManager.save_checkpoint writes the LoRA adapter to
+#   $RL_OUTPUT_DIR/global_step_<N>/lora_adapter/{adapter_config.json,
+#   adapter_model.safetensors}
+# (only when the actor is a PeftModel and trainer.save_freq > 0). We pick the
+# highest global_step folder, which is the final checkpoint for our 1-epoch
+# runs.
+LORA_PARENT=""
+if compgen -G "$RL_OUTPUT_DIR/global_step_*/lora_adapter" >/dev/null; then
+    LORA_PARENT="$(ls -d "$RL_OUTPUT_DIR"/global_step_*/lora_adapter 2>/dev/null | sort -V | tail -n1)"
+fi
+if [ -z "$LORA_PARENT" ] || [ ! -f "$LORA_PARENT/adapter_config.json" ]; then
+    log "WARN: no verl LoRA checkpoint found under $RL_OUTPUT_DIR/global_step_*/lora_adapter"
+    log "      verl save_checkpoint did not run (trainer.save_freq <= 0?) or PeftModel branch was skipped."
+    log "      Skipping W&B upload. Training metrics are still in the W&B run."
+    exit 0
+fi
+
+log "publishing verl LoRA from $LORA_PARENT to W&B Inference: $LORA_ARTIFACT_NAME"
 python /workspace/scripts/wandb_lora_upload.py \
-    --lora-dir "$RL_OUTPUT_DIR" \
+    --lora-dir "$LORA_PARENT" \
     --artifact-name "$LORA_ARTIFACT_NAME" \
     --base-model "Qwen/Qwen3-30B-A3B-Instruct-2507" \
     --project   "$WANDB_PROJECT" \

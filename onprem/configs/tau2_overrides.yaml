@@ -262,7 +262,15 @@ trainer:
   n_gpus_per_node: 8
   nnodes: 1
   total_epochs: 1
-  save_freq: 100
+  # Save every step for the smoke (smoke runs only ~1 step), and override to
+  # something larger for prod via Hydra. verl's FSDP checkpoint manager writes
+  # the LoRA adapter to `<default_local_dir>/global_step_<N>/lora_adapter/`
+  # (adapter_config.json + adapter_model.safetensors) when the actor is a
+  # PeftModel, which our wandb_lora_upload.py reads.
+  save_freq: 1
+  # Keep at most 2 checkpoints on the PVC (latest + previous) so the smoke
+  # disk doesn't fill up across resubmissions.
+  max_actor_ckpt_to_keep: 2
   test_freq: 25
   val_before_train: false
   critic_warmup: 0
