@@ -73,8 +73,12 @@ RUN pip install --no-cache-dir \
         python-dotenv>=1.0 \
         hf_transfer>=0.1.8 \
         "litellm>=1.83.0" \
-    && pip install --no-cache-dir --force-reinstall --no-deps "transformers==4.55.4" \
-    && pip install --no-cache-dir --force-reinstall --no-deps "tokenizers==0.21.4"
+    && pip install --no-cache-dir --force-reinstall --no-deps "transformers==4.55.4"
+
+# Tokenizers must be downgraded to <0.22 to satisfy transformers 4.55.4's
+# version pin. We do this in a separate RUN as the last layer to ensure no
+# subsequent pip install can pull in tokenizers>=0.22 transitively.
+RUN pip uninstall -y tokenizers && pip install --no-cache-dir --no-deps "tokenizers>=0.21,<0.22"
 
 # vLLM 0.11's Qwen3-MoE LoRA dummy-warmup path crashes during
 # determine_available_memory()/profile_run() with
