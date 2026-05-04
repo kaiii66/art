@@ -136,12 +136,13 @@ actor_rollout_ref:
     agent:
       num_workers: 0              # workflow concurrency lives in n_parallel_tasks
     tensor_model_parallel_size: 8
-    # Lower GPU mem util from default 0.85 to 0.6 so we leave headroom for
-    # FSDP actor weights + optimizer (now also on GPU after disabling CPU
-    # offload). vLLM rollout still gets ~48GB per H100 for KV cache + LoRA.
-    gpu_memory_utilization: 0.6
-    free_cache_engine: true
-    multi_stage_wake_up: true
+    # Lower GPU mem util from default 0.85 to 0.5 so vLLM weights + KV cache
+    # fit alongside the FSDP actor weights (LoRA-only training, both on GPU
+    # permanently). free_cache_engine=false disables vLLM sleep-mode (which
+    # otherwise pins ~230GB of weights per rank in CPU RAM during wake_up
+    # and OOMs the 2TB host node when run colocated with 8 ranks).
+    gpu_memory_utilization: 0.5
+    free_cache_engine: false
     # enforce_eager skips CUDA graph capture, which is the path that triggers
     # vLLM's SymmMemCommunicator allocations colliding with FSDP shards on
     # colocated TP=8. Slower per-token but unblocks the rollout init.
