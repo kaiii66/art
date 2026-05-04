@@ -61,15 +61,19 @@ RUN pip install --no-cache-dir "transformers==4.55.4"
 RUN pip install --no-cache-dir "peft==0.15.2"
 
 # Standard helpers used by the trainer + upload scripts.
-# litellm>=1.77 is required for native `wandb/<model>` routing to W&B
+# litellm>=1.83 is required for native `wandb/<model>` routing to W&B
 # Inference (provider added late 2025); earlier versions raise
 # `LLM Provider NOT provided` from llm_utils.generate.
+# litellm 1.83 transitively requires tokenizers/transformers >= 4.59 which
+# breaks verl 0.6.1's AutoModelForVision2Seq import. Re-pin transformers
+# back down to 4.55.4 immediately after.
 RUN pip install --no-cache-dir \
         wandb>=0.18 \
         peft>=0.14 \
         python-dotenv>=1.0 \
         hf_transfer>=0.1.8 \
-        "litellm>=1.83.0"
+        "litellm>=1.83.0" \
+    && pip install --no-cache-dir --force-reinstall --no-deps "transformers==4.55.4"
 
 # vLLM 0.11's Qwen3-MoE LoRA dummy-warmup path crashes during
 # determine_available_memory()/profile_run() with
