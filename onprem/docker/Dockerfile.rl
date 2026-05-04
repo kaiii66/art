@@ -124,7 +124,17 @@ WORKDIR /workspace/repo
 # so no --ignore-requires-python escape hatch is needed.
 COPY pyproject.toml pdm.lock README.md /workspace/repo/
 COPY src/ /workspace/repo/src/
-RUN pip install --no-cache-dir -e .
+# tau2 / litellm transitively depend on tokenizers >= 0.21 and pip's resolver
+# happily upgrades to >= 0.22 here, breaking the transformers 4.55.4 pin in
+# the base layer. Re-apply the same downgrade after the editable install.
+RUN pip install --no-cache-dir -e . \
+    && pip uninstall -y tokenizers \
+    && rm -rf /usr/local/lib/python3.12/dist-packages/tokenizers \
+                /usr/local/lib/python3.12/dist-packages/tokenizers-*.dist-info \
+    && pip install --no-cache-dir --no-deps "tokenizers==0.21.4" \
+    && python3 -c "import tokenizers; assert tokenizers.__version__ == '0.21.4', tokenizers.__version__" \
+    && python3 -c "from transformers import AutoModelForVision2Seq" \
+    && python3 -c "from verl.workers.config import ActorConfig"
 
 # The pieces of the existing repo the rollout needs at runtime: the helpers,
 # the configs, the scripts, and the tau2 task/policy data files (telecom
