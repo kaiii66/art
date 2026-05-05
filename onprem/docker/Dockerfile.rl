@@ -90,6 +90,24 @@ RUN python -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-
 # ever fixes this upstream.
 RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/verl/workers/fsdp_workers.py'); s = p.read_text(); old = '            actor_module = actor_module_class.from_pretrained(\n                pretrained_model_name_or_path=local_path,\n                torch_dtype=torch_dtype,\n                config=actor_model_config,\n                trust_remote_code=trust_remote_code,\n                attn_implementation=attn_implementation,\n            )\n'; new = '            actor_module = actor_module_class.from_pretrained(\n                pretrained_model_name_or_path=local_path,\n                torch_dtype=torch_dtype,\n                config=actor_model_config,\n                trust_remote_code=trust_remote_code,\n                attn_implementation=attn_implementation,\n                low_cpu_mem_usage=True,\n            )\n'; p.write_text(s.replace(old, new)) if old in s else print('WARNING: from_pretrained anchor not found in fsdp_workers.py -- patch skipped (may already be fixed in verl 0.7.1)')"
 
+# verl 0.7.1's apply_fsdp2 (fsdp_utils.py:543-546) converts str→list for
+# transformer_layer_cls_to_wrap but not set→list. PeftModelForCausalLM._no_split_modules
+# returns a set on newer PEFT, causing `set[0]` TypeError at line 546.
+# Patch: add `elif isinstance(..., (set, frozenset)): sorted(...)` so the assert
+# can subscript [0] regardless of type. Guard with `if old in s`.
+RUN python3 -c "
+import pathlib
+p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/verl/utils/fsdp_utils.py')
+s = p.read_text()
+old = '    if isinstance(fsdp_transformer_layer_cls_to_wrap, str):\n        fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]\n\n    assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None'
+new = '    if isinstance(fsdp_transformer_layer_cls_to_wrap, str):\n        fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]\n    elif isinstance(fsdp_transformer_layer_cls_to_wrap, (set, frozenset)):\n        fsdp_transformer_layer_cls_to_wrap = sorted(fsdp_transformer_layer_cls_to_wrap)\n\n    assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None'
+if old in s:
+    p.write_text(s.replace(old, new))
+    print('patched verl fsdp_utils.py: set->sorted list for fsdp_transformer_layer_cls_to_wrap')
+else:
+    print('WARNING: fsdp_utils.py patch anchor not found -- skipped (may be fixed in a newer verl)')
+"
+
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
 
