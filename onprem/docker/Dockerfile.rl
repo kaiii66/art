@@ -152,10 +152,47 @@ RUN printf 'import multiprocessing.resource_sharer as _rs_fix\nimport multiproce
 # EOS token.  Every rollout generates to max_tokens, gets finish_reason="length",
 # triggers MAX_RESPONSE_LENGTH_EXCEEDED, gets filtered out, and the episode list
 # is empty → pad_sequence([]) crash.
-# Fix: monkey-patch both VerlEngine classes (rllm.engine and rllm.experimental)
-# via a .pth module so stop_token_ids=[151645] is injected at __init__ time,
-# before the first generate() call.
-RUN echo 'ZGVmIF9wYXRjaF92ZXJsX2VuZ2luZXMoKToKICAgIGZvciBfbXAgaW4gWydybGxtLmVuZ2luZS5yb2xsb3V0LnZlcmxfZW5naW5lJywgJ3JsbG0uZXhwZXJpbWVudGFsLnJvbGxvdXQudmVybF9lbmdpbmUnXToKICAgICAgICB0cnk6CiAgICAgICAgICAgIGltcG9ydCBpbXBvcnRsaWIKICAgICAgICAgICAgX21vZCA9IGltcG9ydGxpYi5pbXBvcnRfbW9kdWxlKF9tcCkKICAgICAgICAgICAgX1ZFID0gX21vZC5WZXJsRW5naW5lCiAgICAgICAgICAgIF9vaSA9IF9WRS5fX2luaXRfXwogICAgICAgICAgICBkZWYgX3BpKHNlbGYsICphLCBfbz1fb2ksICoqa3cpOgogICAgICAgICAgICAgICAgX28oc2VsZiwgKmEsICoqa3cpCiAgICAgICAgICAgICAgICBzZWxmLnRyYWluX3NhbXBsaW5nX3BhcmFtcy5zZXRkZWZhdWx0KCdzdG9wX3Rva2VuX2lkcycsIFsxNTE2NDVdKQogICAgICAgICAgICAgICAgc2VsZi52YWxfc2FtcGxpbmdfcGFyYW1zLnNldGRlZmF1bHQoJ3N0b3BfdG9rZW5faWRzJywgWzE1MTY0NV0pCiAgICAgICAgICAgICAgICBwcmludCgnW3N0b3BfcGF0Y2hdIHN0b3BfdG9rZW5faWRzPVsxNTE2NDVdICg8fGltX2VuZHw+KSBpbmplY3RlZCBpbnRvIFZlcmxFbmdpbmUnKQogICAgICAgICAgICBfVkUuX19pbml0X18gPSBfcGkKICAgICAgICAgICAgcHJpbnQoZidbc3RvcF9wYXRjaF0gcGF0Y2hlZCB7X21wfScpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBfZToKICAgICAgICAgICAgcHJpbnQoZidbc3RvcF9wYXRjaF0gd2FybmluZzoge19tcH06IHtfZX0nKQpfcGF0Y2hfdmVybF9lbmdpbmVzKCkK' | base64 -d > /usr/local/lib/python3.12/dist-packages/_qwen3_stop_patch.py && printf 'import _qwen3_stop_patch\n' > /usr/local/lib/python3.12/dist-packages/_qwen3_stop_patch.pth && python3 -c "import _qwen3_stop_patch; print('stop_token_ids patch OK')"
+# Fix: directly add stop_token_ids=[151645] to both sampling_params dicts via
+# an in-place text edit of the two verl_engine.py files.  Do NOT use a .pth
+# startup import — importing verl.experimental.agent_loop before ray.init()
+# corrupts Ray's GPU assignment for WorkerDict actors, forcing all 8 FSDP
+# workers onto GPU 0 and triggering an immediate OOM during actor_rollout_init_model.
+RUN python3 -c "
+import pathlib, sys
+PATCH = '            stop_token_ids=[151645],'
+BEFORE = '            logprobs=1,\n        )'
+AFTER  = '            logprobs=1,\n' + PATCH + '\n        )'
+ok = True
+for path in [
+    '/usr/local/lib/python3.12/dist-packages/rllm/engine/rollout/verl_engine.py',
+    '/usr/local/lib/python3.12/dist-packages/rllm/experimental/rollout/verl_engine.py',
+]:
+    p = pathlib.Path(path)
+    if not p.exists():
+        print(f'SKIP (not found): {path}'); continue
+    text = p.read_text()
+    if 'stop_token_ids' in text:
+        print(f'already patched: {path}'); continue
+    new_text = text.replace(BEFORE, AFTER)
+    if new_text == text:
+        print(f'ERROR: pattern not found in {path}'); ok = False; continue
+    p.write_text(new_text)
+    n = new_text.count('stop_token_ids')
+    print(f'patched {path} ({n} insertions)')
+sys.exit(0 if ok else 1)
+" && python3 -c "
+from rllm.engine.rollout.verl_engine import VerlEngine
+import inspect, ast, textwrap
+src = inspect.getsource(VerlEngine.__init__)
+assert 'stop_token_ids' in src, 'stop_token_ids missing from VerlEngine.__init__'
+print('stop_token_ids direct-patch OK (engine)')
+" && python3 -c "
+from rllm.experimental.rollout.verl_engine import VerlEngine
+import inspect
+src = inspect.getsource(VerlEngine.__init__)
+assert 'stop_token_ids' in src, 'stop_token_ids missing from experimental VerlEngine.__init__'
+print('stop_token_ids direct-patch OK (experimental)')
+"
 
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
