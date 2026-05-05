@@ -95,9 +95,12 @@ data:
   return_multi_modal_inputs: false
 
 actor_rollout_ref:
-  # disaggregated: actor (FSDP, GPUs 0-3) and rollout (SGLang, GPUs 4-7) on
-  # separate Ray placement groups. hybrid_engine: false disables colocated mode.
-  hybrid_engine: false
+  # Colocated: actor (FSDP) and rollout (SGLang TP=8) share all 8 GPUs.
+  # verl 0.7.1 only supports hybrid_engine: true (disaggregated mode not yet
+  # available in the 0.7.x series — ray_trainer.py asserts hybrid_engine).
+  # SGLang handles Qwen3-MoE natively without the fused-qkv workarounds that
+  # vLLM colocated required (fully_sharded_loras, disable_custom_all_reduce).
+  hybrid_engine: true
   model:
     path: Qwen/Qwen3-30B-A3B-Instruct-2507
     use_remove_padding: true
@@ -128,10 +131,9 @@ actor_rollout_ref:
     mode: async
     agent:
       num_workers: 0
-    # Rollout uses 4 GPUs (TP=4); actor FSDP uses the remaining 4.
-    # SGLang natively supports Qwen3-MoE LoRA without the fused-qkv workarounds
-    # that vLLM colocated required (fully_sharded_loras, disable_custom_all_reduce).
-    tensor_model_parallel_size: 4
+    # TP=8: all GPUs used for SGLang colocated rollout.
+    # gpu_memory_utilization=0.5 leaves ~40GB/GPU for the FSDP actor shards.
+    tensor_model_parallel_size: 8
     max_model_len: 16384
     temperature: 0.7
     top_p: 0.95
@@ -143,8 +145,9 @@ actor_rollout_ref:
       do_sample: true
     log_prob_micro_batch_size_per_gpu: 1
     engine_kwargs:
-      # SGLang defaults work for Qwen3-MoE; tune during smoke if needed.
-      sglang: {}
+      sglang:
+        # Leave ~40 GB/GPU for the FSDP actor shards (colocated hybrid mode).
+        gpu_memory_utilization: 0.5
   ref:
     fsdp_config:
       param_offload: false
