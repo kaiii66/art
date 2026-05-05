@@ -142,6 +142,19 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # branches to to_empty().
 RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/verl/utils/fsdp_utils.py'); s = p.read_text(); old = '    if dist.get_rank() == 0:\n        model = model.to(device=get_device_id(), non_blocking=True)\n    else:\n        model = model.to_empty(device=get_device_id())'; new = '    model = model.to_empty(device=get_device_id())'; (p.write_text(s.replace(old, new, 1)), print('fsdp_utils to_empty patch applied')) if old in s else print('WARNING: fsdp_utils to_empty anchor not found -- skipped')"
 
+# verl's get_init_weight_context_manager uses init_empty_weights() on non-rank-0 workers
+# so the base model parameters are meta on those ranks. PEFT's LoraLayer.update_layer
+# calls _move_adapter_to_device_of_base_layer at the end of init, which sees the base
+# layer device=meta and moves the freshly created CPU LoRA A/B params to meta too.
+# That causes set_peft_model_state_dict (called without assign=True) to silently skip
+# loading the adapter weights → 2672 "copying from non-meta to meta, no-op" warnings →
+# LoRA adapter not applied → base model generates max-length thinking → all rollouts
+# filtered → empty batch crash.
+# Fix: return early in _move_adapter_to_device_of_base_layer when base is meta; this
+# keeps LoRA params on CPU so the subsequent load_state_dict copy_ succeeds and
+# full_state captures correct weights before FSDP2 scattering.
+RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/peft/tuners/lora/layer.py'); s = p.read_text(); old = '        device = self.get_param().device\n        meta = torch.device(\"meta\")\n        param = self.get_param()\n'; new = '        device = self.get_param().device\n        meta = torch.device(\"meta\")\n        param = self.get_param()\n        if device == meta:\n            return  # base on meta (FSDP2 deferred init on non-rank-0); keep LoRA on CPU\n'; (p.write_text(s.replace(old, new, 1)), print('peft lora meta-move patch applied')) if old in s else print('WARNING: peft lora layer anchor not found -- skipped')"
+
 # torch 2.9.1 serializes FSDP de-sharded CPU tensors via ForkingPickler's
 # FD-based shared memory (rebuild_storage_fd). The FD is passed through
 # multiprocessing.resource_sharer, which creates a connection.Listener with
