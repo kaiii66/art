@@ -41,11 +41,13 @@ RUN pip install --no-cache-dir \
         "verl==0.7.1" \
         "httpx>=0.26.0"
 
-# SGLang rollout engine. SGLang natively supports Qwen3-MoE LoRA without the
-# fused-qkv workarounds that vLLM colocated required.
-# NOTE: sglang>=0.4.0 upgrades torch from the NGC base (2.8.0a0) to 2.9.1,
+# SGLang rollout engine. verl 0.7.1 requires sglang==0.5.6 exactly (its
+# async_sglang_server.py imports _launch_subprocesses from sglang.srt.entrypoints.http_server
+# which was removed in sglang>=0.5.7). Pin to 0.5.6 with the [openai,srt] extras
+# verl specifies.
+# NOTE: sglang 0.5.6 upgrades torch from the NGC base (2.8.0a0) to 2.9.1,
 # so flash-attn MUST be built AFTER sglang to link against the correct ABI.
-RUN pip install --no-cache-dir "sglang>=0.4.0"
+RUN pip install --no-cache-dir "sglang[openai,srt]==0.5.6"
 
 # sglang>=0.4.0 downgrades torchao to 0.9.0, but PEFT>=0.14 checks torchao at
 # import time and requires >=0.16.0 (for its torchao quantization feature gate).
