@@ -569,20 +569,6 @@ def main() -> int:
         print(f"    ghcr user        : {ghcr_user or '(unset; pass --ghcr-user or export GHCR_USER)'}")
         print(f"    kubeconfig       : {os.environ.get('KUBECONFIG', '(unset)')}")
 
-    # No --publish-leaderboard flag any more: create_leaderboard_shaped_reward.py
-    # auto-creates the Weave Dataset/Evaluation/Leaderboard on first invocation
-    # and reuses + appends to them on every subsequent invocation.
-    #
-    # For the onprem backend, also pass auto-derived SFT/RL collection names
-    # and W&B aliases so the leaderboard can find our PVC-uploaded LoRAs.
-    # Without these, the script falls back to .sft_endpoint_step / .best_rl_step
-    # files (serverless ART convention) that onprem doesn't write.
-    leaderboard_cmd = _build_leaderboard_cmd(
-        train_cfg=train_cfg,
-        snapshot=snapshot,
-        backend=args.backend,
-    )
-
     # ── stage: upload (shared) ──
     upload_cmd = ["uv", "run", "python", "upload_dataset_to_wandb.py", "--config", str(train_cfg)]
     if "upload" not in skip:
@@ -646,6 +632,14 @@ def main() -> int:
 
     # ── stage: leaderboard ──
     if "leaderboard" not in skip:
+        # Build the leaderboard command here (after RL) so that .rl_lora_artifact_uri
+        # is already written by the RL stage and the RL model is included in the
+        # leaderboard. Building it at startup (before RL) silently drops the RL row.
+        leaderboard_cmd = _build_leaderboard_cmd(
+            train_cfg=train_cfg,
+            snapshot=snapshot,
+            backend=args.backend,
+        )
         run_stage("leaderboard", leaderboard_cmd, snapshot / "05-leaderboard.log", dry_run=args.dry_run)
     else:
         print("\n=== stage: leaderboard (skipped) ===")
