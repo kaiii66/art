@@ -31,7 +31,7 @@ defaults:
 # tau2-specific config (consumed by rllm_train_tau2.py only; not by verl).
 # ---------------------------------------------------------------------------
 tau2:
-  project: tau2-ART-autoresearch-telecom
+  project: ${oc.env:WANDB_PROJECT,tau2-ART-autoresearch-telecom}
   group: null  # K8s sets WANDB_RUN_GROUP
 
   workflow:
@@ -227,7 +227,7 @@ fireworks:
   concurrency: 32
 
 trainer:
-  project_name: tau2-ART-autoresearch-telecom
+  project_name: ${oc.env:WANDB_PROJECT,tau2-ART-autoresearch-telecom}
   experiment_name: rl-${oc.env:PIPELINE_SUFFIX,manual}
   logger:
     - console
