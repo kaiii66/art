@@ -70,15 +70,7 @@ RUN mkdir -p /root/wheelhouse && \
 # libcudart.so.12 lives in the nvidia-cuda-runtime-cu12 Python package but
 # is NOT in ldconfig or LD_LIBRARY_PATH. Register it so the subprocess can
 # find it regardless of LD_LIBRARY_PATH inheritance.
-RUN python3 -c "
-import pathlib
-# nvidia-cuda-runtime-cu12 ships libcudart.so.12 here:
-cuda12_lib = pathlib.Path('/usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/lib')
-assert (cuda12_lib / 'libcudart.so.12').exists(), 'libcudart.so.12 missing from nvidia cuda-runtime package'
-with open('/etc/ld.so.conf.d/nvidia-cuda-12.conf', 'w') as f:
-    f.write(str(cuda12_lib) + '\n')
-print('Registered:', cuda12_lib)
-" && ldconfig && ldconfig -p | grep "libcudart.so.12"
+RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/lib'); assert (p / 'libcudart.so.12').exists(), 'libcudart.so.12 not found in nvidia cuda-runtime package'; open('/etc/ld.so.conf.d/nvidia-cuda-12.conf', 'w').write(str(p) + '\n'); print('Registered:', p)" && ldconfig && ldconfig -p | grep "libcudart.so.12"
 
 # Standard helpers used by the trainer + upload scripts.
 # litellm>=1.83.0 is required for native `wandb/<model>` routing to W&B
