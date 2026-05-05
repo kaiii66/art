@@ -106,6 +106,15 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # can subscript [0] regardless of type. Guard with `if old in s`.
 RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/verl/utils/fsdp_utils.py'); s = p.read_text(); old = '    if isinstance(fsdp_transformer_layer_cls_to_wrap, str):\n        fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]\n\n    assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None'; new = '    if isinstance(fsdp_transformer_layer_cls_to_wrap, str):\n        fsdp_transformer_layer_cls_to_wrap = [fsdp_transformer_layer_cls_to_wrap]\n    elif isinstance(fsdp_transformer_layer_cls_to_wrap, (set, frozenset)):\n        fsdp_transformer_layer_cls_to_wrap = sorted(fsdp_transformer_layer_cls_to_wrap)\n\n    assert len(fsdp_transformer_layer_cls_to_wrap) > 0 and fsdp_transformer_layer_cls_to_wrap[0] is not None'; p.write_text(s.replace(old, new)) if old in s else print('WARNING: fsdp_utils.py patch anchor not found -- skipped')"
 
+# sglang 0.5.6's apply_torchao_config_to_model() imports
+# float8_dynamic_activation_float8_weight and float8_weight_only at function
+# entry before the `if torchao_config is None: return model` early-exit. In
+# torchao>=0.10 these were replaced by class-based configs, so the import
+# fails. Since we always pass torchao_config=None (no quantization), remove
+# the two float8 symbols from the eager import; they live in fp8dq/fp8wo
+# branches that are unreachable with our config. Guard with `if old in s`.
+RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/sglang/srt/layers/torchao_utils.py'); s = p.read_text(); old = '    from torchao.quantization import (\n        float8_dynamic_activation_float8_weight,\n        float8_weight_only,\n        int4_weight_only,\n        int8_dynamic_activation_int8_weight,\n        int8_weight_only,\n        quantize_,\n    )'; new = '    from torchao.quantization import (\n        int4_weight_only,\n        int8_dynamic_activation_int8_weight,\n        int8_weight_only,\n        quantize_,\n    )'; p.write_text(s.replace(old, new)) if old in s else print('WARNING: torchao_utils.py patch anchor not found -- skipped')"
+
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
 
