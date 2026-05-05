@@ -65,13 +65,20 @@ RUN mkdir -p /root/wheelhouse && \
         --find-links /root/wheelhouse \
         "flash-attn==2.8.1"
 
-# sglang's scheduler subprocess is launched as /usr/bin/python (system Python)
-# which does not inherit LD_LIBRARY_PATH and therefore can't find
-# libcudart.so.12 (bundled inside torch/lib/). Register the torch lib directory
-# in the system-wide linker cache so ALL child processes can locate it.
-# Must run after sglang (which upgrades torch to 2.9.1) to get the right path.
-RUN python3 -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'lib')" \
-        | tee /etc/ld.so.conf.d/torch-cuda.conf && ldconfig
+# sglang's scheduler subprocess is launched as /usr/bin/python via
+# multiprocessing.spawn. NGC 25.08 only ships libcudart.so.13 (CUDA 13.0);
+# libcudart.so.12 lives in the nvidia-cuda-runtime-cu12 Python package but
+# is NOT in ldconfig or LD_LIBRARY_PATH. Register it so the subprocess can
+# find it regardless of LD_LIBRARY_PATH inheritance.
+RUN python3 -c "
+import pathlib
+# nvidia-cuda-runtime-cu12 ships libcudart.so.12 here:
+cuda12_lib = pathlib.Path('/usr/local/lib/python3.12/dist-packages/nvidia/cuda_runtime/lib')
+assert (cuda12_lib / 'libcudart.so.12').exists(), 'libcudart.so.12 missing from nvidia cuda-runtime package'
+with open('/etc/ld.so.conf.d/nvidia-cuda-12.conf', 'w') as f:
+    f.write(str(cuda12_lib) + '\n')
+print('Registered:', cuda12_lib)
+" && ldconfig && ldconfig -p | grep "libcudart.so.12"
 
 # Standard helpers used by the trainer + upload scripts.
 # litellm>=1.83.0 is required for native `wandb/<model>` routing to W&B
