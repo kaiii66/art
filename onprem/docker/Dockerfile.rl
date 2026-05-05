@@ -31,16 +31,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --upgrade pip setuptools wheel packaging ninja
 
-# flash-attn must be installed FIRST with --no-build-isolation so it can see
-# the NGC base's torch. rllm[verl] sees flash-attn already satisfied and
-# skips the rebuild.
-RUN pip install --no-cache-dir --no-build-isolation "flash-attn==2.8.3"
+# Build flash-attn wheel against the NGC base torch, save to wheelhouse.
+# --no-build-isolation: lets setup.py import the installed torch.
+RUN mkdir -p /root/wheelhouse && \
+    pip wheel --no-build-isolation --no-deps \
+        -w /root/wheelhouse "flash-attn==2.8.1"
 
-# rLLM v0.3.0-pre + verl 0.7.1 (disaggregated SGLang rollout, native UI logger).
-# [verl] extra pulls verl 0.7.1; [ui] extra pulls httpx>=0.26.0 for the
-# rllm-ui backend that streams per-episode trajectories + metrics.
+# rllm[verl] v0.3.0-pre pulls in vllm==0.17.0 which requires
+# opencv-python-headless → numpy>=2.0.0, but verl==0.7.1 requires numpy<2.0.0.
+# These are irreconcilable in a single pip resolve. Since we use SGLang as the
+# rollout engine (not vllm), skip the [verl] extra entirely and install
+# components separately: rllm base + verl + httpx (for [ui] backend).
 RUN pip install --no-cache-dir \
-        "rllm[verl,ui] @ git+https://github.com/rllm-org/rllm.git@v0.3.0-pre"
+        "rllm @ git+https://github.com/rllm-org/rllm.git@v0.3.0-pre" \
+        "verl==0.7.1" \
+        "httpx>=0.26.0"
+
+# flash-attn from the pre-built wheel. --find-links prevents pip from
+# attempting a source rebuild (which would fail without torch in the build env).
+RUN pip install --no-cache-dir \
+        --find-links /root/wheelhouse \
+        "flash-attn==2.8.1"
 
 # SGLang rollout engine. The disaggregated 4+4 topology puts the SGLang
 # server on GPUs 4-7 (TP=4) while actor FSDP runs on GPUs 0-3. SGLang
