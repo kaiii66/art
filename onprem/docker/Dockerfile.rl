@@ -65,6 +65,14 @@ RUN mkdir -p /root/wheelhouse && \
         --find-links /root/wheelhouse \
         "flash-attn==2.8.1"
 
+# sglang's scheduler subprocess is launched as /usr/bin/python (system Python)
+# which does not inherit LD_LIBRARY_PATH and therefore can't find
+# libcudart.so.12 (bundled inside torch/lib/). Register the torch lib directory
+# in the system-wide linker cache so ALL child processes can locate it.
+# Must run after sglang (which upgrades torch to 2.9.1) to get the right path.
+RUN python3 -c "import torch, pathlib; print(pathlib.Path(torch.__file__).parent / 'lib')" \
+        | tee /etc/ld.so.conf.d/torch-cuda.conf && ldconfig
+
 # Standard helpers used by the trainer + upload scripts.
 # litellm>=1.83.0 is required for native `wandb/<model>` routing to W&B
 # Inference (provider added late 2025); earlier versions raise
