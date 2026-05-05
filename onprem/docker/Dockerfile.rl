@@ -122,6 +122,47 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # version guard so the function returns immediately for torch >= 2.8.0.
 RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/sglang/srt/utils/patch_torch.py'); s = p.read_text(); old = 'def monkey_patch_torch_reductions():\n    \"\"\"Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed\"\"\"\n\n    # Currently, NPU does not support UUID. This has been temporarily commented out, with support expected in the fourth quarter.\n    if _is_npu:\n        return\n\n    if hasattr(reductions, \"_reduce_tensor_original\"):\n        return'; new = 'def monkey_patch_torch_reductions():\n    \"\"\"Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed\"\"\"\n    import torch as _torch\n    from packaging import version as _version\n    if _version.parse(_torch.__version__.split(\"+\")[0]) >= _version.parse(\"2.8.0\"):\n        return  # PR #149248 already merged in torch>=2.8; patch not needed and breaks 2.9.1\n    # Currently, NPU does not support UUID. This has been temporarily commented out, with support expected in the fourth quarter.\n    if _is_npu:\n        return\n    if hasattr(reductions, \"_reduce_tensor_original\"):\n        return'; p.write_text(s.replace(old, new)) if old in s else print('WARNING: monkey_patch_torch_reductions anchor not found -- skipped')"
 
+# torch 2.9.1 serializes FSDP de-sharded CPU tensors via ForkingPickler's
+# FD-based shared memory (rebuild_storage_fd). The FD is passed through
+# multiprocessing.resource_sharer, which creates a connection.Listener with
+# process.current_process().authkey. The FSDP actor (Ray worker, authkey_A)
+# creates the Listener; the SGLang scheduler (spawned process, fresh random
+# authkey_B ≠ authkey_A) connects with authkey_B → AuthenticationError in
+# update_weights_from_tensor (scheduler→tp_worker→model_runner→common.py:2215
+# →rebuild_storage_fd→resource_sharer.detach→Client(authkey=B)).
+#
+# Fix: prepend to sglang/srt/utils/common.py (imported at startup by ALL
+# sglang processes: FSDP actors via verl imports, SGLang scheduler, TP workers)
+# a monkey-patch that overrides _ResourceSharer._start and get_connection to
+# use a fixed shared authkey, so Listener and Client always authenticate.
+RUN python3 -c "
+import pathlib
+p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/sglang/srt/utils/common.py')
+s = p.read_text()
+patch = (
+    'import multiprocessing.resource_sharer as _rs_fix\n'
+    'import multiprocessing.connection as _mc_fix\n'
+    '_AUTHKEY_FIXED = b\"sglang-verl-ipc-2026\"\n'
+    'def _rs_start_patched(self):\n'
+    '    assert self._listener is None\n'
+    '    import multiprocessing.util as _u; _u.debug(\"sglang IPC sharer start\")\n'
+    '    self._listener = _mc_fix.Listener(authkey=_AUTHKEY_FIXED, backlog=128)\n'
+    '    self._address = self._listener.address\n'
+    '    import threading; _t = threading.Thread(target=self._serve); _t.daemon = True; _t.start(); self._thread = _t\n'
+    '_rs_fix._ResourceSharer._start = _rs_start_patched\n'
+    '@staticmethod\n'
+    'def _rs_get_conn_patched(ident):\n'
+    '    import os; addr, key = ident\n'
+    '    _c = _mc_fix.Client(addr, authkey=_AUTHKEY_FIXED); _c.send((key, os.getpid())); return _c\n'
+    '_rs_fix._ResourceSharer.get_connection = _rs_get_conn_patched\n'
+)
+if '_AUTHKEY_FIXED' not in s:
+    p.write_text(patch + s)
+    print('Patched: resource_sharer fixed authkey injected into sglang/srt/utils/common.py')
+else:
+    print('Already patched')
+"
+
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
 
