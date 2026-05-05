@@ -122,6 +122,15 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # version guard so the function returns immediately for torch >= 2.8.0.
 RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/sglang/srt/utils/patch_torch.py'); s = p.read_text(); old = 'def monkey_patch_torch_reductions():\n    \"\"\"Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed\"\"\"\n\n    # Currently, NPU does not support UUID. This has been temporarily commented out, with support expected in the fourth quarter.\n    if _is_npu:\n        return\n\n    if hasattr(reductions, \"_reduce_tensor_original\"):\n        return'; new = 'def monkey_patch_torch_reductions():\n    \"\"\"Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed\"\"\"\n    import torch as _torch\n    from packaging import version as _version\n    if _version.parse(_torch.__version__.split(\"+\")[0]) >= _version.parse(\"2.8.0\"):\n        return  # PR #149248 already merged in torch>=2.8; patch not needed and breaks 2.9.1\n    # Currently, NPU does not support UUID. This has been temporarily commented out, with support expected in the fourth quarter.\n    if _is_npu:\n        return\n    if hasattr(reductions, \"_reduce_tensor_original\"):\n        return'; p.write_text(s.replace(old, new)) if old in s else print('WARNING: monkey_patch_torch_reductions anchor not found -- skipped')"
 
+# PEFT's _maybe_shard_state_dict_for_tp (save_and_load.py) unconditionally
+# imports EmbeddingParallel from transformers.integrations.tensor_parallel,
+# which was added in transformers>=4.48. The transformers installed via
+# sglang 0.5.6 dependencies predates this → ImportError when loading the
+# SFT LoRA adapter into the FSDP actor. We use FSDP (not tensor parallel),
+# so the function is a no-op: append a shadowing definition at module end
+# (Python last-def wins) that skips the broken import entirely.
+RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/peft/utils/save_and_load.py'); s = p.read_text(); patch = '\n# Patched: no-op for FSDP -- transformers lacks EmbeddingParallel pre-4.48\ndef _maybe_shard_state_dict_for_tp(model, peft_model_state_dict, adapter_name): pass\n'; (p.write_text(s + patch), print('peft TP shard no-op applied')) if '_maybe_shard_state_dict_for_tp' in s and 'Patched: no-op' not in s else print('peft TP shard patch already applied or function not found')"
+
 # torch 2.9.1 serializes FSDP de-sharded CPU tensors via ForkingPickler's
 # FD-based shared memory (rebuild_storage_fd). The FD is passed through
 # multiprocessing.resource_sharer, which creates a connection.Listener with
