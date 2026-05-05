@@ -135,33 +135,7 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # sglang processes: FSDP actors via verl imports, SGLang scheduler, TP workers)
 # a monkey-patch that overrides _ResourceSharer._start and get_connection to
 # use a fixed shared authkey, so Listener and Client always authenticate.
-RUN python3 -c "
-import pathlib
-p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/sglang/srt/utils/common.py')
-s = p.read_text()
-patch = (
-    'import multiprocessing.resource_sharer as _rs_fix\n'
-    'import multiprocessing.connection as _mc_fix\n'
-    '_AUTHKEY_FIXED = b\"sglang-verl-ipc-2026\"\n'
-    'def _rs_start_patched(self):\n'
-    '    assert self._listener is None\n'
-    '    import multiprocessing.util as _u; _u.debug(\"sglang IPC sharer start\")\n'
-    '    self._listener = _mc_fix.Listener(authkey=_AUTHKEY_FIXED, backlog=128)\n'
-    '    self._address = self._listener.address\n'
-    '    import threading; _t = threading.Thread(target=self._serve); _t.daemon = True; _t.start(); self._thread = _t\n'
-    '_rs_fix._ResourceSharer._start = _rs_start_patched\n'
-    '@staticmethod\n'
-    'def _rs_get_conn_patched(ident):\n'
-    '    import os; addr, key = ident\n'
-    '    _c = _mc_fix.Client(addr, authkey=_AUTHKEY_FIXED); _c.send((key, os.getpid())); return _c\n'
-    '_rs_fix._ResourceSharer.get_connection = _rs_get_conn_patched\n'
-)
-if '_AUTHKEY_FIXED' not in s:
-    p.write_text(patch + s)
-    print('Patched: resource_sharer fixed authkey injected into sglang/srt/utils/common.py')
-else:
-    print('Already patched')
-"
+RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/sglang/srt/utils/common.py'); s = p.read_text(); patch = 'import multiprocessing.resource_sharer as _rs_fix\\nimport multiprocessing.connection as _mc_fix\\n_AUTHKEY_FIXED = b\\'sglang-verl-ipc-2026\\'\\ndef _rs_start_patched(self):\\n    assert self._listener is None\\n    self._listener = _mc_fix.Listener(authkey=_AUTHKEY_FIXED, backlog=128)\\n    self._address = self._listener.address\\n    import threading; _t = threading.Thread(target=self._serve); _t.daemon = True; _t.start(); self._thread = _t\\n_rs_fix._ResourceSharer._start = _rs_start_patched\\n@staticmethod\\ndef _rs_get_conn_patched(ident):\\n    import os; addr, key = ident\\n    _c = _mc_fix.Client(addr, authkey=_AUTHKEY_FIXED); _c.send((key, os.getpid())); return _c\\n_rs_fix._ResourceSharer.get_connection = _rs_get_conn_patched\\n'; (p.write_text(patch + s), print('Patched: resource_sharer fixed authkey')) if '_AUTHKEY_FIXED' not in s else print('Already patched')"
 
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
