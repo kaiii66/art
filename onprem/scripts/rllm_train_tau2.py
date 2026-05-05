@@ -1,4 +1,4 @@
-"""On-prem GRPO RL trainer for tau2-bench (rLLM v0.2.1.post1, verl backend).
+"""On-prem GRPO RL trainer for tau2-bench (rLLM v0.3.0-pre, verl 0.7.1 backend).
 
 Hydra entry point. Build:
   * the W&B run (so verl's `wandb` logger reuses it)

@@ -3,8 +3,8 @@
 #
 # Steps:
 #   1. Sanity checks (GPUs, secrets, starting LoRA).
-#   2. Run rllm_train_tau2.py via Hydra.  The verl backend internally manages
-#      vLLM (colocated TP=8 on the 8 H100s) and FSDP actor sharding.
+#   2. Run rllm_train_tau2.py via Hydra.  The verl backend manages a
+#      disaggregated SGLang rollout (TP=4, GPUs 4-7) + FSDP actor (GPUs 0-3).
 #   3. On success, upload the resulting LoRA dir to W&B Inference and write
 #      its URI to the artifacts PVC for the pipeline driver to read.
 #
@@ -47,20 +47,6 @@ export PYTHONUNBUFFERED=1
 export NCCL_P2P_DISABLE=0
 export NCCL_DEBUG=WARN
 export TOKENIZERS_PARALLELISM=false
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-# verl's async rollout path requires VLLM_USE_V1=1, but v1's
-# SymmMemCommunicator + custom_all_reduce collide with FSDP allocations on
-# colocated TP=8. Disable cuMem-based NCCL allocator + symmetric-memory so
-# vLLM falls back to plain NCCL collectives that play nicely with FSDP.
-export VLLM_USE_V1=1
-# vLLM's TP all-reduce path defaults to PyTorch symmetric-memory (cuMem),
-# which can't rendezvous when FSDP has already pinned the same devices.
-# Falling back to NCCL all-reduce (the default before 0.x) is the supported
-# escape hatch.
-export VLLM_ALLREDUCE_USE_SYMM_MEM=0
-export NCCL_CUMEM_ENABLE=0
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-export VLLM_ENGINE_ITERATION_TIMEOUT_S=100000000000
 
 # Hydra overrides forwarded from the env (smoke vs. prod runs differ here).
 # RL_HYDRA_OVERRIDES is split on whitespace by the shell; quoted args inside
