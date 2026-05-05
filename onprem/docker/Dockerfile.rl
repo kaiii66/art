@@ -157,42 +157,7 @@ RUN printf 'import multiprocessing.resource_sharer as _rs_fix\nimport multiproce
 # startup import — importing verl.experimental.agent_loop before ray.init()
 # corrupts Ray's GPU assignment for WorkerDict actors, forcing all 8 FSDP
 # workers onto GPU 0 and triggering an immediate OOM during actor_rollout_init_model.
-RUN python3 -c "
-import pathlib, sys
-PATCH = '            stop_token_ids=[151645],'
-BEFORE = '            logprobs=1,\n        )'
-AFTER  = '            logprobs=1,\n' + PATCH + '\n        )'
-ok = True
-for path in [
-    '/usr/local/lib/python3.12/dist-packages/rllm/engine/rollout/verl_engine.py',
-    '/usr/local/lib/python3.12/dist-packages/rllm/experimental/rollout/verl_engine.py',
-]:
-    p = pathlib.Path(path)
-    if not p.exists():
-        print(f'SKIP (not found): {path}'); continue
-    text = p.read_text()
-    if 'stop_token_ids' in text:
-        print(f'already patched: {path}'); continue
-    new_text = text.replace(BEFORE, AFTER)
-    if new_text == text:
-        print(f'ERROR: pattern not found in {path}'); ok = False; continue
-    p.write_text(new_text)
-    n = new_text.count('stop_token_ids')
-    print(f'patched {path} ({n} insertions)')
-sys.exit(0 if ok else 1)
-" && python3 -c "
-from rllm.engine.rollout.verl_engine import VerlEngine
-import inspect, ast, textwrap
-src = inspect.getsource(VerlEngine.__init__)
-assert 'stop_token_ids' in src, 'stop_token_ids missing from VerlEngine.__init__'
-print('stop_token_ids direct-patch OK (engine)')
-" && python3 -c "
-from rllm.experimental.rollout.verl_engine import VerlEngine
-import inspect
-src = inspect.getsource(VerlEngine.__init__)
-assert 'stop_token_ids' in src, 'stop_token_ids missing from experimental VerlEngine.__init__'
-print('stop_token_ids direct-patch OK (experimental)')
-"
+RUN echo 'aW1wb3J0IHBhdGhsaWIsIHN5cwpBTkNIT1IgPSAnICAgICAgICBwcmludChmInRyYWluX3NhbXBsaW5nX3BhcmFtczoge3NlbGYudHJhaW5fc2FtcGxpbmdfcGFyYW1zfSIpJwpJTlNFUlQgPSAnICAgICAgICBzZWxmLnRyYWluX3NhbXBsaW5nX3BhcmFtc1sic3RvcF90b2tlbl9pZHMiXSA9IFsxNTE2NDVdXG4gICAgICAgIHNlbGYudmFsX3NhbXBsaW5nX3BhcmFtc1sic3RvcF90b2tlbl9pZHMiXSA9IFsxNTE2NDVdXG4nCm9rID0gVHJ1ZQpmb3IgcGF0aCBpbiBbCiAgICAiL3Vzci9sb2NhbC9saWIvcHl0aG9uMy4xMi9kaXN0LXBhY2thZ2VzL3JsbG0vZW5naW5lL3JvbGxvdXQvdmVybF9lbmdpbmUucHkiLAogICAgIi91c3IvbG9jYWwvbGliL3B5dGhvbjMuMTIvZGlzdC1wYWNrYWdlcy9ybGxtL2V4cGVyaW1lbnRhbC9yb2xsb3V0L3ZlcmxfZW5naW5lLnB5IiwKXToKICAgIHAgPSBwYXRobGliLlBhdGgocGF0aCkKICAgIGlmIG5vdCBwLmV4aXN0cygpOgogICAgICAgIHByaW50KGYiU0tJUCAobm90IGZvdW5kKToge3BhdGh9IikKICAgICAgICBjb250aW51ZQogICAgdGV4dCA9IHAucmVhZF90ZXh0KCkKICAgIGlmICJzdG9wX3Rva2VuX2lkcyIgaW4gdGV4dDoKICAgICAgICBwcmludChmImFscmVhZHkgcGF0Y2hlZDoge3BhdGh9IikKICAgICAgICBjb250aW51ZQogICAgaWYgQU5DSE9SIG5vdCBpbiB0ZXh0OgogICAgICAgIHByaW50KGYiRVJST1I6IGFuY2hvciBub3QgZm91bmQgaW4ge3BhdGh9IikKICAgICAgICBvayA9IEZhbHNlCiAgICAgICAgY29udGludWUKICAgIG5ld190ZXh0ID0gdGV4dC5yZXBsYWNlKEFOQ0hPUiwgSU5TRVJUICsgQU5DSE9SLCAxKQogICAgcC53cml0ZV90ZXh0KG5ld190ZXh0KQogICAgcHJpbnQoZiJwYXRjaGVkIHtwYXRofSIpCnN5cy5leGl0KDAgaWYgb2sgZWxzZSAxKQo=' | base64 -d | python3 && python3 -c "import rllm.engine.rollout.verl_engine as m, inspect; src=inspect.getsource(m.VerlEngine.__init__); assert 'stop_token_ids' in src; print('stop_token_ids direct-patch OK (engine)')" && python3 -c "import rllm.experimental.rollout.verl_engine as m, inspect; src=inspect.getsource(m.VerlEngine.__init__); assert 'stop_token_ids' in src; print('stop_token_ids direct-patch OK (experimental)')"
 
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
