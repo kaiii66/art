@@ -162,20 +162,7 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # base is also meta — load_state_dict copy_() is a no-op (meta→meta no-copy warning).
 # Fix: always use assign=True in the else branch so the checkpoint tensor replaces (not
 # copies into) the meta param, correctly materializing it for all 8 ranks.
-RUN python3 -c "
-import pathlib
-p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/peft/utils/save_and_load.py')
-s = p.read_text()
-old = '        load_result = model.load_state_dict(peft_model_state_dict, strict=False)\n'
-new = '        load_result = model.load_state_dict(peft_model_state_dict, strict=False, assign=True)\n'
-if 'assign=True patch' in s:
-    print('peft set_peft_model_state_dict assign=True patch already applied')
-elif old in s:
-    p.write_text(s.replace(old, new, 1))
-    print('peft set_peft_model_state_dict assign=True patch applied')
-else:
-    print('WARNING: set_peft_model_state_dict else-branch anchor not found -- skipped')
-"
+RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/peft/utils/save_and_load.py'); s = p.read_text(); old = '        load_result = model.load_state_dict(peft_model_state_dict, strict=False)\n'; new = '        load_result = model.load_state_dict(peft_model_state_dict, strict=False, assign=True)\n'; (p.write_text(s.replace(old, new, 1)), print('peft set_peft_model_state_dict assign=True patch applied')) if old in s else print('WARNING: set_peft_model_state_dict else-branch anchor not found -- skipped')"
 
 # torch 2.9.1 serializes FSDP de-sharded CPU tensors via ForkingPickler's
 # FD-based shared memory (rebuild_storage_fd). The FD is passed through
