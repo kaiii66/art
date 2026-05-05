@@ -140,17 +140,7 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # Rank-0 should also use to_empty() because set_model_state_dict(broadcast_from_rank0=True)
 # fills the actual weights from full_state anyway.  Patch fsdp_utils to unify both
 # branches to to_empty().
-RUN python3 -c "
-import pathlib
-p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/verl/utils/fsdp_utils.py')
-s = p.read_text()
-old = '    if dist.get_rank() == 0:\n        model = model.to(device=get_device_id(), non_blocking=True)\n    else:\n        model = model.to_empty(device=get_device_id())'
-new = '    model = model.to_empty(device=get_device_id())'
-if old in s:
-    p.write_text(s.replace(old, new, 1))
-    print('fsdp_utils fsdp2_load_full_state_dict to_empty patch applied')
-else:
-    print('WARNING: fsdp_utils to_empty anchor not found -- skipped')
+RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/verl/utils/fsdp_utils.py'); s = p.read_text(); old = '    if dist.get_rank() == 0:\n        model = model.to(device=get_device_id(), non_blocking=True)\n    else:\n        model = model.to_empty(device=get_device_id())'; new = '    model = model.to_empty(device=get_device_id())'; (p.write_text(s.replace(old, new, 1)), print('fsdp_utils to_empty patch applied')) if old in s else print('WARNING: fsdp_utils to_empty anchor not found -- skipped')"
 "
 
 # torch 2.9.1 serializes FSDP de-sharded CPU tensors via ForkingPickler's
