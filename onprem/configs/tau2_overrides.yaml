@@ -157,7 +157,8 @@ actor_rollout_ref:
     engine_kwargs:
       sglang:
         # Leave ~40 GB/GPU for the FSDP actor shards (colocated hybrid mode).
-        gpu_memory_utilization: 0.5
+        # sglang uses mem_fraction_static (not vLLM's gpu_memory_utilization).
+        mem_fraction_static: 0.5
   ref:
     fsdp_config:
       param_offload: false
