@@ -47,6 +47,12 @@ RUN pip install --no-cache-dir \
 # so flash-attn MUST be built AFTER sglang to link against the correct ABI.
 RUN pip install --no-cache-dir "sglang>=0.4.0"
 
+# sglang>=0.4.0 downgrades torchao to 0.9.0, but PEFT>=0.14 checks torchao at
+# import time and requires >=0.16.0 (for its torchao quantization feature gate).
+# Upgrade torchao after sglang so PeftModel.from_pretrained doesn't error out
+# when loading the SFT LoRA adapter into the actor.
+RUN pip install --no-cache-dir "torchao>=0.16.0"
+
 # Build flash-attn wheel against the torch that sglang installed (2.9.1),
 # then install it. Building after sglang ensures ABI compatibility.
 # --no-build-isolation: lets setup.py import the installed (sglang) torch.
