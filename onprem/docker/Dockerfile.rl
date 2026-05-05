@@ -147,6 +147,16 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # workers AND sglang spawned processes) without from __future__ ordering issues.
 RUN printf 'import multiprocessing.resource_sharer as _rs_fix\nimport multiprocessing.connection as _mc_fix\n_AUTHKEY_FIXED = b"sglang-verl-ipc-2026"\ndef _rs_start_patched(self):\n    assert self._listener is None\n    self._listener = _mc_fix.Listener(authkey=_AUTHKEY_FIXED, backlog=128)\n    self._address = self._listener.address\n    import threading; _t = threading.Thread(target=self._serve); _t.daemon = True; _t.start(); self._thread = _t\n_rs_fix._ResourceSharer._start = _rs_start_patched\n@staticmethod\ndef _rs_get_conn_patched(ident):\n    import os; addr, key = ident\n    _c = _mc_fix.Client(addr, authkey=_AUTHKEY_FIXED); _c.send((key, os.getpid())); return _c\n_rs_fix._ResourceSharer.get_connection = _rs_get_conn_patched\n' > /usr/local/lib/python3.12/dist-packages/_sglang_rs_fix.py && printf 'import _sglang_rs_fix\n' > /usr/local/lib/python3.12/dist-packages/_sglang_rs_fix.pth && python3 -c "import _sglang_rs_fix; print('resource_sharer authkey fix loaded OK')"
 
+# rllm VerlEngine builds train_sampling_params / val_sampling_params without
+# stop_token_ids, so SGLang never sees Qwen3's <|im_end|> (token 151645) as an
+# EOS token.  Every rollout generates to max_tokens, gets finish_reason="length",
+# triggers MAX_RESPONSE_LENGTH_EXCEEDED, gets filtered out, and the episode list
+# is empty → pad_sequence([]) crash.
+# Fix: monkey-patch both VerlEngine classes (rllm.engine and rllm.experimental)
+# via a .pth module so stop_token_ids=[151645] is injected at __init__ time,
+# before the first generate() call.
+RUN echo 'ZGVmIF9wYXRjaF92ZXJsX2VuZ2luZXMoKToKICAgIGZvciBfbXAgaW4gWydybGxtLmVuZ2luZS5yb2xsb3V0LnZlcmxfZW5naW5lJywgJ3JsbG0uZXhwZXJpbWVudGFsLnJvbGxvdXQudmVybF9lbmdpbmUnXToKICAgICAgICB0cnk6CiAgICAgICAgICAgIGltcG9ydCBpbXBvcnRsaWIKICAgICAgICAgICAgX21vZCA9IGltcG9ydGxpYi5pbXBvcnRfbW9kdWxlKF9tcCkKICAgICAgICAgICAgX1ZFID0gX21vZC5WZXJsRW5naW5lCiAgICAgICAgICAgIF9vaSA9IF9WRS5fX2luaXRfXwogICAgICAgICAgICBkZWYgX3BpKHNlbGYsICphLCBfbz1fb2ksICoqa3cpOgogICAgICAgICAgICAgICAgX28oc2VsZiwgKmEsICoqa3cpCiAgICAgICAgICAgICAgICBzZWxmLnRyYWluX3NhbXBsaW5nX3BhcmFtcy5zZXRkZWZhdWx0KCdzdG9wX3Rva2VuX2lkcycsIFsxNTE2NDVdKQogICAgICAgICAgICAgICAgc2VsZi52YWxfc2FtcGxpbmdfcGFyYW1zLnNldGRlZmF1bHQoJ3N0b3BfdG9rZW5faWRzJywgWzE1MTY0NV0pCiAgICAgICAgICAgICAgICBwcmludCgnW3N0b3BfcGF0Y2hdIHN0b3BfdG9rZW5faWRzPVsxNTE2NDVdICg8fGltX2VuZHw+KSBpbmplY3RlZCBpbnRvIFZlcmxFbmdpbmUnKQogICAgICAgICAgICBfVkUuX19pbml0X18gPSBfcGkKICAgICAgICAgICAgcHJpbnQoZidbc3RvcF9wYXRjaF0gcGF0Y2hlZCB7X21wfScpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBfZToKICAgICAgICAgICAgcHJpbnQoZidbc3RvcF9wYXRjaF0gd2FybmluZzoge19tcH06IHtfZX0nKQpfcGF0Y2hfdmVybF9lbmdpbmVzKCkK' | base64 -d > /usr/local/lib/python3.12/dist-packages/_qwen3_stop_patch.py && printf 'import _qwen3_stop_patch\n' > /usr/local/lib/python3.12/dist-packages/_qwen3_stop_patch.pth && python3 -c "import _qwen3_stop_patch; print('stop_token_ids patch OK')"
+
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
 
