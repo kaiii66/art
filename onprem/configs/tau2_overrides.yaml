@@ -107,7 +107,17 @@ actor_rollout_ref:
     enable_gradient_checkpointing: true
     lora_rank: 16
     lora_alpha: 32
-    target_modules: "all-linear"
+    # Explicit list required: verl/OmegaConf converts the "all-linear" magic
+    # string to set("all-linear") = individual characters, which PEFT rejects.
+    # These match the Axolotl SFT adapter's target modules (axolotl_sft.yaml).
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
   actor:
     optim:
       lr: 5.0e-7
