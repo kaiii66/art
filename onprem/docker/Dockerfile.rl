@@ -131,6 +131,18 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # (Python last-def wins) that skips the broken import entirely.
 RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/peft/utils/save_and_load.py'); s = p.read_text(); patch = '\n# Patched: no-op for FSDP -- transformers lacks EmbeddingParallel pre-4.48\ndef _maybe_shard_state_dict_for_tp(model, peft_model_state_dict, adapter_name): pass\n'; (p.write_text(s + patch), print('peft TP shard no-op applied')) if '_maybe_shard_state_dict_for_tp' in s and 'Patched: no-op' not in s else print('peft TP shard patch already applied or function not found')"
 
+# When the actor base model is loaded with low_cpu_mem_usage=True (to avoid 8-rank
+# × 60GB CPU-RAM spike), model parameters are meta tensors.  verl then calls
+# PeftModel.from_pretrained without low_cpu_mem_usage=True, so PEFT's
+# load_state_dict uses the default copy path instead of assign=True.  Copying to a
+# meta parameter is a no-op (PyTorch warns: "copying from a non-meta parameter…
+# which is a no-op"), leaving all LoRA weights at their random init values.  The
+# SFT adapter is silently discarded → model behaves like a base model → generates
+# 16K+ tokens of thinking on every tau2 task without ever making a tool call.
+# Fix: add low_cpu_mem_usage=True so PEFT uses load_state_dict(..., assign=True),
+# which replaces the meta tensors with the actual checkpoint weights in-place.
+RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/verl/workers/fsdp_workers.py'); s = p.read_text(); old = 'actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)'; new = 'actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True, low_cpu_mem_usage=True)'; (p.write_text(s.replace(old, new, 1)), print('fsdp_workers PeftModel.from_pretrained low_cpu_mem_usage patch applied')) if old in s and 'low_cpu_mem_usage=True, low_cpu_mem_usage' not in s else print('WARNING: fsdp_workers PeftModel patch anchor not found -- skipped')"
+
 # torch 2.9.1 serializes FSDP de-sharded CPU tensors via ForkingPickler's
 # FD-based shared memory (rebuild_storage_fd). The FD is passed through
 # multiprocessing.resource_sharer, which creates a connection.Listener with
