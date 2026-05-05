@@ -127,15 +127,16 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # multiprocessing.resource_sharer, which creates a connection.Listener with
 # process.current_process().authkey. The FSDP actor (Ray worker, authkey_A)
 # creates the Listener; the SGLang scheduler (spawned process, fresh random
-# authkey_B ≠ authkey_A) connects with authkey_B → AuthenticationError in
-# update_weights_from_tensor (scheduler→tp_worker→model_runner→common.py:2215
-# →rebuild_storage_fd→resource_sharer.detach→Client(authkey=B)).
+# authkey_B ≠ authkey_A) connects with authkey_B → AuthenticationError.
+# Full trace: scheduler→tp_worker:167→model_runner:2871→common.py:2215
+# →rebuild_storage_fd→resource_sharer.detach→Client(authkey=B).
 #
-# Fix: prepend to sglang/srt/utils/common.py (imported at startup by ALL
-# sglang processes: FSDP actors via verl imports, SGLang scheduler, TP workers)
-# a monkey-patch that overrides _ResourceSharer._start and get_connection to
-# use a fixed shared authkey, so Listener and Client always authenticate.
-RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/sglang/srt/utils/common.py'); s = p.read_text(); patch = 'import multiprocessing.resource_sharer as _rs_fix\\nimport multiprocessing.connection as _mc_fix\\n_AUTHKEY_FIXED = b\\'sglang-verl-ipc-2026\\'\\ndef _rs_start_patched(self):\\n    assert self._listener is None\\n    self._listener = _mc_fix.Listener(authkey=_AUTHKEY_FIXED, backlog=128)\\n    self._address = self._listener.address\\n    import threading; _t = threading.Thread(target=self._serve); _t.daemon = True; _t.start(); self._thread = _t\\n_rs_fix._ResourceSharer._start = _rs_start_patched\\n@staticmethod\\ndef _rs_get_conn_patched(ident):\\n    import os; addr, key = ident\\n    _c = _mc_fix.Client(addr, authkey=_AUTHKEY_FIXED); _c.send((key, os.getpid())); return _c\\n_rs_fix._ResourceSharer.get_connection = _rs_get_conn_patched\\n'; (p.write_text(patch + s), print('Patched: resource_sharer fixed authkey')) if '_AUTHKEY_FIXED' not in s else print('Already patched')"
+# Fix: write a standalone patch module _sglang_rs_fix.py that overrides
+# _ResourceSharer._start (Listener) and get_connection (Client) to use a
+# fixed shared authkey b"sglang-verl-ipc-2026". Install via a .pth file in
+# site-packages so it runs at Python startup in ALL processes (FSDP Ray
+# workers AND sglang spawned processes) without from __future__ ordering issues.
+RUN printf 'import multiprocessing.resource_sharer as _rs_fix\nimport multiprocessing.connection as _mc_fix\n_AUTHKEY_FIXED = b"sglang-verl-ipc-2026"\ndef _rs_start_patched(self):\n    assert self._listener is None\n    self._listener = _mc_fix.Listener(authkey=_AUTHKEY_FIXED, backlog=128)\n    self._address = self._listener.address\n    import threading; _t = threading.Thread(target=self._serve); _t.daemon = True; _t.start(); self._thread = _t\n_rs_fix._ResourceSharer._start = _rs_start_patched\n@staticmethod\ndef _rs_get_conn_patched(ident):\n    import os; addr, key = ident\n    _c = _mc_fix.Client(addr, authkey=_AUTHKEY_FIXED); _c.send((key, os.getpid())); return _c\n_rs_fix._ResourceSharer.get_connection = _rs_get_conn_patched\n' > /usr/local/lib/python3.12/dist-packages/_sglang_rs_fix.py && printf 'import _sglang_rs_fix\n' > /usr/local/lib/python3.12/dist-packages/_sglang_rs_fix.pth && python3 -c "import _sglang_rs_fix; print('resource_sharer authkey fix loaded OK')"
 
 # ----- app layer (your repo + tau2; rebuilt on code changes) -----
 FROM base AS app
