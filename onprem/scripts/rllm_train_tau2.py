@@ -141,6 +141,30 @@ def _init_wandb(config: DictConfig) -> Optional[str]:
     return name
 
 
+def _patch_lora_dropout(lora_dir: str) -> None:
+    """Patch adapter_config.json to set lora_dropout=0.0 before verl loads it.
+
+    PEFT's ParamWrapper dispatch (selected for Qwen3-MoE expert linear layers
+    in newer PEFT versions) raises ValueError if lora_dropout != 0. Axolotl
+    SFT configs typically default to lora_dropout=0.05, which triggers this.
+    Zeroing it here is safe: dropout is irrelevant when loading a frozen
+    adapter as an RL starting point, and the trained SFT weights are unchanged.
+    """
+    cfg_path = Path(lora_dir) / "adapter_config.json"
+    if not cfg_path.exists():
+        return
+    cfg = json.loads(cfg_path.read_text())
+    dropout = cfg.get("lora_dropout", 0.0)
+    if dropout != 0.0:
+        logger.info(
+            "patching adapter_config.json: lora_dropout %.4f -> 0.0 "
+            "(PEFT ParamWrapper requirement for Qwen3-MoE expert layers)",
+            dropout,
+        )
+        cfg["lora_dropout"] = 0.0
+        cfg_path.write_text(json.dumps(cfg, indent=2))
+
+
 def _attach_lora(config: DictConfig, starting_lora: Optional[str]) -> None:
     """Wire the starting LoRA into the verl model config so verl loads it.
 
@@ -152,6 +176,7 @@ def _attach_lora(config: DictConfig, starting_lora: Optional[str]) -> None:
     if not starting_lora:
         return
 
+    _patch_lora_dropout(starting_lora)
     OmegaConf.update(
         config, "actor_rollout_ref.model.lora_adapter_path",
         starting_lora, force_add=True,
