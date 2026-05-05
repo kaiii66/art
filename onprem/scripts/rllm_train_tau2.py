@@ -138,6 +138,10 @@ def _init_wandb(config: DictConfig) -> Optional[str]:
         config=OmegaConf.to_container(config, resolve=True),
         job_type="rl-train",
     )
+    # Mirror resolved project back into Hydra config so the inner verl trainer
+    # (which reads config.trainer.project_name directly) uses the same W&B
+    # project instead of the hardcoded tau2_overrides.yaml default.
+    OmegaConf.update(config, "trainer.project_name", project, force_add=True)
     return name
 
 
