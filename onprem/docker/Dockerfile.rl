@@ -155,6 +155,28 @@ RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist
 # full_state captures correct weights before FSDP2 scattering.
 RUN python3 -c "import pathlib; p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/peft/tuners/lora/layer.py'); s = p.read_text(); old = '        device = self.get_param().device\n        meta = torch.device(\"meta\")\n        param = self.get_param()\n'; new = '        device = self.get_param().device\n        meta = torch.device(\"meta\")\n        param = self.get_param()\n        if device == meta:\n            return  # base on meta (FSDP2 deferred init on non-rank-0); keep LoRA on CPU\n'; (p.write_text(s.replace(old, new, 1)), print('peft lora meta-move patch applied')) if old in s else print('WARNING: peft lora layer anchor not found -- skipped')"
 
+# PEFT's set_peft_model_state_dict has two branches: low_cpu_mem_usage (uses assign=True)
+# and the default else branch (uses strict=False only, no assign). When LoRA params are
+# meta at load time — which happens on FSDP non-rank-0 workers even after the
+# _move_adapter_to_device_of_base_layer early-return fix above, for layers where the
+# base is also meta — load_state_dict copy_() is a no-op (meta→meta no-copy warning).
+# Fix: always use assign=True in the else branch so the checkpoint tensor replaces (not
+# copies into) the meta param, correctly materializing it for all 8 ranks.
+RUN python3 -c "
+import pathlib
+p = pathlib.Path('/usr/local/lib/python3.12/dist-packages/peft/utils/save_and_load.py')
+s = p.read_text()
+old = '        load_result = model.load_state_dict(peft_model_state_dict, strict=False)\n'
+new = '        load_result = model.load_state_dict(peft_model_state_dict, strict=False, assign=True)\n'
+if 'assign=True patch' in s:
+    print('peft set_peft_model_state_dict assign=True patch already applied')
+elif old in s:
+    p.write_text(s.replace(old, new, 1))
+    print('peft set_peft_model_state_dict assign=True patch applied')
+else:
+    print('WARNING: set_peft_model_state_dict else-branch anchor not found -- skipped')
+"
+
 # torch 2.9.1 serializes FSDP de-sharded CPU tensors via ForkingPickler's
 # FD-based shared memory (rebuild_storage_fd). The FD is passed through
 # multiprocessing.resource_sharer, which creates a connection.Listener with
