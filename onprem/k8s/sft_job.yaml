@@ -34,7 +34,7 @@ spec:
       containers:
         - name: trainer
           image: __IMAGE__
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           command: ["/workspace/scripts/run_axolotl_sft.sh"]
           resources:
             limits:

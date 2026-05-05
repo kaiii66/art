@@ -77,7 +77,7 @@ val_set_size: 0.05
 # blocks, im_start/im_end tokens) and was likely silently dropping the
 # longest successful trajectories. 24576 gives 1.6x headroom above the
 # observed max while staying well within Qwen3's native context.
-sequence_len: 24576
+sequence_len: 16384
 sample_packing: true
 pad_to_sequence_len: true
 

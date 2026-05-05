@@ -288,12 +288,9 @@ trainer:
   logger:
     - console
     - wandb
-    # rLLM UI: streams per-episode trajectories + metrics to ui.rllm-project.com.
-    # RLLM_API_KEY is already mounted into the pod via the rllmui K8s secret
-    # (rl_job.yaml line 49). Adding "ui" here is the only missing piece --
-    # UILogger registers only when present in this list. Without it the key is
-    # read but never connected to anything, which is why traces were absent.
-    - ui
+    # rLLM UI logger removed: the installed verl version does not support the
+    # "ui" backend (AssertionError: ui is not supported). Drop it so training
+    # proceeds with console + wandb only.
   n_gpus_per_node: 8
   nnodes: 1
   total_epochs: 1
