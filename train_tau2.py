@@ -86,19 +86,37 @@ def load_training_tasks_from_artifact(config, num_tasks=None):
 
 
 def load_validation_tasks(config):
-    """Load validation tasks from Weave or W&B artifact.
+    """Load mid-training validation tasks from Weave or W&B artifact.
 
-    Uses validation_weave_dataset if set, else validation_dataset_artifact.
+    Resolution order (highest precedence first):
+        1. dev_weave_dataset / dev_dataset_artifact (with dev_task_split,
+           defaults to "small"). This is the train/dev/test-clean path: SFT
+           and RL both validate on the dev split, leaving the test split
+           reserved for the leaderboard.
+        2. validation_weave_dataset / validation_dataset_artifact (with
+           validation_task_split, defaults to "test"). Legacy path kept for
+           back-compat with configs that pre-date the dev split.
+
     Returns empty list if neither is configured. Raises if a source is configured
     but download/load fails.
     """
-    weave_name = config.get("validation_weave_dataset")
-    artifact_name = config.get("validation_dataset_artifact")
+    weave_name = config.get("dev_weave_dataset") or config.get("validation_weave_dataset")
+    artifact_name = config.get("dev_dataset_artifact") or config.get("validation_dataset_artifact")
+    using_dev = bool(config.get("dev_weave_dataset") or config.get("dev_dataset_artifact"))
     if not weave_name and not artifact_name:
         return []
 
     domain = config.get("domain")
-    val_split = config.get("validation_task_split", "test")
+    if using_dev:
+        val_split = config.get("dev_task_split", "small")
+        expected_json = "dev_scenarios.json"
+        source_label = "dev"
+        config_key_hint = "dev_weave_dataset / dev_dataset_artifact"
+    else:
+        val_split = config.get("validation_task_split", "test")
+        expected_json = "validation_scenarios.json"
+        source_label = "validation"
+        config_key_hint = "validation_weave_dataset / validation_dataset_artifact"
 
     if weave_name:
         try:
@@ -107,8 +125,8 @@ def load_validation_tasks(config):
             rows = dataset.rows
         except Exception as e:
             raise RuntimeError(
-                f"Could not load validation Weave dataset {weave_name}: {e}. "
-                "Check validation_weave_dataset and run upload_dataset_to_wandb.py."
+                f"Could not load {source_label} Weave dataset {weave_name}: {e}. "
+                f"Check {config_key_hint} and run upload_dataset_to_wandb.py."
             ) from e
         if not rows:
             return []
@@ -116,7 +134,7 @@ def load_validation_tasks(config):
         if not domain:
             domain = rows[0].get("domain") if rows else None
         if not domain:
-            raise ValueError("config must set domain or validation rows must include domain")
+            raise ValueError(f"config must set domain or {source_label} rows must include domain")
         tasks = get_tasks(
             task_set_name=domain,
             task_split_name=val_split,
@@ -125,25 +143,24 @@ def load_validation_tasks(config):
         id_to_task = {t.id: t for t in tasks}
         return [id_to_task[tid] for tid in task_ids]
 
-    # validation_dataset_artifact
     run = wandb.run
     if run is None:
         raise RuntimeError(
-            "validation_dataset_artifact is set but wandb.run is None. "
+            f"{source_label}_dataset_artifact is set but wandb.run is None. "
             "Ensure wandb.init() is called before load_validation_tasks."
         )
     try:
         artifact = run.use_artifact(artifact_name)
         download_dir = artifact.download()
-        path = Path(download_dir) / "validation_scenarios.json"
+        path = Path(download_dir) / expected_json
         if not path.exists():
-            raise FileNotFoundError(f"Artifact dir missing validation_scenarios.json: {download_dir}")
+            raise FileNotFoundError(f"Artifact dir missing {expected_json}: {download_dir}")
         with open(path) as f:
             rows = json.load(f)
     except Exception as e:
         raise RuntimeError(
-            f"Could not load validation artifact {artifact_name}: {e}. "
-            "Check validation_dataset_artifact and run upload_dataset_to_wandb.py."
+            f"Could not load {source_label} artifact {artifact_name}: {e}. "
+            f"Check {config_key_hint} and run upload_dataset_to_wandb.py."
         ) from e
     if not rows:
         return []
@@ -151,7 +168,7 @@ def load_validation_tasks(config):
     if not domain:
         domain = rows[0].get("domain") if rows else None
     if not domain:
-        raise ValueError("config must set domain or artifact rows must include domain")
+        raise ValueError(f"config must set domain or artifact rows must include domain")
     tasks = get_tasks(
         task_set_name=domain,
         task_split_name=val_split,
@@ -359,6 +376,7 @@ async def run_training(model, backend, training_tasks, config, validation_tasks=
     # policy being trained. Only `agent_llm_args` (temperature, max_tokens) is
     # plumbed through so the inference call has sane decoding settings.
     agent_llm_args = config.get("agent_llm_args", {"temperature": 1.0, "max_tokens": 16384})
+    val_agent_llm_args = config.get("val_agent_llm_args", agent_llm_args)
     max_steps = config.get("max_orchestrator_steps", 30)
     groups_per_step = config["groups_per_step"]
     rollouts_per_group = config["rollouts_per_group"]
@@ -480,6 +498,8 @@ async def run_training(model, backend, training_tasks, config, validation_tasks=
                         model,
                         finished_groups,
                         learning_rate=learning_rate,
+                        ppo=True,
+                        epsilon=0.2,
                     )
                     await model.log(
                         finished_groups,
@@ -517,7 +537,7 @@ async def run_training(model, backend, training_tasks, config, validation_tasks=
                             scenario,
                             user_llm=user_llm,
                             user_llm_args=user_llm_args,
-                            agent_llm_args=agent_llm_args,
+                            agent_llm_args=val_agent_llm_args,
                             max_steps=max_steps,
                         )
                     ])
@@ -637,30 +657,33 @@ async def main(args):
     random.seed(config.get("random_seed", 42))
 
     # ── Names (W&B run + ART model) ──
-    # The W&B run name is always uniquely timestamped so each training run is
-    # distinct in the W&B UI. The ART model.name (= W&B artifact collection)
+    # The W&B run name encodes the iteration suffix (same as the snapshot dir
+    # and group) plus the GRPO knobs, so cross-iteration comparison reduces to
+    # a regex on the run list. The ART model.name (= W&B artifact collection)
     # is either:
     #   - `continue_from_model`, when set, so GRPO continues that collection's
     #     checkpoint history (e.g. RL on top of an SFT collection's step 6 →
     #     produces step 7, 8, … in the same collection, all servable).
-    #   - `<model_name>-<timestamp>`, otherwise, for a fresh LoRA in a new
-    #     auto-named collection.
+    #   - `<model_name>-<suffix>`, otherwise, for a fresh LoRA in a new
+    #     auto-named collection that's still tied back to the iteration.
     lr_str = f"{config['learning_rate']:.0e}".replace("-0", "-")
     now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+    group = config.get("group") or "manual"
+    suffix = group.removeprefix("pipeline-") if group.startswith("pipeline-") else group
     run_name = (
-        f"train-{config['domain']}-g{config['groups_per_step']}"
+        f"rl-{suffix}-g{config['groups_per_step']}"
         f"-r{config['rollouts_per_group']}-lr{lr_str}"
-        f"-{now_pt.strftime('%Y%m%d-%H%M')}"
     )
     continue_from = config.get("continue_from_model")
     if continue_from:
         model_name = continue_from
     else:
-        model_name = f"{config['model_name']}-{now_pt.strftime('%Y%m%d-%H%M')}"
+        model_name = f"{config['model_name']}-{suffix}"
 
     # ── W&B (main training run) ──
     wandb.init(
         project=config["project"],
+        group=group,
         name=run_name,
         config=config,
         job_type=config.get("wandb_job_type", "train"),
@@ -688,6 +711,33 @@ async def main(args):
                 "the base LoRA. Verify the source collection actually has the "
                 "expected SFT checkpoint registered with the ART backend."
             )
+        # Diagnostic: the SFT distill stage trims the collection so :latest
+        # equals the best-validating chunk, and writes that step to
+        # `.best_sft_step`. If the two disagree, the trim silently no-oped
+        # (e.g. private ART API removed), which means RL is starting from
+        # the wrong checkpoint and the leaderboard's sft row will not match
+        # what RL actually trained from.
+        best_sft_step_file = config_path.resolve().parent / ".best_sft_step"
+        if best_sft_step_file.exists():
+            try:
+                expected_best = int(best_sft_step_file.read_text().strip())
+            except (ValueError, OSError) as e:
+                print(f"  [best-chunk] could not read .best_sft_step: {e}")
+            else:
+                if expected_best != starting_step:
+                    print(
+                        f"WARNING: .best_sft_step={expected_best} but the SFT "
+                        f"collection's latest is step {starting_step}. The SFT "
+                        f"trim apparently no-oped, so RL is starting from the "
+                        f"WRONG checkpoint (the last chunk, not the best). The "
+                        f"leaderboard sft row will pin to step {starting_step} "
+                        f"to stay consistent with what RL actually used."
+                    )
+                else:
+                    print(
+                        f"  [best-chunk] verified: starting_step matches "
+                        f".best_sft_step={expected_best}"
+                    )
         # The serverless ART backend's train() does not accept `beta`/
         # `kl_penalty_coef`, so config['kl_beta'] is silently ignored. Surface
         # a one-time warning when continuing from SFT, since the missing KL
@@ -734,6 +784,9 @@ async def main(args):
     else:
         print(f"Loaded {len(training_tasks)} training tasks from W&B artifact ({config['training_dataset_artifact']})")
     validation_tasks = load_validation_tasks(config)
+    num_validation = config.get("num_validation_tasks")
+    if num_validation is not None:
+        validation_tasks = validation_tasks[:num_validation]
     if validation_tasks:
         print(f"Loaded {len(validation_tasks)} validation tasks")
 

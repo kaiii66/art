@@ -173,12 +173,22 @@ async def generate_teacher_trajectories(training_tasks, config):
 # ─────────────────────────────────────────────────────────────────────
 
 async def run_student_validation(model, validation_tasks, config, step):
-    """Run the student (ART model) on validation tasks; log to W&B."""
+    """Run the student (ART model) on validation tasks; log to W&B.
+
+    Returns the mean val/success across the validation tasks (or None when
+    validation could not run / produced no trajectories). The caller in
+    `run_distillation_sft` uses this to track the best chunk (recorded as
+    .best_sft_step for the leaderboard pin) and to drive early-stop.
+    """
     if not validation_tasks:
-        return
+        return None
     domain = config["domain"]
     user_llm = config["user_llm"]
     user_llm_args = config.get("user_llm_args", {"temperature": 1.0})
+    val_agent_llm_args = config.get(
+        "val_agent_llm_args",
+        config.get("agent_llm_args", {"temperature": 0.0, "max_tokens": 16384}),
+    )
     max_steps = config.get("max_orchestrator_steps", 30)
 
     print(f"\n  [validation] running student on {len(validation_tasks)} tasks...")
@@ -192,6 +202,7 @@ async def run_student_validation(model, validation_tasks, config, step):
                     scenario,
                     user_llm=user_llm,
                     user_llm_args=user_llm_args,
+                    agent_llm_args=val_agent_llm_args,
                     max_steps=max_steps,
                 )
             ])
@@ -203,18 +214,20 @@ async def run_student_validation(model, validation_tasks, config, step):
     )
     await model.log(finished_val_groups, split="val")
     val_trajs = [t for g in finished_val_groups for t in g.trajectories]
-    if val_trajs:
-        val_reward = sum(t.reward for t in val_trajs) / len(val_trajs)
-        val_success = sum(t.metrics.get("success", 0.0) for t in val_trajs) / len(val_trajs)
-        val_tokens = sum(t.metadata.get("completion_tokens", 0) for t in val_trajs)
-        wandb.log({
-            "val/reward": val_reward,
-            "val/success": val_success,
-            "val/completion_tokens": val_tokens,
-            "val/num_tasks": len(val_trajs),
-            "val/sft_step": step,
-        })
-        print(f"  [validation] reward={val_reward:.3f}  success={val_success:.1%}")
+    if not val_trajs:
+        return None
+    val_reward = sum(t.reward for t in val_trajs) / len(val_trajs)
+    val_success = sum(t.metrics.get("success", 0.0) for t in val_trajs) / len(val_trajs)
+    val_tokens = sum(t.metadata.get("completion_tokens", 0) for t in val_trajs)
+    wandb.log({
+        "val/reward": val_reward,
+        "val/success": val_success,
+        "val/completion_tokens": val_tokens,
+        "val/num_tasks": len(val_trajs),
+        "val/sft_step": step,
+    })
+    print(f"  [validation] reward={val_reward:.3f}  success={val_success:.1%}")
+    return val_success
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -222,6 +235,25 @@ async def run_student_validation(model, validation_tasks, config, step):
 # ─────────────────────────────────────────────────────────────────────
 
 async def run_distillation_sft(model, trajectories, validation_tasks, config):
+    """Run chunked SFT distillation with dev-validation early-stop.
+
+    Returns the ART step number (in the model's W&B collection) of the best
+    chunk by val/success on dev, or None if no validation produced a usable
+    signal. Caller (`main`) records this to `.best_sft_step`, which the
+    leaderboard prefers over `.sft_endpoint_step` when pinning the "sft" row.
+
+    Non-destructive: the collection is NOT trimmed. Every SFT chunk's
+    checkpoint stays available in W&B for inspection / ad-hoc re-evaluation.
+    Instead, `sft_early_stop_patience` (config) bounds how far past the best
+    dev step we keep training, so the collection's `:latest` -- which is
+    what RL continues from -- is at most `patience` chunks past `best_step`.
+
+    Hand-off summary (after this returns, in main):
+        .best_sft_step      = best_step                   (leaderboard pin)
+        .sft_endpoint_step  = collection :latest at RL start
+                            = best_step + slack, slack <= patience
+                            (written by train_tau2.py; leaderboard fallback)
+    """
     epochs = config.get("sft_epochs", 2)
     batch_size = config.get("sft_batch_size", 2)
     peak_lr = float(config.get("sft_peak_lr", 2e-4))
@@ -229,6 +261,7 @@ async def run_distillation_sft(model, trajectories, validation_tasks, config):
     schedule_type = config.get("sft_schedule_type", "cosine")
     chunk_size = config.get("sft_chunk_size", 2)
     val_every = config.get("validation_every_n_chunks", 1)
+    sft_early_stop_patience = int(config.get("sft_early_stop_patience") or 0)
 
     print(f"\n{'='*60}")
     print(f"Phase B: SFT distillation")
@@ -239,6 +272,8 @@ async def run_distillation_sft(model, trajectories, validation_tasks, config):
     print(f"Schedule         : {schedule_type} (warmup_ratio={warmup_ratio})")
     print(f"Chunk size       : {chunk_size} batches per train_sft call")
     print(f"Validation cadence: every {val_every} chunk(s)")
+    if sft_early_stop_patience > 0:
+        print(f"Early-stop patience: {sft_early_stop_patience} validations without val/success improvement")
     print(f"{'='*60}")
 
     # Run baseline validation BEFORE any SFT so we can see baseline-vs-trained
@@ -262,6 +297,15 @@ async def run_distillation_sft(model, trajectories, validation_tasks, config):
     ))
     total_chunks = len(all_chunks)
     print(f"Total chunks     : {total_chunks}")
+
+    # Best-chunk tracking. Strict `>` matches train_tau2.py's .best_rl_step
+    # convention: when multiple chunks tie on val/success, the EARLIEST
+    # winning chunk is preferred (less training -> less overfitting risk
+    # and a smaller divergence from the SFT seed for downstream RL).
+    best_val_success = float("-inf")
+    best_step: int | None = None
+    evals_without_improvement = 0
+    early_stopped = False
 
     chunks_done = 0
     last_validated_step = None
@@ -290,12 +334,68 @@ async def run_distillation_sft(model, trajectories, validation_tasks, config):
         # so we never miss the most important data point: the final model.
         should_validate = (chunks_done % val_every == 0) or is_last_chunk
         if should_validate and chunk.step != last_validated_step:
-            await run_student_validation(
+            val_success = await run_student_validation(
                 model, validation_tasks, config, step=chunk.step,
             )
             last_validated_step = chunk.step
+            if val_success is not None:
+                if val_success > best_val_success:
+                    # Use ART's own step counter (not chunk.step, which is the
+                    # internal sft batch counter) since the leaderboard pin and
+                    # train_tau2.py's continue-from logic both key off
+                    # model.get_step().
+                    try:
+                        candidate_step = await model.get_step()
+                    except Exception as e:
+                        print(f"  [best-chunk] could not read model.get_step(): {e}")
+                        continue
+                    best_val_success = val_success
+                    best_step = candidate_step
+                    evals_without_improvement = 0
+                    print(
+                        f"  [best-chunk] new best val/success={best_val_success:.3f} "
+                        f"@ ART step {best_step}"
+                    )
+                    if wandb.run is not None:
+                        wandb.run.summary["sft/best_step"] = best_step
+                        wandb.run.summary["sft/best_val_success"] = best_val_success
+                    wandb.log({
+                        "sft/best_step": best_step,
+                        "sft/best_val_success": best_val_success,
+                    })
+                else:
+                    evals_without_improvement += 1
+                    if sft_early_stop_patience > 0:
+                        print(
+                            f"  [early-stop] {evals_without_improvement}/{sft_early_stop_patience} "
+                            f"validations without val/success improvement "
+                            f"(best={best_val_success:.3f} @ step {best_step})"
+                        )
+                        if evals_without_improvement >= sft_early_stop_patience:
+                            print(
+                                f"\n[early-stop] no improvement for "
+                                f"{sft_early_stop_patience} consecutive validations; "
+                                f"stopping SFT after chunk {i+1}/{total_chunks}."
+                            )
+                            early_stopped = True
+                            break
 
-    print(f"\nSFT distillation complete. {chunks_done}/{total_chunks} chunks finished.")
+    completion_label = "early-stopped" if early_stopped else "complete"
+    print(f"\nSFT distillation {completion_label}. {chunks_done}/{total_chunks} chunks finished.")
+    if best_step is None:
+        print(
+            "  [best-chunk] no validation produced a usable val/success; "
+            "downstream RL will start from the final SFT chunk and the "
+            "leaderboard sft row will pin to .sft_endpoint_step (legacy fallback)."
+        )
+    else:
+        print(
+            f"  [best-chunk] best dev val/success={best_val_success:.3f} @ "
+            f"ART step {best_step}; main() will write this to .best_sft_step "
+            f"as the leaderboard sft pin. Collection :latest is preserved as-is "
+            f"(no trim) so RL can continue from it."
+        )
+    return best_step
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -324,21 +424,30 @@ async def main(args):
     random.seed(config.get("random_seed", 42))
 
     # ── W&B ──
+    # The pipeline writes `group: pipeline-<MMDDHHMM>` into the snapshot
+    # config so every wandb.run from this iteration (upload, sft, rl,
+    # leaderboard) collapses under one expandable group in the W&B UI.
+    # Ad-hoc invocations without the pipeline default to "manual".
     now_pt = datetime.now(ZoneInfo("America/Los_Angeles"))
+    group = config.get("group") or "manual"
+    suffix = group.removeprefix("pipeline-") if group.startswith("pipeline-") else group
     run_name = (
-        f"distill-{config['domain']}-r{config.get('teacher_rollouts_per_task', 1)}"
+        f"sft-{suffix}-r{config.get('teacher_rollouts_per_task', 1)}"
         f"-ep{config.get('sft_epochs', 2)}"
-        f"-{now_pt.strftime('%Y%m%d-%H%M')}"
     )
     wandb.init(
         project=config["project"],
+        group=group,
         name=run_name,
         config=config,
         job_type=config.get("wandb_job_type", "distill"),
     )
 
     # ── ART model ──
-    model_name = f"{config['model_name']}-{now_pt.strftime('%Y%m%d-%H%M')}"
+    # Tie the SFT collection name to the iteration suffix (same string used in
+    # the snapshot dir name, W&B group, and leaderboard row labels) so it's
+    # trivially greppable across all four surfaces.
+    model_name = f"{config['model_name']}-{suffix}"
     model = art.TrainableModel(
         name=model_name,
         project=config["project"],
@@ -399,7 +508,21 @@ async def main(args):
         teacher_trajectories = kept
 
     # ── Phase B: SFT ──
-    await run_distillation_sft(model, teacher_trajectories, validation_tasks, config)
+    best_step = await run_distillation_sft(
+        model, teacher_trajectories, validation_tasks, config
+    )
+
+    # Authoritative leaderboard pin for the "sft" row. The collection is NOT
+    # trimmed (no _delete_checkpoint_files), so :latest at RL start may sit
+    # `sft_early_stop_patience` chunks past best_step. The leaderboard prefers
+    # this file over `.sft_endpoint_step` so the sft row evaluates the true
+    # best-on-dev checkpoint regardless of where SFT actually stopped.
+    if best_step is not None:
+        try:
+            (config_path.resolve().parent / ".best_sft_step").write_text(str(best_step))
+            print(f"  [best-chunk] wrote .best_sft_step = {best_step}")
+        except Exception as e:
+            print(f"  [best-chunk] failed to write .best_sft_step: {e}")
 
     wandb.finish()
 

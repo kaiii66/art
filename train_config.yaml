@@ -2,9 +2,13 @@
 # Override any value via CLI args (e.g. --num-tasks 5)
 
 # ── Model ────────────────────────────────────────────────────────────
-# project: "tau2-ART-proj-0419"
-# project: "tau2-ART-distill-0419"
-project: "tau2-ART-distill-04211613"
+# Stable W&B project shared by every autoresearch iteration. Per-iteration
+# isolation is achieved via `group: pipeline-<MMDDHHMM>` (written by
+# run_pipeline.py into the snapshot config), NOT via project name. This keeps
+# all autoresearch runs collapsible under one project page and lets the Weave
+# leaderboard grow with one row per (sft|rl) checkpoint per iteration.
+project: "tau2-ART-autoresearch-telecom-0428"
+# group: written by run_pipeline.py make_snapshot at runtime (e.g. pipeline-04241730)
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 model_name: "tau2-ART-telecom-Qwen3-30B-A3B-Instruct-2507"
 
@@ -51,6 +55,9 @@ user_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
 user_llm_args:
   temperature: 1.0
   max_tokens: 16384
+val_agent_llm_args:
+  temperature: 0.0
+  max_tokens: 16384
 
 # ── Training hyperparameters ────────────────────────────────────────
 #current setup will take around 1 hour 20 minutes to train
@@ -61,7 +68,8 @@ user_llm_args:
 groups_per_step: 4
 # Bumped 1 -> 3: re-use the small set of trainable groups (post-prefilter)
 # multiple times so GRPO sees more update steps from the same data.
-num_epochs: 3
+# Reduced 3 -> 1 (iter3): epoch-0 peaked at step 41 then overfitted; lock in gains.
+num_epochs: 1
 # Bumped 8 -> 16 after kwt/tau2-ART-distill-04221704 showed train/success=0
 # over 720 trajectories. More rollouts per group raises the chance that at
 # least one rollout actually solves the task, giving GRPO a positive
@@ -119,6 +127,14 @@ verify_checkpoint_digest_before_train: true
 # leaderboard_trained_model_name: "tau2-telecom-Qwen3-30B-A3B-Instruct-2507-0313-20260312-1009"
 training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
 training_weave_dataset: "tau2-ART-telecom-training-scenarios"
+# Dev = mid-training validation set (tau2 `small` split, 20 tasks, disjoint
+# from train and test). Used by SFT chunk selection and RL early-stopping so
+# the test split below stays untouched until create_leaderboard*.py runs.
+dev_dataset_artifact: "tau2-ART-telecom-dev-scenarios:latest"
+dev_weave_dataset: "tau2-ART-telecom-dev-scenarios"
+dev_task_split: "small"
+# Validation = held-out test split (40 tasks). Reserved EXCLUSIVELY for the
+# leaderboard scripts to keep the published number a clean held-out estimate.
 validation_dataset_artifact: "tau2-ART-telecom-validation-scenarios:latest"
 validation_weave_dataset: "tau2-ART-telecom-validation-scenarios"
 base_weave_dataset: "tau2-ART-telecom-base-scenarios"
