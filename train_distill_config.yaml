@@ -28,21 +28,21 @@ user_llm_args:
 # Always uses the full train split from the loaded artifact (74 telecom tasks
 # at the time of writing). To bound size for a smoke test, pass
 # `--num-tasks N` on the train_tau2_distill.py CLI (kept for ad-hoc use).
-teacher_rollouts_per_task: 3
+teacher_rollouts_per_task: 5
 num_validation_tasks: 4
 # Bumped 30 -> 100 to match leaderboard.max_steps in train_config.yaml and
 # tau2's own default. Avoids train/eval mismatch where tasks needing 31-100
 # turns to succeed were silently dropped from the SFT training set.
 max_orchestrator_steps: 100
 filter_successful_only: true
-teacher_concurrency: 8
+teacher_concurrency: 10
 # When true, first run 1 probe rollout per task to find solvable tasks, then
 # concentrate the remaining (teacher_rollouts_per_task - 1) rollouts on those
 # solvable tasks only. Avoids wasting compute on tasks the teacher can't solve.
 prefilter_tasks: true
 
 # ── SFT hyperparameters ────────────────────────────────────────────
-sft_epochs: 2
+sft_epochs: 3
 sft_batch_size: 2
 # 1e-4 is conservative; 2e-4 was overfitting on small (~13 traj) datasets.
 sft_peak_lr: 1.0e-4

@@ -401,6 +401,17 @@ async def main(args):
     # ── Phase B: SFT ──
     await run_distillation_sft(model, teacher_trajectories, validation_tasks, config)
 
+    # Write .sft_endpoint_step so create_leaderboard_shaped_reward.py can evaluate
+    # the SFT row even when RL is skipped (train_tau2.py normally writes this file
+    # right before RL begins; we write it here so --skip rl pipelines still work).
+    try:
+        final_step = await model.get_step()
+        sft_step_path = config_path.resolve().parent / ".sft_endpoint_step"
+        sft_step_path.write_text(str(final_step))
+        print(f"[distill] wrote .sft_endpoint_step = {final_step} → {sft_step_path}")
+    except Exception as e:
+        print(f"[distill] WARNING: could not write .sft_endpoint_step: {e}")
+
     wandb.finish()
 
 

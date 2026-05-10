@@ -242,10 +242,19 @@ def main() -> int:
     print(f"    stages skipped   : {sorted(skip)}")
     print(f"    publish_lb (leaderboard): {not args.no_publish_leaderboard}")
 
+    # When RL is skipped there is no RL checkpoint, so limit leaderboard to the
+    # rows that were actually trained. --models all with no RL falls back to
+    # :latest (= the SFT checkpoint) for the RL row — redundant and confusing.
+    if "rl" in skip and "sft" in skip:
+        lb_models = ["base"]
+    elif "rl" in skip:
+        lb_models = ["base", "sft"]
+    else:
+        lb_models = ["all"]
     leaderboard_cmd = [
         "uv", "run", "python", "create_leaderboard_shaped_reward.py",
         "--config", str(train_cfg),
-        "--models", "all",
+        "--models", *lb_models,
     ]
     if not args.no_publish_leaderboard:
         leaderboard_cmd.append("--publish-leaderboard")
