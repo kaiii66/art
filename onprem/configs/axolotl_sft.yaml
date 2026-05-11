@@ -82,13 +82,16 @@ sample_packing: true
 pad_to_sequence_len: true
 
 # ----- training schedule (mirrors train_distill_config.yaml) -----
-# Doubling sequence_len doubles activation memory, so halve micro_batch_size
-# (2 -> 1) and double gradient_accumulation_steps (4 -> 8) to keep the
-# effective per-step batch at micro * grad_accum * world_size = 1*8*8 = 64,
-# matching the previous 2*4*8 = 64.
-num_epochs: 2
+# micro_batch_size=1 is required at sequence_len=24576 to avoid OOM.
+# gradient_accumulation_steps=4 → effective_batch = 1*4*8 = 32 sequences/update.
+# With ~93-138 packed sequences at this seq_len, that gives ~3-4 optimizer
+# updates per epoch × 4 epochs = ~12-16 total updates. Previous setting of
+# grad_accum=8 → effective_batch=64 → only ~1.5 updates/epoch ≈ 3 total,
+# which was too few for the model to learn the task (SFT scored 9.2% ≈ base).
+# Reducing grad_accum from 8→4 doubles optimizer steps without touching memory.
+num_epochs: 4
 micro_batch_size: 1
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 4
 learning_rate: 1.0e-4
 warmup_ratio: 0.1
 lr_scheduler: cosine
