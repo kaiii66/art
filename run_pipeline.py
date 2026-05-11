@@ -320,16 +320,28 @@ def _build_leaderboard_cmd(
     discoverable (they don't carry :step{N} aliases the serverless path
     expects -- only :v0/:v1 W&B version aliases).
     """
-    cmd = [
-        "uv", "run", "python", "create_leaderboard_shaped_reward.py",
-        "--config", str(train_cfg),
-        "--models", "all",
-    ]
     if backend != "onprem":
-        return cmd
+        return [
+            "uv", "run", "python", "create_leaderboard_shaped_reward.py",
+            "--config", str(train_cfg),
+            "--models", "all",
+        ]
 
     sft_uri_file = snapshot / ".sft_lora_artifact_uri"
     rl_uri_file = snapshot / ".rl_lora_artifact_uri"
+
+    # Only evaluate rows that were actually trained this run.
+    models = ["base"]
+    if sft_uri_file.exists():
+        models.append("sft")
+    if rl_uri_file.exists():
+        models.append("rl")
+
+    cmd = [
+        "uv", "run", "python", "create_leaderboard_shaped_reward.py",
+        "--config", str(train_cfg),
+        "--models", *models,
+    ]
 
     if sft_uri_file.exists():
         try:
