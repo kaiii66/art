@@ -55,11 +55,11 @@ user_llm_args:
 
 # ── Training hyperparameters ────────────────────────────────────────
 #current setup will take around 1 hour 20 minutes to train
-# Bumped rollouts_per_group 4 -> 8 and dropped groups_per_step 8 -> 4 to
-# raise within-group statistical power without changing total rollouts/step.
-# This is the cheapest fix for the "~99% of GRPO groups had zero variance"
-# pathology observed in run kwt/tau2-ART-distill-04211613/3kxgwhmp.
-groups_per_step: 4
+# Dropped 4 -> 1: 05110038 confirmed num_epochs=1 still produced 32 gradient
+# steps per GRPO update (4 groups × 16 rollouts ÷ batch=2) — too many with no
+# KL anchor. At groups_per_step=1: only 8 grad steps per update (16 rollouts
+# ÷ 2 per batch). Still samples 16 rollouts for advantage variance estimation.
+groups_per_step: 1
 # Dropped 3 -> 1: 05101907 showed num_epochs=3 caused 19 grad steps per GRPO
 # update with no KL anchor, driving grad_norm=4.46 and policy collapse at step 0.
 # With 1 epoch we get ~6 grad steps per update — conservative without losing signal.
