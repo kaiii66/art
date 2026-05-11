@@ -26,7 +26,8 @@ model_name: "tau2-ART-telecom-Qwen3-30B-A3B-Instruct-2507"
 #
 # Comment out to train from `base_model` with a fresh LoRA in a new,
 # auto-named collection.
-continue_from_model: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260419-1420"
+# continue_from_model: set automatically by pipeline patch stage from .last_trained_model
+# continue_from_model: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260419-1420"
 
 # ── Domain / tasks ──────────────────────────────────────────────────
 domain: "telecom"
@@ -59,20 +60,19 @@ user_llm_args:
 # This is the cheapest fix for the "~99% of GRPO groups had zero variance"
 # pathology observed in run kwt/tau2-ART-distill-04211613/3kxgwhmp.
 groups_per_step: 4
-# Bumped 1 -> 3: re-use the small set of trainable groups (post-prefilter)
-# multiple times so GRPO sees more update steps from the same data.
-num_epochs: 3
+# Dropped 3 -> 1: 05101907 showed num_epochs=3 caused 19 grad steps per GRPO
+# update with no KL anchor, driving grad_norm=4.46 and policy collapse at step 0.
+# With 1 epoch we get ~6 grad steps per update — conservative without losing signal.
+num_epochs: 1
 # Bumped 8 -> 16 after kwt/tau2-ART-distill-04221704 showed train/success=0
 # over 720 trajectories. More rollouts per group raises the chance that at
 # least one rollout actually solves the task, giving GRPO a positive
 # example to climb toward instead of optimizing partial credit only.
 rollouts_per_group: 16
-# Lowered 5e-6 -> 1e-6 -> 5e-7: with no SFT KL anchor available in
-# ServerlessBackend.train(), LR is the only knob to limit drift from the
-# post-SFT policy. With zero successful training rollouts in 04221704 we
-# halve LR again so RL stays even closer to SFT until positive examples
-# appear (either organically or via larger rollouts_per_group).
-learning_rate: 5.0e-7
+# Lowered 5e-6 -> 1e-6 -> 5e-7 -> 1e-7: 05101907 confirmed LR=5e-7 with 19
+# grad steps/update (num_epochs=3) destroyed policy in 1 GRPO update. Now
+# num_epochs=1 cuts steps to ~6, and LR=1e-7 further tightens the leash.
+learning_rate: 1.0e-7
 max_orchestrator_steps: 100
 # NOTE: kl_beta is currently NOT honored. The serverless ART backend's
 # train() API does not expose `beta`/`kl_penalty_coef`, so this value is
@@ -150,8 +150,6 @@ leaderboard:
   agent_llm_args:
     temperature: 0.0
     max_tokens: 16384
-    extra_body:
-      enable_thinking: true
   user_llm_args:
     temperature: 0.0
     max_tokens: 16384
