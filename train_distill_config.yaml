@@ -42,7 +42,7 @@ teacher_concurrency: 10
 prefilter_tasks: true
 
 # ── SFT hyperparameters ────────────────────────────────────────────
-sft_epochs: 3
+sft_epochs: 1
 sft_batch_size: 2
 # 1e-4 is conservative; 2e-4 was overfitting on small (~13 traj) datasets.
 sft_peak_lr: 1.0e-4
