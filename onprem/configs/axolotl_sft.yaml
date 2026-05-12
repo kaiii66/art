@@ -77,18 +77,19 @@ val_set_size: 0.05
 # blocks, im_start/im_end tokens) and was likely silently dropping the
 # longest successful trajectories. 24576 gives 1.6x headroom above the
 # observed max while staying well within Qwen3's native context.
-sequence_len: 24576
+sequence_len: 16384
 sample_packing: true
 pad_to_sequence_len: true
 
 # ----- training schedule (mirrors train_distill_config.yaml) -----
-# micro_batch_size=1 is required at sequence_len=24576 to avoid OOM.
+# micro_batch_size=1 is required to avoid OOM on 8×H100 80GB.
 # gradient_accumulation_steps=4 → effective_batch = 1*4*8 = 32 sequences/update.
-# With ~93-138 packed sequences at this seq_len, that gives ~3-4 optimizer
-# updates per epoch × 4 epochs = ~12-16 total updates. Previous setting of
-# grad_accum=8 → effective_batch=64 → only ~1.5 updates/epoch ≈ 3 total,
-# which was too few for the model to learn the task (SFT scored 9.2% ≈ base).
-# Reducing grad_accum from 8→4 doubles optimizer steps without touching memory.
+# At sequence_len=16384: ~138 packed sequences → ~4-5 optimizer updates/epoch
+# × 4 epochs = ~16-20 total updates. This is ~5× more than the original
+# grad_accum=8/epochs=2 config (≈3 total) that produced SFT=9.2% ≈ base.
+# NOTE: sequence_len=24576 caused OOM during backward with grad_accum=4 due
+# to FSDP gradient buffer sizing (grad_accum=8 was memory-safe at 24576 but
+# gave too few gradient updates). 16384 is confirmed memory-safe.
 num_epochs: 4
 micro_batch_size: 1
 gradient_accumulation_steps: 4
