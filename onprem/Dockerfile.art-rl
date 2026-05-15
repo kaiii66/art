@@ -1,0 +1,73 @@
+# tau2-art image — openpipe-art LocalBackend (GRPO + KL anchor)
+#
+# Build (from the art/ directory as the Docker context):
+#   docker build -f onprem/Dockerfile.art-rl \
+#                -t ghcr.io/kaiii66/tau2-art:$(git rev-parse --short HEAD) \
+#                .
+#
+# Key package pins (from openpipe-art 0.5.17 [backend] extra):
+#   vllm==0.17.0, unsloth==2026.3.3, torch>=2.8.0, trl==0.20.0
+#   accelerate==1.7.0, peft>=0.14.0, transformers>=4.55.2,<=4.57.3
+
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+# Activate the project venv on every shell invocation
+ENV PATH="/root/.local/bin:/workspace/.venv/bin:$PATH"
+
+# ── System packages ──────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 python3.12-dev python3.12-venv python3-pip \
+        git curl ca-certificates build-essential \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+# ── uv (fast Python package manager, used at runtime by run_art_rl.sh) ──────
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+WORKDIR /workspace
+
+# ── Layer: dependency manifests only (cache busts only on lock changes) ──────
+COPY pyproject.toml uv.lock pdm.lock ./
+
+# ── Layer: install tau2's pinned deps from the lock file ─────────────────────
+# Creates /workspace/.venv and installs all packages listed in uv.lock.
+# --no-dev skips developer tooling that is irrelevant inside the image.
+# --no-install-project skips building the local tau2 package here (README.md
+# and src/ aren't in this layer yet — they arrive in the later `COPY . .`).
+RUN uv sync --frozen --no-dev --no-install-project --python python3.12
+
+# ── Layer: add openpipe-art backend extras to the same venv ──────────────────
+# These are heavy GPU packages (vllm, unsloth, torch, trl…) NOT included in
+# tau2's regular deps.  Pinned to the exact version already used in this
+# project's .cache to guarantee a bit-for-bit match with local experiments.
+#
+# Pin huggingface-hub<1.0 in the same step: transformers (a transitive dep)
+# enforces `huggingface-hub>=0.34.0,<1.0` at import time, but openpipe-art's
+# resolver otherwise pulls hf-hub 1.x, which fails at first `from transformers`.
+RUN uv pip install \
+        "openpipe-art[backend]==0.5.17" \
+        "huggingface-hub>=0.34.0,<1.0"
+
+# Force-upgrade gql to 4.0 (weave imports `TransportConnectionFailed` from
+# gql.transport.exceptions, which first ships in gql 4.0).  openpipe-art[backend]
+# hard-constrains gql<4, so we install it first and then override gql in a
+# second step with --no-deps to bypass the resolver constraint.
+RUN uv pip install --no-deps --upgrade "gql>=4.0.0"
+
+# ── Layer: copy source (invalidates on any code change; comes last) ───────────
+COPY . .
+
+# ── Layer: install the local tau2 package itself (README.md + src/ now present)
+# Use `uv pip install --no-deps` rather than `uv sync` — the latter prunes
+# packages not in uv.lock (including openpipe-art[backend] which we installed
+# explicitly in the previous layer).  --no-deps is safe because tau2's runtime
+# deps are already satisfied by the earlier `uv sync --no-install-project`.
+RUN uv pip install --no-deps .
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+RUN chmod +x /workspace/onprem/scripts/run_art_rl.sh
+
+CMD ["/workspace/onprem/scripts/run_art_rl.sh"]

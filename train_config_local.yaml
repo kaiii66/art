@@ -1,0 +1,114 @@
+# LocalBackend RL configuration — mirrors train_config.yaml but wired for
+# on-prem 8×H100 training with KL anchor against the SFT checkpoint.
+#
+# Run via:
+#   uv run python local/run_pipeline_local.py
+# or standalone:
+#   uv run python local/pull_sft_lora.py  --config train_config_local.yaml
+#   uv run python local/train_tau2_local.py --config train_config_local.yaml
+#   uv run python local/upload_rl_lora.py  --config train_config_local.yaml
+
+# ── Model ─────────────────────────────────────────────────────────────
+project: "tau2-ART-distill-05111101"
+base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+# model_name is a BASE template. run_pipeline_local.py appends the run
+# suffix (MMDDHHMM) automatically, producing an isolated name like
+#   tau2-distill-...-20260511-1101-rl-05121452
+# This gives each run its own .art/ checkpoint dir and its own W&B RL
+# artifact collection, so every run always starts fresh from the SFT LoRA.
+# sft_source.name (below) always points back to the original SFT baseline.
+model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260511-1101"
+
+# ── SFT source (pull_sft_lora.py) ─────────────────────────────────────
+# Identifies which W&B artifact to seed the local .art/ checkpoint dir from.
+# "step: latest" resolves to the highest registered step in the collection.
+sft_source:
+  entity: "kwt"
+  project: "tau2-ART-distill-05111101"
+  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260511-1101"
+  step: "latest"
+
+# ── Domain / tasks ────────────────────────────────────────────────────
+domain: "telecom"
+
+# ── LLM routing ───────────────────────────────────────────────────────
+# agent_llm MUST be null/omitted so training rollouts use ARTAgent against
+# the local vLLM (the trainable LoRA). Setting it would switch to LLMAgent
+# and bypass the policy being optimised (see tau2_art_helpers.py L615).
+agent_llm: null
+agent_llm_args:
+  temperature: 0.7
+  # 1024 output + max_model_len=24576 leaves ~23K for prompts.  Agent rarely
+  # emits >300 tokens per turn so 1024 is generous.  Smaller cap also keeps
+  # GRPO batches smaller for trainer-memory headroom.
+  max_tokens: 1024
+
+# user_llm: external dialogue simulator, unchanged from serverless config.
+user_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
+user_llm_args:
+  temperature: 1.0
+  max_tokens: 1024
+
+# ── KL anchor (now ACTUALLY honoured by LocalBackend.train) ───────────
+# kl_penalty_reference_step is set automatically at runtime from
+# .sft_endpoint_step written by pull_sft_lora.py (== the seeded SFT step).
+kl_penalty_coef: 0.04
+
+# ── Training hyperparameters ──────────────────────────────────────────
+groups_per_step: 1
+num_epochs: 1
+rollouts_per_group: 16
+learning_rate: 1.0e-7
+# 40 turns + max_tokens=1024 keeps total conversation under 24K tokens, fitting
+# vLLM's max_model_len=24576.  50 turns + 2048 tokens grew past 32K and OOMed.
+max_orchestrator_steps: 40
+
+# ── Validation & early stopping ───────────────────────────────────────
+validation_step_interval: 2
+early_stop_patience_evals: 3
+save_checkpoint_artifact: true
+
+# ── RL pre-filter (curriculum) ────────────────────────────────────────
+rl_prefilter_tasks: true
+rl_prefilter_k: 4
+rl_prefilter_keep_band: [0.10, 0.90]
+
+# ── Datasets ──────────────────────────────────────────────────────────
+training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
+training_weave_dataset: "tau2-ART-telecom-training-scenarios"
+validation_dataset_artifact: "tau2-ART-telecom-validation-scenarios:latest"
+validation_weave_dataset: "tau2-ART-telecom-validation-scenarios"
+base_weave_dataset: "tau2-ART-telecom-base-scenarios"
+
+# ── Shaped reward ─────────────────────────────────────────────────────
+shaped_reward: true
+shaped_reward_weights:
+  action: 0.35
+  communicate: 0.10
+  nl_assertions: 0.30
+  termination: 0.15
+  tool_accuracy: 0.15
+  tool_arg_accuracy: 0.05
+  step_penalty: -0.10
+
+# ── Reproducibility ───────────────────────────────────────────────────
+random_seed: 42
+
+# ── Leaderboard evaluation ────────────────────────────────────────────
+leaderboard:
+  num_trials: 3
+  max_steps: 100
+  agent_llm_args:
+    temperature: 0.0
+    max_tokens: 16384
+  user_llm_args:
+    temperature: 0.0
+    max_tokens: 16384
+
+# ── W&B ───────────────────────────────────────────────────────────────
+wandb_job_type: "train"
+
+# ── Fields NOT present here (serverless-only, not meaningful for LocalBackend) ──
+# continue_from_model:              LocalBackend uses seeded .art/ checkpoint instead
+# verify_checkpoint_digest_before_train: queries W&B artifact aliases; skipped locally
+# kl_beta:                          replaced by kl_penalty_coef (canonical LocalBackend name)

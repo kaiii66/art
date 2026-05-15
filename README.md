@@ -35,7 +35,7 @@
    python upload_dataset_to_wandb.py
    ```
 
-4. **Train** (GRPO):
+4. **Train** (GRPO via ART serverless backend):
    ```bash
    python train_tau2.py
    ```
@@ -46,6 +46,149 @@
    ```
 
 Run in that order. For more options, see each script's `--help` or docstring.
+
+> The Quick Start above uses ART's W&B serverless backend. For the on-prem
+> GRPO pipeline (Kubernetes + 8×H100 + KL-anchored LoRA training), see the
+> next section.
+
+## End-to-End Pipeline: SFT → RL → Leaderboard (on-prem Kubernetes)
+
+This repo includes a full on-prem RL pipeline that takes a teacher-distilled
+SFT checkpoint, runs KL-anchored GRPO training on a Kubernetes-managed H100
+node, and publishes a Weave leaderboard comparing **base / SFT / RL** rows.
+
+```
+[teacher trajectories] ──► [SFT (axolotl on k8s)] ──► SFT LoRA on W&B
+                                                              │
+                                                              ▼
+            ┌─────────── local/run_pipeline_local.py ───────────┐
+            │ pull_sft → rl (LocalBackend) → upload_rl → leaderboard │
+            └────────────────────────────────────────────────────┘
+                                                              │
+                                                              ▼
+                                                Weave leaderboard
+                                              (base / SFT / RL rows)
+```
+
+Detailed runbook: [`local/RUNBOOK.md`](local/RUNBOOK.md).
+Architecture write-up: [`local/RUN_SUMMARY.md`](local/RUN_SUMMARY.md).
+
+### Prerequisites
+
+```bash
+# 1. Clone + venv (per Quick Start above)
+git clone <this-repo> && cd tau2-bench
+uv venv .venv && source .venv/bin/activate && uv pip install -e .
+
+# 2. .env (in repo root)
+WANDB_API_KEY=wandb_v1_...     # personal W&B token
+HF_TOKEN=hf_...                # for downloading Qwen3-30B-A3B-Instruct-2507
+WANDB_ENTITY=kwt
+
+# 3. Docker daemon + GHCR auth
+echo "$CR_PAT" | docker login ghcr.io -u <gh-user> --password-stdin
+
+# 4. Kubernetes access to a namespace with:
+#    - tau2-artifacts PVC (≥500 Gi, for HF cache + checkpoints)
+#    - tau2-data PVC
+#    - secrets: ghcr (image pull), wandb (key=api), hf (key=token)
+kubectl get pvc,secret -n tau2
+```
+
+### Step 1 — SFT (skip if you already have an SFT LoRA in W&B)
+
+Produce a LoRA artifact at `kwt/<project>/<collection>:step16` (or wherever).
+
+```bash
+# Runs upload → sft, stops before RL/leaderboard.
+uv run python run_pipeline.py --skip rl leaderboard
+```
+
+After completion, note the SFT collection name in
+`pipeline_runs/<MMDDHHMM>/.last_trained_model`. You'll wire it into the RL
+config below.
+
+### Step 2 — Configure the RL run
+
+Edit `train_config_local.yaml` so `sft_source` points at the artifact from
+Step 1:
+
+```yaml
+project: "tau2-ART-distill-05111101"
+base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+sft_source:
+  entity: "kwt"
+  project: "tau2-ART-distill-05111101"
+  name:   "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260511-1101"
+  step:   "latest"   # or a specific int
+
+kl_penalty_coef: 0.04            # KL anchor against SFT
+learning_rate:   1.0e-7
+groups_per_step: 1
+rollouts_per_group: 16
+```
+
+Leave the other hyperparameters at their defaults — they are the validated
+values from this work (see [`local/RUN_SUMMARY.md`](local/RUN_SUMMARY.md) for the
+rationale behind each one).
+
+### Step 3 — Build & push the on-prem image
+
+```bash
+IMAGE=ghcr.io/<gh-user>/tau2-art:$(git rev-parse --short HEAD)
+docker build --progress=plain -f onprem/Dockerfile.art-rl -t "$IMAGE" .
+docker push "$IMAGE"
+```
+
+> ⚠️ kubelet caches images by tag. If you rebuild without bumping the git
+> SHA (e.g. uncommitted changes), append a fresh suffix:
+> `IMAGE=...:$(git rev-parse --short HEAD)-$(date +%s)`
+
+### Step 4 — Smoke test (optional, ~30 min)
+
+Runs 4 tasks, skips upload + leaderboard:
+
+```bash
+uv run python local/k8s_submit.py \
+    --image-tag "$IMAGE" \
+    --skip-stages "upload_rl leaderboard" \
+    --num-tasks 4
+```
+
+Success means: `loss/kl_policy_ref` non-zero in the W&B run, `[best-step]`
+line appears, pod exits `phase=Succeeded`.
+
+### Step 5 — Full RL run (~3 h)
+
+```bash
+uv run python local/k8s_submit.py --image-tag "$IMAGE"
+
+# Watch
+kubectl get job  -n tau2 -l app.kubernetes.io/component=art-rl -w
+kubectl logs -f job/tau2-art-rl-<MMDDHHMM> -n tau2
+```
+
+When you see `Leaderboard published: ObjectRef(…)` the pipeline is done.
+
+### Outputs
+
+| Artifact | Where |
+|---|---|
+| RL LoRA checkpoints | `kwt/<project>/<collection>-rl-<MMDDHHMM>:step{N}` on W&B |
+| Best step | Printed as `[rl] best step: N best val/reward: X` |
+| W&B run | `https://wandb.ai/kwt/<project>/runs/<id>` (link in log) |
+| **Weave leaderboard** | `https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1` |
+
+The leaderboard has three rows — **base**, **SFT @ step N**, **RL @ best step**
+— with `success.mean` and `task_reward.mean` for each. Validated reference
+result on `kwt/tau2-ART-distill-05111101`:
+
+| Row | success.mean | task_reward.mean |
+|---|---|---|
+| base Qwen3-30B-A3B-Instruct-2507 | 9.2% | 0.233 |
+| SFT @ step 16 | 27.5% | 0.557 |
+| **RL @ step 17** | **38.3%** | **0.624** (+10.8 pp over SFT) |
 
 ## 🆕 What's New
 

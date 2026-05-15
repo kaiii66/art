@@ -1,0 +1,80 @@
+# Templated K8s Job for the on-prem ART RL stage
+# (openpipe-art LocalBackend — GRPO with KL anchor).
+#
+# Placeholders substituted by local/k8s_submit.py before kubectl apply:
+#   TEMPLATE_JOB_NAME         e.g. tau2-art-rl-05121500
+#   TEMPLATE_IMAGE_TAG        e.g. ghcr.io/kaiii66/tau2-art:abc1234
+#   TEMPLATE_PIPELINE_SUFFIX  e.g. 05121500
+#   TEMPLATE_WANDB_PROJECT    e.g. tau2-ART-distill-05111101
+#   TEMPLATE_WANDB_RUN_GROUP  e.g. pipeline-05121500
+#   TEMPLATE_WANDB_NAME       e.g. art-rl-05121500
+#   TEMPLATE_SKIP_STAGES      e.g. ""  or  "upload_rl leaderboard"  (smoke)
+#   TEMPLATE_NUM_TASKS        e.g. ""  or  "4"  (smoke)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: TEMPLATE_JOB_NAME
+  namespace: tau2
+  labels:
+    app.kubernetes.io/part-of: tau2-onprem
+    app.kubernetes.io/component: art-rl
+    pipeline-suffix: "TEMPLATE_PIPELINE_SUFFIX"
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 604800   # 7 days
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: tau2-onprem
+        app.kubernetes.io/component: art-rl
+        pipeline-suffix: "TEMPLATE_PIPELINE_SUFFIX"
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: ghcr
+      containers:
+        - name: trainer
+          image: TEMPLATE_IMAGE_TAG
+          imagePullPolicy: Always
+          command: ["/workspace/onprem/scripts/run_art_rl.sh"]
+          resources:
+            limits:
+              nvidia.com/gpu: 8
+            requests:
+              cpu: "16"
+              memory: 400Gi
+              nvidia.com/gpu: 8
+          env:
+            - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: wandb, key: api } } }
+            - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: hf,    key: token } } }
+            - { name: WANDB_PROJECT,             value: "TEMPLATE_WANDB_PROJECT" }
+            - { name: WANDB_RUN_GROUP,           value: "TEMPLATE_WANDB_RUN_GROUP" }
+            - { name: WANDB_NAME,                value: "TEMPLATE_WANDB_NAME" }
+            - { name: PIPELINE_SUFFIX,           value: "TEMPLATE_PIPELINE_SUFFIX" }
+            - { name: SKIP_STAGES,               value: "TEMPLATE_SKIP_STAGES" }
+            - { name: NUM_TASKS,                 value: "TEMPLATE_NUM_TASKS" }
+            # tau2 looks for domain tasks at Path(__file__).parents[3]/data which,
+            # for the installed package in /workspace/.venv/lib/python3.12/site-packages/,
+            # resolves to /workspace/.venv/lib/python3.12/data (doesn't exist).
+            # The actual data ships in the repo at /workspace/data/.
+            - { name: TAU2_DATA_DIR,             value: "/workspace/data" }
+            - { name: HF_HUB_ENABLE_HF_TRANSFER, value: "1" }
+            - { name: TOKENIZERS_PARALLELISM,    value: "false" }
+            # Expandable segments avoids allocator fragmentation on MoE layers.
+            - { name: PYTORCH_CUDA_ALLOC_CONF,   value: "expandable_segments:True" }
+            # Persist Qwen3-30B weights across job restarts — avoids the 60 GB
+            # re-download penalty (and occasional HF Hub 429 errors).
+            - { name: HF_HOME,                   value: "/artifacts/hf-cache" }
+            - { name: HUGGINGFACE_HUB_CACHE,     value: "/artifacts/hf-cache/hub" }
+            - { name: NCCL_P2P_DISABLE,          value: "0" }
+            - { name: NCCL_DEBUG,                value: "WARN" }
+          volumeMounts:
+            - { name: artifacts, mountPath: /artifacts }
+            - { name: data,      mountPath: /data }
+            - { name: shm,       mountPath: /dev/shm }
+      volumes:
+        - { name: artifacts, persistentVolumeClaim: { claimName: tau2-artifacts } }
+        - { name: data,      persistentVolumeClaim: { claimName: tau2-data } }
+        # ART LocalBackend + vLLM share GPU memory via shared memory;
+        # 128 Gi matches the existing rLLM RL job headroom.
+        - { name: shm,       emptyDir: { medium: Memory, sizeLimit: 128Gi } }

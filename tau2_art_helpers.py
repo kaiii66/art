@@ -161,6 +161,24 @@ class ARTAgent(LocalAgent):
                 response = self.client.chat.completions.create(**kwargs)
             except Exception as e:
                 last_error = e
+                # Fail-fast on deterministic context-length-overflow 400s:
+                # retrying the same prompt produces the same error and wastes
+                # up to ~30 min/rollout.  But "Already borrowed" and similar
+                # transient 400s from vllm LoRA concurrency DO recover on
+                # retry, so don't short-circuit those.
+                msg = str(e)
+                if (
+                    ("Error code: 400" in msg or "BadRequestError" in msg)
+                    and (
+                        "context length" in msg
+                        or "input_tokens" in msg
+                        or "model ID is invalid" in msg
+                    )
+                ):
+                    logger.warning(
+                        "Inference API 400 (no retry, fail-fast): %s", e
+                    )
+                    raise
                 if attempt < self.max_retries - 1:
                     delay = min(60, 2 ** attempt)
                     logger.warning(
@@ -624,7 +642,12 @@ async def tau2_rollout(
             completion_tokens = 0
             messages_and_choices = []
         else:
-            inference_api_key = os.getenv("WANDB_API_KEY")
+            # Prefer the model's inference_api_key (set by the backend during
+            # prepare_backend_for_training).  For LocalBackend this is the
+            # local vLLM server's key ("default"); for ServerlessBackend it's
+            # the W&B Inference key.  Fall back to env for eval-time callers
+            # who pass an unregistered model.
+            inference_api_key = model.inference_api_key or os.getenv("WANDB_API_KEY")
             if pinned_alias is not None:
                 # Pin directly to any W&B artifact alias on this model's collection
                 # (e.g. "v1", "latest", "best"). Useful when the desired checkpoint

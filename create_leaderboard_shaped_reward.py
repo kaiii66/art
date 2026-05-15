@@ -32,6 +32,7 @@ Model options: base, sft, rl, all
 """
 import argparse
 import asyncio
+import os
 import yaml
 from pathlib import Path
 
@@ -84,7 +85,12 @@ async def main(
     project = config["project"]
     domain = config["domain"]
     base_model = config["base_model"]
-    agent_llm = config.get("agent_llm", f"wandb/{base_model}")
+    # `config.get(key, default)` returns the existing value (even None), so an
+    # explicit `agent_llm: null` in yaml (the training-time setting) skips the
+    # default — and the base eval row would then crash on `model.inference_api_key`.
+    # Treat None the same as missing here, falling back to W&B Inference for the
+    # bare base model.
+    agent_llm = config.get("agent_llm") or f"wandb/{base_model}"
     user_llm = config["user_llm"]
     eval_weave = config.get("validation_weave_dataset") or f"tau2-{domain}-validation-scenarios"
     trained_name = trained_model_name or config.get("leaderboard_trained_model_name")
@@ -240,11 +246,34 @@ async def main(
                         "This is normal for ad-hoc runs without the pipeline."
                     )
                 else:
+                    # Per-run isolation gives `trained_name` a `-rl-<suffix>` tag
+                    # but SFT checkpoints live in the original (unsuffixed) W&B
+                    # collection pointed to by `sft_source.name`.  If config sets
+                    # sft_source, use it; otherwise fall back to trained_name
+                    # (the legacy single-collection layout).
+                    sft_src = config.get("sft_source", {})
+                    sft_collection_name = sft_src.get("name") or trained_name
+                    sft_collection_project = sft_src.get("project") or project
+                    sft_collection_entity = sft_src.get("entity") or config.get("wandb_entity") or os.getenv("WANDB_ENTITY", "kwt")
+                    if sft_collection_name != trained_name or sft_collection_project != project:
+                        print(
+                            f"Resolving sft row to original collection: "
+                            f"{sft_collection_entity}/{sft_collection_project}/{sft_collection_name}"
+                        )
+                        sft_model = art.TrainableModel(
+                            name=sft_collection_name,
+                            project=sft_collection_project,
+                            base_model=base_model,
+                        )
+                        await sft_model.register(backend)
+                        sft_model.inference_base_url = trained_model.inference_base_url
+                    else:
+                        sft_model = trained_model
                     sft_label = f"SFT @ step {sft_pinned_step}"
                     sft_display = f"{base_model} ({sft_label})"
                     print(f"Pinning sft row to checkpoint :step{sft_pinned_step}")
                     sft_wrapper = Tau2BaseModelWrapper(
-                        model=trained_model,
+                        model=sft_model,
                         model_name=sft_display,
                         domain=domain,
                         user_llm=user_llm,

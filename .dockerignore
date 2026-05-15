@@ -1,0 +1,29 @@
+# Excludes from the Docker build context (build from the art/ directory).
+# Keeps the image lean and avoids accidentally leaking secrets.
+
+# Python runtime artifacts
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# ART local checkpoints (can be very large)
+.art/
+
+# Pipeline run snapshots + logs
+pipeline_runs/
+
+# Local dev / editor files
+.env
+.env.*
+*.log
+.DS_Store
+.idea/
+.vscode/
+
+# Git history (not needed inside the image)
+.git/
+.gitignore
