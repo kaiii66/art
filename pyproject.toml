@@ -42,7 +42,8 @@ dependencies = [
     "gymnasium>=1.2.2",
     "weave>=0.52.29",
     "openpipe-art>=0.5.11",
-    "pyarrow>=23.0.1"
+    "pyarrow>=23.0.1",
+    "ruamel-yaml>=0.19.1",
 ]
 
 [project.scripts]

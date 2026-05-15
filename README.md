@@ -88,25 +88,108 @@ WANDB_ENTITY=kwt
 # 3. Docker daemon + GHCR auth
 echo "$CR_PAT" | docker login ghcr.io -u <gh-user> --password-stdin
 
-# 4. Kubernetes access to a namespace with:
-#    - tau2-artifacts PVC (≥500 Gi, for HF cache + checkpoints)
-#    - tau2-data PVC
-#    - secrets: ghcr (image pull), wandb (key=api), hf (key=token)
-kubectl get pvc,secret -n tau2
+# 4. Kubernetes namespace + PVCs + secrets (one-time bootstrap)
+NS=tau2
+kubectl create namespace "$NS" 2>/dev/null || true
+
+# PVCs — adjust storageClassName + sizes for your cluster.
+# 500 Gi covers a persistent HF cache for Qwen3-30B + multiple RL checkpoints;
+# 100 Gi holds intermediate data the pipeline streams in/out.
+kubectl apply -n "$NS" -f - <<'YAML'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: tau2-artifacts }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: shared-vast      # change to your cluster's class
+  resources: { requests: { storage: 500Gi } }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: tau2-data }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: shared-vast
+  resources: { requests: { storage: 100Gi } }
+YAML
+
+# GHCR image-pull secret (so the Job can pull ghcr.io/<gh-user>/tau2-art:...)
+kubectl create secret docker-registry ghcr -n "$NS" \
+    --docker-server=ghcr.io \
+    --docker-username=<gh-user> \
+    --docker-password="$CR_PAT"
+
+# W&B API key — pipeline expects key `api`
+kubectl create secret generic wandb -n "$NS" \
+    --from-literal=api="$WANDB_API_KEY"
+
+# HuggingFace token — pipeline expects key `token`
+kubectl create secret generic hf -n "$NS" \
+    --from-literal=token="$HF_TOKEN"
+
+# Sanity-check everything is in place
+kubectl get pvc,secret -n "$NS"
+# Expect: pvc/tau2-artifacts, pvc/tau2-data, secret/ghcr, secret/wandb, secret/hf
 ```
+
+### Quick (single command)
+
+After the one-time bootstrap above (PVCs + secrets + `.env`), the whole
+pipeline can be driven from a single entry point:
+
+```bash
+# Full pipeline (~3 h) — SFT → patch config → build/push image → k8s Job
+# → leaderboard. The suffix is auto-generated as MMDDHHMM (US/Pacific) and
+# shared across SFT and RL, so cross-stage state stays correlated.
+uv run python run_full_pipeline.py --tail
+```
+
+```bash
+# Smoke test (~30 min) — 4-task RL only; skips upload_rl + leaderboard.
+uv run python run_full_pipeline.py --smoke --tail
+```
+
+```bash
+# Re-use an existing SFT snapshot (e.g., when debugging the RL side):
+uv run python run_full_pipeline.py --suffix 05151200 --skip-sft --tail
+```
+
+`run_full_pipeline.py` composes the manual Steps 1–5 below — it does not
+replace them. Each individual script (`run_pipeline.py`, `local/k8s_submit.py`,
+etc.) remains independently runnable for fine-grained control. The wrapper
+overwrites `train_config_local.yaml > sft_source.{entity,project,name}`
+with the values from the just-completed SFT run (the patched file is then
+baked into the on-prem image via `COPY . .`); that's expected — the next
+run overwrites it again. A snapshot copy lives at
+`pipeline_runs/<SUFFIX>/train_config_local.yaml` for the audit trail.
+
+The CLI surface is intentionally small:
+
+| Flag | Effect |
+|---|---|
+| `--suffix MMDDHHMM` | Override the auto-generated suffix (e.g. to retry a prior run). |
+| `--smoke` | Pass `--skip-stages "upload_rl leaderboard" --num-tasks 4` to `k8s_submit.py`. |
+| `--skip-sft` | Skip the SFT subprocess (requires `--suffix` pointing at an existing snapshot). |
+| `--skip-build` | Skip `docker build` + `docker push`; reuse the image tag from a prior submit. |
+| `--tail` | After `kubectl apply`, stream `kubectl logs -f` until the Job ends. |
+
+The rest of this section (Steps 1–5) is the canonical manual flow for
+running the pipeline stages independently.
 
 ### Step 1 — SFT (skip if you already have an SFT LoRA in W&B)
 
-Produce a LoRA artifact at `kwt/<project>/<collection>:step16` (or wherever).
+Uploads the train/val datasets to W&B, then trains a LoRA on top of the base
+model using teacher-distilled trajectories. Output: a W&B LoRA artifact at
+`kwt/<project>/<collection>:step{N}`.
 
 ```bash
-# Runs upload → sft, stops before RL/leaderboard.
+# Runs upload → sft, stops before the rl + leaderboard stages.
 uv run python run_pipeline.py --skip rl leaderboard
 ```
 
-After completion, note the SFT collection name in
-`pipeline_runs/<MMDDHHMM>/.last_trained_model`. You'll wire it into the RL
-config below.
+When it finishes, the SFT collection name is written to
+`pipeline_runs/<MMDDHHMM>/.last_trained_model`. You'll plug that into
+`train_config_local.yaml > sft_source.name` in Step 2.
 
 ### Step 2 — Configure the RL run
 
