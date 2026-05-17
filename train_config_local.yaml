@@ -9,7 +9,7 @@
 #   uv run python local/upload_rl_lora.py  --config train_config_local.yaml
 
 # ── Model ─────────────────────────────────────────────────────────────
-project: "tau2-ART-distill-05111101"
+project: "tau2-ART-distill-05162346"
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # model_name is a BASE template. run_pipeline_local.py appends the run
 # suffix (MMDDHHMM) automatically, producing an isolated name like
@@ -17,16 +17,25 @@ base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # This gives each run its own .art/ checkpoint dir and its own W&B RL
 # artifact collection, so every run always starts fresh from the SFT LoRA.
 # sft_source.name (below) always points back to the original SFT baseline.
-model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260511-1101"
+model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260516-1646"
 
 # ── SFT source (pull_sft_lora.py) ─────────────────────────────────────
 # Identifies which W&B artifact to seed the local .art/ checkpoint dir from.
-# "step: latest" resolves to the highest registered step in the collection.
+#
+# Step resolution (highest precedence first), see local/pull_sft_lora.py:
+#   1. integer literal             -> downloads :step{N} as-is
+#   2. .best_sft_step sidecar      -> overrides this field when present
+#   3. "best"                       -> requires the sidecar; errors if missing
+#   4. "latest" or unset           -> downloads the collection's :latest alias
+#
+# run_full_pipeline.py auto-patches step to the integer best step after SFT
+# completes (reads pipeline_runs/<SUFFIX>/.best_sft_step). Keep "best" here as
+# the safer default for ad-hoc runs that share a snapshot dir.
 sft_source:
   entity: "kwt"
-  project: "tau2-ART-distill-05111101"
-  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260511-1101"
-  step: "latest"
+  project: "tau2-ART-distill-05162346"
+  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260516-1646"
+  step: 7
 
 # ── Domain / tasks ────────────────────────────────────────────────────
 domain: "telecom"
@@ -35,13 +44,13 @@ domain: "telecom"
 # agent_llm MUST be null/omitted so training rollouts use ARTAgent against
 # the local vLLM (the trainable LoRA). Setting it would switch to LLMAgent
 # and bypass the policy being optimised (see tau2_art_helpers.py L615).
-agent_llm: null
+agent_llm:
 agent_llm_args:
   temperature: 0.7
-  # 1024 output + max_model_len=24576 leaves ~23K for prompts.  Agent rarely
-  # emits >300 tokens per turn so 1024 is generous.  Smaller cap also keeps
-  # GRPO batches smaller for trainer-memory headroom.
-  max_tokens: 1024
+  # Dropped 1024 -> 512: observed p95=250 tokens, max=366 across 1,145 agent
+  # replies — 512 covers all real outputs with headroom.  Smaller cap frees
+  # KV-cache budget to support more orchestrator steps (see max_orchestrator_steps).
+  max_tokens: 512
 
 # user_llm: external dialogue simulator, unchanged from serverless config.
 user_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -59,13 +68,21 @@ groups_per_step: 1
 num_epochs: 1
 rollouts_per_group: 16
 learning_rate: 1.0e-7
-# 40 turns + max_tokens=1024 keeps total conversation under 24K tokens, fitting
-# vLLM's max_model_len=24576.  50 turns + 2048 tokens grew past 32K and OOMed.
-max_orchestrator_steps: 40
+# Bumped 40 -> 60: with max_tokens=512 (down from 1024) the per-turn token
+# budget is halved, so 60 steps × ~300 avg tokens ≈ 18K tokens + ~3K prompt
+# overhead = ~21K < max_model_len=24576.  Closes the gap with the leaderboard's
+# max_steps=100 so the RL policy practices on longer episodes.
+# (Previous limit: 50 turns + 2048 tokens grew past 32K and OOMed.)
+max_orchestrator_steps: 60
 
 # ── Validation & early stopping ───────────────────────────────────────
-validation_step_interval: 2
-early_stop_patience_evals: 3
+# Dropped 2 -> 1: last run had only 12 RL steps = 6 validation points at
+# interval=2.  Denser signal lets best-step tracking and early-stop react
+# faster to short runs.
+validation_step_interval: 1
+# Bumped 3 -> 5: last run best was step 11, stopped at 12 (3 flat evals).
+# The model may have still been improving; 5 patience gives it more runway.
+early_stop_patience_evals: 5
 save_checkpoint_artifact: true
 
 # ── RL pre-filter (curriculum) ────────────────────────────────────────

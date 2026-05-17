@@ -84,11 +84,51 @@ async def pull_sft_lora(
     serverless = ServerlessBackend()
     await sft_model.register(serverless)
 
-    # Resolve "latest" to a concrete step number for determinism
-    if src_step == "latest" or src_step is None:
-        resolved_step = await sft_model.get_step()
-    else:
+    # ── Resolve which checkpoint step to download ───────────────────────
+    # Precedence (highest first):
+    #   1. sft_source.step is a concrete integer (or numeric string)
+    #      — use as-is. This is what run_full_pipeline.py bakes into the
+    #      docker config after reading .best_sft_step on the SFT host.
+    #   2. .best_sft_step sidecar in --snapshot-dir (or config dir)
+    #      — written by train_tau2_distill.py at the best val/reward chunk.
+    #      Prefer this over any non-integer src_step so a manual
+    #      `step: latest` in the config never silently overrides the best
+    #      checkpoint when both are available.
+    #   3. sft_source.step == "best"
+    #      — explicit opt-in to .best_sft_step. Errors loudly if the
+    #      sidecar is missing rather than falling back to :latest.
+    #   4. sft_source.step == "latest" / None / anything else
+    #      — old behaviour: resolve via the W&B collection's :latest alias.
+    sidecar_dir = snapshot_dir or config_path.resolve().parent
+    best_file = sidecar_dir / ".best_sft_step"
+
+    src_step_is_int = isinstance(src_step, int) or (
+        isinstance(src_step, str) and src_step.isdigit()
+    )
+
+    if src_step_is_int:
         resolved_step = int(src_step)
+        print(f"[pull_sft] using config-pinned step {resolved_step}")
+    elif best_file.exists():
+        try:
+            resolved_step = int(best_file.read_text().strip())
+        except (ValueError, OSError) as e:
+            raise RuntimeError(
+                f"[pull_sft] {best_file} exists but is not an integer: {e}"
+            )
+        print(
+            f"[pull_sft] using .best_sft_step = {resolved_step} "
+            f"(overrides sft_source.step={src_step!r})"
+        )
+    elif src_step == "best":
+        raise RuntimeError(
+            f"sft_source.step='best' but {best_file} not found. "
+            "Run SFT first (writes .best_sft_step) or copy the sidecar into "
+            f"{sidecar_dir} before pulling."
+        )
+    else:
+        resolved_step = await sft_model.get_step()
+        print(f"[pull_sft] using collection :latest = {resolved_step}")
 
     print(f"[pull_sft] resolved step : {resolved_step}")
 
@@ -124,8 +164,7 @@ async def pull_sft_lora(
             )
             print(f"[pull_sft] download complete: {target_dir}")
 
-    # ── Write sidecar files ─────────────────────────────────────────────
-    sidecar_dir = snapshot_dir or config_path.resolve().parent
+    # ── Write sidecar files (sidecar_dir already resolved above) ────────
     sft_step_file = sidecar_dir / ".sft_endpoint_step"
     last_model_file = sidecar_dir / ".last_trained_model"
 

@@ -163,12 +163,27 @@ def _git_short_sha() -> str:
         return "nogit"
 
 
-def _patch_sft_source(snapshot: Path, project: str, sft_name: str) -> None:
+def _patch_sft_source(
+    snapshot: Path,
+    project: str,
+    sft_name: str,
+    sft_step_override: str | int | None,
+) -> None:
     """Overwrite train_config_local.yaml's sft_source + top-level project.
 
     The Dockerfile's `COPY . .` then bakes this into the image so the pod
     reads the right SFT collection without manual editing.  Also copies the
     patched file to the snapshot dir for traceability.
+
+    `sft_step_override` controls the step pin baked into the docker config:
+
+    - None (default): auto-discover from `<snapshot>/.best_sft_step`. If the
+      sidecar is missing (e.g. SFT was skipped or pre-best-step-tracking),
+      fall back to "latest" with a warning.
+    - "best" / "latest": passed through verbatim — the in-image
+      pull_sft_lora.py will resolve via the sidecar / W&B :latest alias.
+    - <int> / numeric string: hard-pin to that exact step (useful for
+      ablations or reproducing a specific historical SFT).
     """
     if not _HAS_RUAMEL:
         print(
@@ -190,7 +205,46 @@ def _patch_sft_source(snapshot: Path, project: str, sft_name: str) -> None:
     sft["entity"] = os.getenv("WANDB_ENTITY", "kwt")
     sft["project"] = project
     sft["name"] = sft_name
-    sft["step"] = "latest"
+
+    # Resolve the step pin to bake into the image. Auto-discovery reads
+    # .best_sft_step that train_tau2_distill.py wrote at the best val/reward
+    # chunk; this is what makes the on-cluster RL stage continue from the
+    # best SFT checkpoint rather than the noisy final one.
+    best_step_file = snapshot / ".best_sft_step"
+    if sft_step_override is None:
+        if best_step_file.exists():
+            try:
+                resolved_step: int | str = int(best_step_file.read_text().strip())
+                print(
+                    f"[patch] {LOCAL_CONFIG.name} -> sft_source.step="
+                    f"{resolved_step} (auto-discovered from .best_sft_step)"
+                )
+            except (ValueError, OSError) as e:
+                resolved_step = "latest"
+                print(
+                    f"[patch] WARNING: could not parse {best_step_file}: {e}; "
+                    f"falling back to sft_source.step='latest'"
+                )
+        else:
+            resolved_step = "latest"
+            print(
+                f"[patch] WARNING: no .best_sft_step in {snapshot}; "
+                f"falling back to sft_source.step='latest'. Re-run SFT to "
+                "get best-step tracking, or pass --sft-step <int|best|latest>."
+            )
+    else:
+        # Honour the explicit override. Convert numeric strings to int so the
+        # YAML lands as `step: 28` (not `step: '28'`) which keeps it visually
+        # consistent with the auto-discovery path.
+        if isinstance(sft_step_override, str) and sft_step_override.isdigit():
+            resolved_step = int(sft_step_override)
+        else:
+            resolved_step = sft_step_override
+        print(
+            f"[patch] {LOCAL_CONFIG.name} -> sft_source.step={resolved_step!r} "
+            f"(--sft-step override)"
+        )
+    sft["step"] = resolved_step
     yaml_dump(cfg, LOCAL_CONFIG)
 
     # Snapshot copy for the audit trail.
@@ -230,6 +284,17 @@ def main() -> int:
     parser.add_argument(
         "--tail", action="store_true",
         help="After kubectl apply, stream `kubectl logs -f` until the Job ends.",
+    )
+    parser.add_argument(
+        "--sft-step",
+        default=None,
+        help=(
+            "Override the SFT checkpoint step baked into the docker image. "
+            "Defaults to auto-discovery (reads pipeline_runs/<SUFFIX>/.best_sft_step "
+            "and pins sft_source.step to that integer). Pass an integer to "
+            "hard-pin (e.g. --sft-step 28), or 'best' / 'latest' to delegate "
+            "resolution to the in-image pull_sft_lora.py."
+        ),
     )
     args = parser.parse_args()
 
@@ -283,7 +348,7 @@ def main() -> int:
     print(f"[handoff] sft_name = {sft_name}")
 
     # ── 3. Patch train_config_local.yaml in place ─────────────────────────
-    _patch_sft_source(snapshot, project, sft_name)
+    _patch_sft_source(snapshot, project, sft_name, args.sft_step)
 
     # ── 4. docker build + push ────────────────────────────────────────────
     gh_user = os.getenv("GHCR_USER")

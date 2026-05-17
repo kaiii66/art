@@ -99,16 +99,31 @@ async def main(
         if last_model_file.exists():
             trained_name = last_model_file.read_text().strip()
 
-    # Pin point for the "sft" row: the trained collection step at the moment
-    # RL began (== final SFT step). Auto-discovered from .sft_endpoint_step
-    # written by train_tau2.py next to the snapshot config when continue_from
-    # is set. If absent, the sft row is skipped (e.g. ad-hoc / non-pipeline run).
+    # Pin point for the "sft" row.
+    #
+    # Resolution order (highest precedence first):
+    #   1. .best_sft_step  -- written by train_tau2_distill.run_distillation_sft
+    #      every time val/reward improves. This is the checkpoint the
+    #      leaderboard should evaluate; pinning to the LAST step (#2) on a
+    #      noisy 4-task validation routinely picks an over-trained tail and
+    #      makes SFT look 20-30 pp worse than its peak (see
+    #      kwt/tau2-ART-autoresearch-telecom/sft-04271957-step28 ≈ 50% vs
+    #      kwt/tau2-ART-distill-05151739 final-step ≈ 9%).
+    #   2. .sft_endpoint_step -- the final SFT step. Used by older snapshots
+    #      that pre-date best-step tracking. Also the fallback when an SFT run
+    #      somehow finished without writing .best_sft_step.
+    # If neither sidecar is present the sft row is skipped (e.g. ad-hoc /
+    # non-pipeline runs, or RL-only resumes).
     sft_pinned_step = None
-    sft_step_file = Path(config_path).resolve().parent / ".sft_endpoint_step"
-    if sft_step_file.exists():
+    snapshot_dir = Path(config_path).resolve().parent
+    for fname in (".best_sft_step", ".sft_endpoint_step"):
+        sft_step_file = snapshot_dir / fname
+        if not sft_step_file.exists():
+            continue
         try:
             sft_pinned_step = int(sft_step_file.read_text().strip())
-            print(f"  [leaderboard] sft pin = step {sft_pinned_step} (from {sft_step_file.name})")
+            print(f"  [leaderboard] sft pin = step {sft_pinned_step} (from {fname})")
+            break
         except (ValueError, OSError) as e:
             print(f"  [leaderboard] could not read {sft_step_file}: {e}")
 
@@ -330,6 +345,42 @@ async def main(
             "or run train first to create .last_trained_model."
         )
 
+    # Always include a frontier-baseline GPT-4.1-mini agent row when an
+    # OpenAI key is in the environment. This gives every leaderboard a
+    # constant "are we beating a strong off-the-shelf model?" reference
+    # without requiring a separate eval pass. The wrapper uses tau2's
+    # LLMAgent (no ART backend needed); litellm picks up OPENAI_API_KEY
+    # from env. Skipped silently when the key is absent so airgapped runs
+    # don't fail.
+    if os.getenv("OPENAI_API_KEY"):
+        # Pin to a dated snapshot so historical leaderboards stay
+        # reproducible if OpenAI rolls a new minor version.
+        gpt41_model_id = "openai/gpt-4.1-mini-2025-04-14"
+        gpt41_display = f"{gpt41_model_id} (frontier-baseline)"
+        gpt41_agent_args = {**agent_llm_args}
+        gpt41_agent_args.setdefault("temperature", 0.0)
+        gpt41_wrapper = Tau2BaseModelWrapper(
+            name="gpt-4.1-mini",
+            model=None,
+            model_name=gpt41_display,
+            domain=domain,
+            user_llm=user_llm,
+            user_llm_args=user_llm_args,
+            agent_llm_args=gpt41_agent_args,
+            max_steps=max_steps,
+            agent_llm=gpt41_model_id,
+            **shaped_kwargs,
+        )
+        models.append(gpt41_wrapper)
+        model_names.append("gpt-4.1-mini")
+        display_names.append(gpt41_display)
+        print(f"\nAdding GPT-4.1-mini agent row (OPENAI_API_KEY detected): {gpt41_display}")
+    else:
+        print(
+            "\nSkipping GPT-4.1-mini agent row (OPENAI_API_KEY not set). "
+            "Add it to art/.env to enable the frontier-baseline row."
+        )
+
     if not models:
         print("\nNo models to evaluate.")
         run.finish()
@@ -403,9 +454,11 @@ if __name__ == "__main__":
         choices=["base", "sft", "rl", "trained", "all"],
         default=["all"],
         help=(
-            "Models to evaluate (default: all). 'sft' uses .sft_endpoint_step, "
-            "'rl' uses .best_rl_step (or :latest fallback). 'trained' is a "
-            "deprecated alias for 'rl'."
+            "Models to evaluate (default: all). 'sft' prefers .best_sft_step "
+            "and falls back to .sft_endpoint_step. 'rl' uses .best_rl_step (or "
+            ":latest fallback). 'trained' is a deprecated alias for 'rl'. The "
+            "frontier-baseline 'gpt-4.1-mini' row is added automatically when "
+            "OPENAI_API_KEY is set."
         ),
     )
     parser.add_argument("--trained-model-name", type=str, default=None, help="Trained model name (overrides config)")

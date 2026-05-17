@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -79,6 +80,71 @@ def _render_template(template_text: str, values: dict[str, str]) -> str:
     if remaining:
         print(f"[k8s_submit] WARNING: unreplaced template markers: {remaining}", file=sys.stderr)
     return result
+
+
+def _upsert_openai_secret(namespace: str, snapshot_dir: Path) -> None:
+    """Idempotently create/update the `openai` k8s secret from the local env.
+
+    Resolution order:
+      1. OPENAI_API_KEY in the current process environment (covers CI and shells
+         that already have the key exported).
+      2. OPENAI_API_KEY in art/.env (dotenv file next to train_config_local.yaml).
+
+    If neither source has the key, a warning is printed but the function returns
+    without error — the Job template uses ``optional: true`` so pods start even
+    when the secret is absent; the gpt-4.1-mini row will simply be skipped.
+    """
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        env_file = REPO_ROOT / ".env"
+        if env_file.exists():
+            for line in env_file.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("OPENAI_API_KEY"):
+                    _, _, val = line.partition("=")
+                    key = val.strip().strip('"').strip("'")
+                    break
+
+    if not key:
+        print(
+            "[k8s_submit] WARNING: OPENAI_API_KEY not found in env or .env — "
+            "openai k8s secret NOT created; gpt-4.1-mini leaderboard row will be skipped.",
+            file=sys.stderr,
+        )
+        return
+
+    # --dry-run=client | kubectl apply is idempotent: create-or-update.
+    secret_path = snapshot_dir / "openai_secret.yaml"
+    dry_run = subprocess.run(
+        [
+            "kubectl", "create", "secret", "generic", "openai",
+            f"--from-literal=api={key}",
+            "-n", namespace,
+            "--dry-run=client", "-o", "yaml",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if dry_run.returncode != 0:
+        print(
+            f"[k8s_submit] WARNING: could not render openai secret: {dry_run.stderr.strip()}",
+            file=sys.stderr,
+        )
+        return
+
+    secret_path.write_text(dry_run.stdout)
+    result = subprocess.run(
+        ["kubectl", "apply", "-f", str(secret_path), "-n", namespace],
+        check=False,
+    )
+    if result.returncode == 0:
+        print(f"[k8s_submit] openai k8s secret upserted in namespace {namespace!r}")
+    else:
+        print(
+            f"[k8s_submit] WARNING: kubectl apply for openai secret failed (exit {result.returncode})",
+            file=sys.stderr,
+        )
 
 
 def _git_short_sha() -> str | None:
@@ -191,6 +257,9 @@ def main() -> int:
         print(rendered)
         print("=== (dry-run; kubectl not called) ===")
         return 0
+
+    # Upsert the openai k8s secret so the gpt-4.1-mini leaderboard row gets its key.
+    _upsert_openai_secret(args.namespace, snapshot_dir)
 
     print()
     print(f"[k8s_submit] kubectl apply -f {rendered_path}")

@@ -45,8 +45,9 @@ spec:
               memory: 400Gi
               nvidia.com/gpu: 8
           env:
-            - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: wandb, key: api } } }
-            - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: hf,    key: token } } }
+            - { name: WANDB_API_KEY,   valueFrom: { secretKeyRef: { name: wandb,   key: api   } } }
+            - { name: HF_TOKEN,        valueFrom: { secretKeyRef: { name: hf,      key: token } } }
+            - { name: OPENAI_API_KEY,  valueFrom: { secretKeyRef: { name: openai,  key: api, optional: true } } }
             - { name: WANDB_PROJECT,             value: "TEMPLATE_WANDB_PROJECT" }
             - { name: WANDB_RUN_GROUP,           value: "TEMPLATE_WANDB_RUN_GROUP" }
             - { name: WANDB_NAME,                value: "TEMPLATE_WANDB_NAME" }

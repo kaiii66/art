@@ -28,13 +28,27 @@ user_llm_args:
 # Always uses the full train split from the loaded artifact (74 telecom tasks
 # at the time of writing). To bound size for a smoke test, pass
 # `--num-tasks N` on the train_tau2_distill.py CLI (kept for ad-hoc use).
-teacher_rollouts_per_task: 5
-num_validation_tasks: 4
+# Bumped 5 -> 8: last run yielded ~232 successful trajs from 5 rollouts/task.
+# 8 rollouts should produce ~370 (+60%), giving SFT more signal per task
+# without requiring a larger task set.
+teacher_rollouts_per_task: 8
+# Bumped 4 -> 20 after kwt/tau2-ART-distill-05151739 showed val/success swinging
+# 25→100→75→25 across chunks because a single task flip on 4 tasks = 25pp. With
+# 20 val tasks the per-task noise drops to ±5pp, which is small enough that
+# best-step tracking (see early_stop_patience_evals + train_tau2_distill.py
+# best_sft_step) actually picks the right peak instead of a noisy outlier.
+num_validation_tasks: 20
 # Bumped 30 -> 100 to match leaderboard.max_steps in train_config.yaml and
 # tau2's own default. Avoids train/eval mismatch where tasks needing 31-100
 # turns to succeed were silently dropped from the SFT training set.
 max_orchestrator_steps: 100
 filter_successful_only: true
+# Partial-credit alternative to filter_successful_only.  When set to a float
+# (e.g. 0.5), keeps any trajectory whose shaped reward >= the threshold,
+# regardless of binary success.  filter_successful_only is ignored when this
+# knob is active.  Unset (null / absent) = default binary-success-only filter.
+# A/B this after confirming teacher_rollouts_per_task=8 is stable.
+# filter_min_shaped_reward: 0.5
 teacher_concurrency: 10
 # When true, first run 1 probe rollout per task to find solvable tasks, then
 # concentrate the remaining (teacher_rollouts_per_task - 1) rollouts on those
@@ -42,14 +56,24 @@ teacher_concurrency: 10
 prefilter_tasks: true
 
 # ── SFT hyperparameters ────────────────────────────────────────────
-sft_epochs: 1
+sft_epochs: 2
 sft_batch_size: 2
 # 1e-4 is conservative; 2e-4 was overfitting on small (~13 traj) datasets.
+# 1e-4 is also the value that hit ~50% on kwt/tau2-ART-autoresearch-telecom
+# (sft-04271957-step28:v0) so it's the recovered baseline.
 sft_peak_lr: 1.0e-4
 sft_warmup_ratio: 0.1
 sft_schedule_type: "cosine"
 sft_chunk_size: 8          # batches per train_sft call (=> validation cadence)
-validation_every_n_chunks: 4
+# Dropped 4 -> 1 so best-step tracking (train_tau2_distill.run_distillation_sft)
+# has a datapoint at every chunk. Cheap because num_validation_tasks=20 and
+# chunks_total ~= 16-30 → at most ~30 evals per run.
+validation_every_n_chunks: 1
+# Stop SFT if val/reward fails to beat the running best for this many
+# consecutive validations. 0/None disables. 3 mirrors RL's
+# early_stop_patience_evals in train_config.yaml. Keeps over-trained chunks
+# from clobbering the best LoRA we already saved via .best_sft_step.
+early_stop_patience_evals: 3
 
 # ── Datasets (W&B artifacts produced by upload_dataset_to_wandb.py) ─
 training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
@@ -59,3 +83,29 @@ validation_task_split: "test"
 # ── Reproducibility / W&B ──────────────────────────────────────────
 random_seed: 42
 wandb_job_type: "distill"
+
+# ── Sweep recipe (knobs to A/B when SFT regresses) ─────────────────
+# The autoresearch baseline (kwt/tau2-ART-autoresearch-telecom/sft-04271957-step28
+# on the leaderboard ≈ 50%) was produced with the values currently set above.
+# When val/reward stays below ~0.5 try, in this order:
+#
+#   1. teacher_rollouts_per_task: 5 → 8 → 10
+#      Drives more SFT data; works around small-dataset overfitting before
+#      touching the optimizer. Cheap to add (teacher does ~1 rollout/task/min).
+#   2. sft_peak_lr: 1.0e-4 → 7e-5 → 5e-5
+#      Lower LR if val/reward plateaus AND grad_norm > ~5 in early chunks.
+#      Higher LR (1.5e-4) only if val/reward is rising linearly to the end —
+#      i.e. you ran out of learning, not patience.
+#   3. sft_epochs: 1 → 2
+#      Safe to enable now that early_stop_patience_evals stops the run as
+#      soon as val/reward plateaus, so extra epochs only run if the model is
+#      still climbing.
+#   4. filter_successful_only: true → false (with shaped reward gate)
+#      Loosen the filter to keep partial-credit teacher trajectories
+#      (shaped_reward >= ~0.6). Adds ~80% more SFT data on telecom but risks
+#      teaching the student to imitate near-miss patterns; pair with bigger
+#      val set (already 20) so the regression is detectable.
+#
+# Always keep best-step tracking on (it's enforced by .best_sft_step in
+# train_tau2_distill.py), so the leaderboard SFT row never sees the over-
+# trained tail again.
