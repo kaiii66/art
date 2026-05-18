@@ -90,6 +90,8 @@ async def run_training(
     num_epochs = config.get("num_epochs", 1)
     use_shaped = config.get("shaped_reward", False)
     shaped_weights = config.get("shaped_reward_weights")
+    task_reward_blend = config.get("task_reward_blend", None)
+    val_trials = int(config.get("validation_rollouts_per_task", 1))
     validation_interval = config.get("validation_step_interval", 5)
     early_stop_patience = int(config.get("early_stop_patience_evals") or 0)
     kl_coef = config.get("kl_penalty_coef", config.get("kl_beta", 0.0))
@@ -146,6 +148,7 @@ async def run_training(
                         max_steps=max_steps,
                         use_shaped_reward=use_shaped,
                         shaped_reward_weights=shaped_weights,
+                        task_reward_blend=task_reward_blend,
                     )
                     for _ in range(rollouts_per_group)
                 )
@@ -180,8 +183,8 @@ async def run_training(
                 "train/num_trajectories": len(all_trajs),
             }
             if use_shaped:
-                for key in ("action_fraction", "nl_fraction", "communicate_fraction",
-                            "termination_bonus", "efficiency"):
+                for key in ("action_fraction", "termination_bonus",
+                            "max_step_penalty", "repeat_message_penalty"):
                     vals = [t.metrics.get(key, -1.0) for t in all_trajs]
                     active = [v for v in vals if v >= 0]
                     if active:
@@ -227,7 +230,8 @@ async def run_training(
 
         # Validation
         if validation_tasks and batch.step % validation_interval == 0:
-            print(f"\n  Running validation on {len(validation_tasks)} tasks...")
+            print(f"\n  Running validation on {len(validation_tasks)} tasks "
+                  f"× {val_trials} trial(s)...")
             val_groups = []
             for task in validation_tasks:
                 scenario = Tau2TaskScenario(step=batch.step, task_id=task.id, domain=domain)
@@ -241,12 +245,13 @@ async def run_training(
                             agent_llm_args=agent_llm_args,
                             max_steps=max_steps,
                         )
+                        for _ in range(val_trials)
                     ])
                 )
             finished_val_groups = await art.gather_trajectory_groups(
                 val_groups,
                 pbar_desc="validation",
-                max_exceptions=len(validation_tasks),
+                max_exceptions=len(validation_tasks) * val_trials,
             )
             await model.log(finished_val_groups, split="val")
             val_trajs = [t for g in finished_val_groups for t in g.trajectories]

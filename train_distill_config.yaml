@@ -1,6 +1,7 @@
 # ART SFT-distillation configuration for tau2-bench.
-# Teacher (MiniMax-M2.5) plays tau2 as the agent; only successful rollouts
-# are used to supervised-fine-tune the student (Qwen3-30B-A3B-Instruct-2507).
+# Teacher (GLM-5.1 via Z.AI) plays tau2 as the agent; only successful rollouts
+# with clean tool use (no tool_not_found, no max-step) are used to
+# supervised-fine-tune the student (Qwen3-30B-A3B-Instruct-2507).
 # Override anything via CLI args (see train_tau2_distill.py --help).
 
 # ── Model ───────────────────────────────────────────────────────────
@@ -16,7 +17,11 @@ domain: "telecom"
 # Teacher temperature kept at 0.7 for trajectory diversity. Lowering it to
 # 0.3 in run kwt/tau2-ART-distill-04231209 produced redundant rollouts and
 # collapsed SFT leaderboard score to 0.83% (vs 7.5-27.5% with temp 0.7).
-teacher_llm: "wandb/MiniMaxAI/MiniMax-M2.5"
+# Switched from MiniMax-M2.5 to GLM-5.1 (top-3 on artificialanalysis.ai
+# tau2-Telecom leaderboard). Slug verified 200 OK via litellm.completion.
+# teacher_concurrency halved to 5 (was 10) until GLM-5.1 rate limits are
+# confirmed stable.
+teacher_llm: "wandb/zai-org/GLM-5.1"
 teacher_llm_args:
   temperature: 0.7
   max_tokens: 4096
@@ -31,13 +36,13 @@ user_llm_args:
 # Bumped 5 -> 8: last run yielded ~232 successful trajs from 5 rollouts/task.
 # 8 rollouts should produce ~370 (+60%), giving SFT more signal per task
 # without requiring a larger task set.
-teacher_rollouts_per_task: 8
+teacher_rollouts_per_task: 12
 # Bumped 4 -> 20 after kwt/tau2-ART-distill-05151739 showed val/success swinging
 # 25→100→75→25 across chunks because a single task flip on 4 tasks = 25pp. With
 # 20 val tasks the per-task noise drops to ±5pp, which is small enough that
 # best-step tracking (see early_stop_patience_evals + train_tau2_distill.py
 # best_sft_step) actually picks the right peak instead of a noisy outlier.
-num_validation_tasks: 20
+num_validation_tasks: 40
 # Bumped 30 -> 100 to match leaderboard.max_steps in train_config.yaml and
 # tau2's own default. Avoids train/eval mismatch where tasks needing 31-100
 # turns to succeed were silently dropped from the SFT training set.
@@ -49,7 +54,7 @@ filter_successful_only: true
 # knob is active.  Unset (null / absent) = default binary-success-only filter.
 # A/B this after confirming teacher_rollouts_per_task=8 is stable.
 # filter_min_shaped_reward: 0.5
-teacher_concurrency: 10
+teacher_concurrency: 5
 # When true, first run 1 probe rollout per task to find solvable tasks, then
 # concentrate the remaining (teacher_rollouts_per_task - 1) rollouts on those
 # solvable tasks only. Avoids wasting compute on tasks the teacher can't solve.
@@ -74,6 +79,9 @@ validation_every_n_chunks: 1
 # early_stop_patience_evals in train_config.yaml. Keeps over-trained chunks
 # from clobbering the best LoRA we already saved via .best_sft_step.
 early_stop_patience_evals: 3
+# Run 2 rollouts per validation task and average; halves per-checkpoint val
+# noise (SE drops from ~7-8 pp to ~5 pp at 40 tasks × 2 trials = 80 rollouts).
+validation_rollouts_per_task: 2
 
 # ── Datasets (W&B artifacts produced by upload_dataset_to_wandb.py) ─
 training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"

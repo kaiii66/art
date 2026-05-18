@@ -2,7 +2,7 @@
 ART SFT-distillation training script for tau2-bench.
 
 Pipeline:
-  Phase A. Run teacher LLM (MiniMax-M2.5) as the tau2 agent on training tasks
+  Phase A. Run teacher LLM (GLM-5.1 via Z.AI) as the tau2 agent on training tasks
            and capture each rollout as an SFT-ready Trajectory.
   Phase B. Optionally filter for successful teacher rollouts, then chunked
            supervised fine-tuning of the student (Qwen3-30B-A3B-Instruct-2507)
@@ -94,6 +94,24 @@ async def _run_teacher_pass(tasks, rollouts_per_task, config, label):
     return [t for t in results if t is not None]
 
 
+def _trajectory_has_clean_tool_use(traj) -> bool:
+    """Return True if the trajectory has no tool_not_found error and did not hit max steps.
+
+    Trajectories that end in success but contain role-confusion tool calls
+    (agent calling user-side tools) still carry the bad pattern in their
+    messages; SFT would memorise it. This filter keeps only truly clean traces.
+    """
+    msgs = traj.messages_and_choices
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") == "tool":
+            c = (m.get("content") or "").lower()
+            if "not found" in c:
+                return False
+    if traj.metadata.get("termination_reason") == "max_steps":
+        return False
+    return True
+
+
 async def generate_teacher_trajectories(training_tasks, config):
     """Run the teacher LLM on training tasks and return Trajectories.
 
@@ -175,10 +193,13 @@ async def generate_teacher_trajectories(training_tasks, config):
 async def run_student_validation(model, validation_tasks, config, step):
     """Run the student (ART model) on validation tasks; log to W&B.
 
-    Returns the mean val/reward over the validation trajectories (None when
-    there were no validation tasks or every rollout exceptioned). The caller
-    uses this to drive best-step tracking and early-stopping; see
-    `run_distillation_sft`.
+    Runs `validation_rollouts_per_task` rollouts per task (default 2) and
+    averages across all rollouts. Multiple trials halve per-checkpoint SE
+    compared to single-trial validation (from ~7-8 pp to ~5 pp at 40 tasks).
+
+    Returns the mean val/reward over all rollouts (None when there were no
+    validation tasks or every rollout exceptioned). The caller uses this to
+    drive best-step tracking and early-stopping; see `run_distillation_sft`.
     """
     if not validation_tasks:
         return None
@@ -186,8 +207,10 @@ async def run_student_validation(model, validation_tasks, config, step):
     user_llm = config["user_llm"]
     user_llm_args = config.get("user_llm_args", {"temperature": 1.0})
     max_steps = config.get("max_orchestrator_steps", 30)
+    trials = int(config.get("validation_rollouts_per_task", 1))
 
-    print(f"\n  [validation] running student on {len(validation_tasks)} tasks...")
+    print(f"\n  [validation] running student on {len(validation_tasks)} tasks "
+          f"× {trials} trial(s)...")
     val_groups = []
     for task in validation_tasks:
         scenario = Tau2TaskScenario(step=step, task_id=task.id, domain=domain)
@@ -200,12 +223,13 @@ async def run_student_validation(model, validation_tasks, config, step):
                     user_llm_args=user_llm_args,
                     max_steps=max_steps,
                 )
+                for _ in range(trials)
             ])
         )
     finished_val_groups = await art.gather_trajectory_groups(
         val_groups,
         pbar_desc="validation",
-        max_exceptions=len(validation_tasks),
+        max_exceptions=len(validation_tasks) * trials,
     )
     await model.log(finished_val_groups, split="val")
     val_trajs = [t for g in finished_val_groups for t in g.trajectories]
@@ -470,6 +494,9 @@ async def main(args):
     filter_successful_only: bool = config.get("filter_successful_only", True)
     filter_min_shaped_reward: float | None = config.get("filter_min_shaped_reward", None)
 
+    # ── Step 1: record total generated ──────────────────────────────────
+    num_total = len(teacher_trajectories)
+
     if filter_min_shaped_reward is not None:
         # Partial-credit mode: keep any trajectory whose shaped reward meets the
         # threshold, regardless of binary success.  filter_successful_only is
@@ -478,25 +505,45 @@ async def main(args):
             t for t in teacher_trajectories
             if t.reward >= filter_min_shaped_reward
         ]
-        dropped = len(teacher_trajectories) - len(kept)
         print(
             f"  filter_min_shaped_reward={filter_min_shaped_reward}: "
-            f"kept {len(kept)} / {len(teacher_trajectories)} "
-            f"(dropped {dropped} below threshold)"
+            f"kept {len(kept)} / {num_total} "
+            f"(dropped {num_total - len(kept)} below threshold)"
         )
     elif filter_successful_only:
         kept = [t for t in teacher_trajectories if t.metrics.get("success", 0.0) >= 1.0]
-        dropped = len(teacher_trajectories) - len(kept)
-        print(f"  filter_successful_only: kept {len(kept)} / {len(teacher_trajectories)} "
-              f"(dropped {dropped} failed)")
+        print(f"  filter_successful_only: kept {len(kept)} / {num_total} "
+              f"(dropped {num_total - len(kept)} failed)")
     else:
         kept = list(teacher_trajectories)
-        dropped = 0
         print(f"  no filter applied: keeping all {len(kept)} trajectories")
 
+    # ── Step 2: record success-filtered count ───────────────────────────
+    num_success = len(kept)
+
+    # ── Step 3: quality filter — drop trajectories with tool_not_found or
+    #    max-step termination even if they were scored as successful.
+    #    These carry role-confusion patterns that SFT would memorise.
+    clean_kept = [t for t in kept if _trajectory_has_clean_tool_use(t)]
+    num_clean_success = len(clean_kept)
+    kept = clean_kept
+
+    print(
+        f"  [filter funnel] total={num_total}  "
+        f"success={num_success} ({num_success / max(num_total, 1):.1%})  "
+        f"clean_success={num_clean_success} ({num_clean_success / max(num_total, 1):.1%})"
+    )
+
     wandb.log({
-        "teacher/kept_trajectories": len(kept),
-        "teacher/dropped_trajectories": dropped,
+        "teacher/num_total_trajectories":         num_total,
+        "teacher/num_success_trajectories":       num_success,
+        "teacher/num_clean_success_trajectories": num_clean_success,
+        "teacher/success_rate":                   num_success / max(num_total, 1),
+        "teacher/clean_rate_of_success":          num_clean_success / max(num_success, 1),
+        "teacher/clean_rate_of_total":            num_clean_success / max(num_total, 1),
+        # back-compat keys so existing dashboards keep working
+        "teacher/kept_trajectories":              num_clean_success,
+        "teacher/dropped_trajectories":           num_total - num_clean_success,
     })
     if not kept:
         print("No trajectories passed the filter. Cannot run SFT. Aborting.")

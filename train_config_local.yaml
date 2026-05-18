@@ -9,7 +9,7 @@
 #   uv run python local/upload_rl_lora.py  --config train_config_local.yaml
 
 # ── Model ─────────────────────────────────────────────────────────────
-project: "tau2-ART-distill-05162346"
+project: "tau2-ART-distill-05180253"
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # model_name is a BASE template. run_pipeline_local.py appends the run
 # suffix (MMDDHHMM) automatically, producing an isolated name like
@@ -17,7 +17,7 @@ base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # This gives each run its own .art/ checkpoint dir and its own W&B RL
 # artifact collection, so every run always starts fresh from the SFT LoRA.
 # sft_source.name (below) always points back to the original SFT baseline.
-model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260516-1646"
+model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260517-1953"
 
 # ── SFT source (pull_sft_lora.py) ─────────────────────────────────────
 # Identifies which W&B artifact to seed the local .art/ checkpoint dir from.
@@ -31,10 +31,11 @@ model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260516-1646"
 # run_full_pipeline.py auto-patches step to the integer best step after SFT
 # completes (reads pipeline_runs/<SUFFIX>/.best_sft_step). Keep "best" here as
 # the safer default for ad-hoc runs that share a snapshot dir.
+# GLM-5.1 teacher SFT run: best step=12, val/reward=0.725 (72.5%)
 sft_source:
   entity: "kwt"
-  project: "tau2-ART-distill-05162346"
-  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260516-1646"
+  project: "tau2-ART-distill-05180253"
+  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260517-1953"
   step: 7
 
 # ── Domain / tasks ────────────────────────────────────────────────────
@@ -64,16 +65,24 @@ user_llm_args:
 kl_penalty_coef: 0.04
 
 # ── Training hyperparameters ──────────────────────────────────────────
-groups_per_step: 1
+# Raised 1 -> 4: mtud1ncl (05180253 RL) showed groups_per_step=1 made per-step
+# variance ≥ signal — KL(policy||ref) stayed ~0 across all 9 grad steps because
+# each update saw only one task's reward signal. 4 groups = 4 tasks per update,
+# reducing gradient direction noise by ~2×. With KL anchor active locally,
+# 4×16÷2=32 grad steps per update is safe; monitor kl_policy_ref vs [3e-3, 2e-2].
+groups_per_step: 3
 num_epochs: 1
 rollouts_per_group: 16
-learning_rate: 1.0e-7
+# Raised 1e-7 -> 5e-7: mtud1ncl showed LR=1e-7 kept KL ~25× below the 3e-3
+# floor — policy was a no-op. Target loss/kl_policy_ref in [3e-3, 2e-2] by
+# step 5; if still under-shooting with groups_per_step=4, bump to 1e-6.
+learning_rate: 5.0e-7
 # Bumped 40 -> 60: with max_tokens=512 (down from 1024) the per-turn token
 # budget is halved, so 60 steps × ~300 avg tokens ≈ 18K tokens + ~3K prompt
 # overhead = ~21K < max_model_len=24576.  Closes the gap with the leaderboard's
 # max_steps=100 so the RL policy practices on longer episodes.
 # (Previous limit: 50 turns + 2048 tokens grew past 32K and OOMed.)
-max_orchestrator_steps: 60
+max_orchestrator_steps: 80
 
 # ── Validation & early stopping ───────────────────────────────────────
 # Dropped 2 -> 1: last run had only 12 RL steps = 6 validation points at
@@ -100,13 +109,18 @@ base_weave_dataset: "tau2-ART-telecom-base-scenarios"
 # ── Shaped reward ─────────────────────────────────────────────────────
 shaped_reward: true
 shaped_reward_weights:
-  action: 0.35
-  communicate: 0.10
-  nl_assertions: 0.30
-  termination: 0.15
-  tool_accuracy: 0.15
+  action: 0.55
+  termination: 0.20
+  tool_accuracy: 0.20
   tool_arg_accuracy: 0.05
   step_penalty: -0.10
+  max_step_penalty: -0.20
+  repeat_message_penalty: -0.05
+# Blend: 75% binary task reward + 25% shaped. Makes task completion
+# dominate while shaped components still provide gradient signal.
+task_reward_blend: 0.75
+# Run 2 rollouts per validation task; halves per-checkpoint SE.
+validation_rollouts_per_task: 2
 
 # ── Reproducibility ───────────────────────────────────────────────────
 random_seed: 42

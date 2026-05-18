@@ -55,11 +55,12 @@ user_llm_args:
 
 # ── Training hyperparameters ────────────────────────────────────────
 #current setup will take around 1 hour 20 minutes to train
-# Dropped 4 -> 1: 05110038 confirmed num_epochs=1 still produced 32 gradient
-# steps per GRPO update (4 groups × 16 rollouts ÷ batch=2) — too many with no
-# KL anchor. At groups_per_step=1: only 8 grad steps per update (16 rollouts
-# ÷ 2 per batch). Still samples 16 rollouts for advantage variance estimation.
-groups_per_step: 1
+# Raised 1 -> 4: mtud1ncl (05180253 RL) showed groups_per_step=1 made per-step
+# variance ≥ signal — KL(policy||ref) stayed ~0 across all 9 grad steps because
+# each update saw only one task's reward signal. 4 groups = 4 tasks per update,
+# reducing gradient direction noise by ~2×. With num_epochs=1 this gives 32
+# grad steps per GRPO update (4×16÷2); monitor grad_norm for collapse.
+groups_per_step: 4
 # Dropped 3 -> 1: 05101907 showed num_epochs=3 caused 19 grad steps per GRPO
 # update with no KL anchor, driving grad_norm=4.46 and policy collapse at step 0.
 # With 1 epoch we get ~6 grad steps per update — conservative without losing signal.
@@ -69,10 +70,12 @@ num_epochs: 1
 # least one rollout actually solves the task, giving GRPO a positive
 # example to climb toward instead of optimizing partial credit only.
 rollouts_per_group: 16
-# Lowered 5e-6 -> 1e-6 -> 5e-7 -> 1e-7: 05101907 confirmed LR=5e-7 with 19
-# grad steps/update (num_epochs=3) destroyed policy in 1 GRPO update. Now
-# num_epochs=1 cuts steps to ~6, and LR=1e-7 further tightens the leash.
-learning_rate: 1.0e-7
+# Raised 1e-7 -> 5e-7: mtud1ncl showed LR=1e-7 with groups_per_step=1 kept KL
+# ~25× below the 3e-3 floor — policy was a no-op. Target loss/kl_policy_ref in
+# [3e-3, 2e-2] by step 5; if still under-shooting with groups_per_step=4, bump
+# to 1e-6. (Prior concern: LR=5e-7 + num_epochs=3 = 19 grad steps → collapse;
+# now num_epochs=1 gives ~8 grad steps so 5e-7 is safe to retry.)
+learning_rate: 5.0e-7
 max_orchestrator_steps: 100
 # NOTE: kl_beta is currently NOT honored. The serverless ART backend's
 # train() API does not expose `beta`/`kl_penalty_coef`, so this value is
@@ -126,15 +129,22 @@ base_weave_dataset: "tau2-ART-telecom-base-scenarios"
 # ── Shaped reward (continuous 0-1 for GRPO signal) ─────────────────
 # When true, training uses fractional sub-metric scores instead of binary 0/1.
 # Baseline/leaderboard evaluation always uses the original binary reward.
+# nl_assertions and communicate removed: both were dead weight for the telecom
+# domain (tasks_full.json has no nl_assertions/communicate_info fields).
 shaped_reward: true
 shaped_reward_weights:
-  action: 0.35
-  communicate: 0.10
-  nl_assertions: 0.30
-  termination: 0.15
-  tool_accuracy: 0.15
+  action: 0.55
+  termination: 0.20
+  tool_accuracy: 0.20
   tool_arg_accuracy: 0.05
   step_penalty: -0.10
+  max_step_penalty: -0.20
+  repeat_message_penalty: -0.05
+# Blend: 75% binary task reward + 25% shaped. Makes task completion
+# dominate while shaped components still provide gradient signal.
+task_reward_blend: 0.75
+# Run 2 rollouts per validation task; halves per-checkpoint SE.
+validation_rollouts_per_task: 2
 
 # ── Reproducibility ─────────────────────────────────────────────────
 random_seed: 42

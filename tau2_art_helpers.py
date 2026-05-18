@@ -36,8 +36,6 @@ from tau2.environment.tool import Tool
 from tau2.data_model.simulation import TerminationReason
 from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
 from tau2.evaluator.evaluator_action import ActionEvaluator
-from tau2.evaluator.evaluator_communicate import CommunicateEvaluator
-from tau2.evaluator.evaluator_nl_assertions import NLAssertionsEvaluator
 from tau2.orchestrator.orchestrator import Orchestrator
 from tau2.registry import registry
 from tau2.user.user_simulator import UserSimulator
@@ -271,13 +269,13 @@ def _evaluate_and_get_reward(simulation, task, domain):
 
 
 DEFAULT_SHAPED_WEIGHTS = {
-    "action": 0.35,
-    "communicate": 0.10,
-    "nl_assertions": 0.30,
-    "termination": 0.15,
-    "tool_accuracy": 0.15,
+    "action": 0.55,
+    "termination": 0.20,
+    "tool_accuracy": 0.20,
     "tool_arg_accuracy": 0.05,
     "step_penalty": -0.10,
+    "max_step_penalty": -0.20,
+    "repeat_message_penalty": -0.05,
 }
 
 
@@ -312,29 +310,11 @@ def compute_shaped_reward(
     action_info = ActionEvaluator.calculate_reward(
         task=task, full_trajectory=simulation.messages,
     )
-    communicate_info = CommunicateEvaluator.calculate_reward(
-        task=task, full_trajectory=simulation.messages,
-    )
-    nl_info = NLAssertionsEvaluator.calculate_reward(
-        task=task, full_trajectory=simulation.messages,
-    )
 
     action_checks = action_info.action_checks or []
     action_fraction = (
         sum(1 for c in action_checks if c.action_match) / len(action_checks)
         if action_checks else None
-    )
-
-    comm_checks = communicate_info.communicate_checks or []
-    communicate_fraction = (
-        sum(1 for c in comm_checks if c.met) / len(comm_checks)
-        if comm_checks else None
-    )
-
-    nl_checks = nl_info.nl_assertions or []
-    nl_fraction = (
-        sum(1 for c in nl_checks if c.met) / len(nl_checks)
-        if nl_checks else None
     )
 
     proper_termination = simulation.termination_reason in {
@@ -362,16 +342,39 @@ def compute_shaped_reward(
     step_fraction = num_agent_steps / max_steps if max_steps > 0 else 0.0
     step_penalty = max(0.0, step_fraction - 0.5)
 
-    # Components: None means "not applicable for this task" (e.g. nl_assertions in telecom).
+    # max_step_penalty: 1.0 if the episode hit the orchestrator step limit (unresolved loop),
+    # else 0.0. Applied as a fixed penalty (weight -0.20).
+    max_step_penalty = 1.0 if simulation.termination_reason == TerminationReason.MAX_STEPS else 0.0
+
+    # repeat_message_penalty: fraction of consecutive identical assistant messages
+    # (capped at 5 repeats → 1.0). Targets "I'll send the payment request..." loops.
+    assistant_contents = [
+        msg.content or ""
+        for msg in simulation.messages
+        if isinstance(msg, AssistantMessage)
+    ]
+    max_consecutive_repeats = 0
+    current_repeats = 0
+    prev_content = None
+    for content in assistant_contents:
+        if content == prev_content:
+            current_repeats += 1
+            max_consecutive_repeats = max(max_consecutive_repeats, current_repeats)
+        else:
+            current_repeats = 0
+        prev_content = content
+    repeat_message_penalty = min(max_consecutive_repeats, 5) / 5.0
+
+    # Components: None means "not applicable for this task".
     # These are excluded from the weighted sum and their weight is redistributed.
     components = {
         "action": action_fraction,
-        "communicate": communicate_fraction,
-        "nl_assertions": nl_fraction,
         "termination": termination_bonus,
         "tool_accuracy": tool_accuracy,
         "tool_arg_accuracy": tool_arg_accuracy,
         "step_penalty": step_penalty,
+        "max_step_penalty": max_step_penalty,
+        "repeat_message_penalty": repeat_message_penalty,
     }
 
     # Separate positive-weight (reward) and negative-weight (penalty) components.
@@ -392,12 +395,12 @@ def compute_shaped_reward(
 
     sub_metrics = {
         "action_fraction": action_fraction if action_fraction is not None else -1.0,
-        "communicate_fraction": communicate_fraction if communicate_fraction is not None else -1.0,
-        "nl_fraction": nl_fraction if nl_fraction is not None else -1.0,
         "termination_bonus": termination_bonus,
         "tool_accuracy": tool_accuracy if tool_accuracy is not None else -1.0,
         "tool_arg_accuracy": tool_arg_accuracy if tool_arg_accuracy is not None else -1.0,
         "step_penalty": step_penalty,
+        "max_step_penalty": max_step_penalty,
+        "repeat_message_penalty": repeat_message_penalty,
         "shaped_reward": shaped_reward,
     }
     return shaped_reward, sub_metrics
@@ -596,6 +599,7 @@ async def tau2_rollout(
     agent_llm_args: Optional[dict] = None,
     use_shaped_reward: bool = False,
     shaped_reward_weights: Optional[dict] = None,
+    task_reward_blend: Optional[float] = None,
     pinned_step: Optional[int] = None,
     pinned_alias: Optional[str] = None,
 ) -> art.Trajectory:
@@ -608,6 +612,11 @@ async def tau2_rollout(
     When use_shaped_reward is True, traj.reward is set to the continuous shaped
     reward (for GRPO training signal) while the original binary reward is kept
     in traj.metrics["task_reward"].
+
+    task_reward_blend (0-1): when set alongside use_shaped_reward, blends binary
+    and shaped rewards: final = blend * binary + (1-blend) * shaped.
+    This makes task completion dominate while still propagating a gradient signal
+    through partial progress. Ignored when use_shaped_reward is False.
     """
     if user_llm_args is None:
         user_llm_args = {"temperature": 1.0}
@@ -736,8 +745,13 @@ async def tau2_rollout(
             max_steps=max_steps,
             binary_reward=binary_reward,
         )
-        reward = shaped_reward
+        if task_reward_blend is not None:
+            blend = float(task_reward_blend)
+            reward = blend * binary_reward + (1.0 - blend) * shaped_reward
+        else:
+            reward = shaped_reward
         metrics.update(sub_metrics)
+        metrics["shaped_reward"] = shaped_reward
     else:
         reward = binary_reward
 
