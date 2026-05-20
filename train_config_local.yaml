@@ -9,7 +9,7 @@
 #   uv run python local/upload_rl_lora.py  --config train_config_local.yaml
 
 # ── Model ─────────────────────────────────────────────────────────────
-project: "tau2-ART-distill-05180253"
+project: "tau2-ART-distill-05190200"
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # model_name is a BASE template. run_pipeline_local.py appends the run
 # suffix (MMDDHHMM) automatically, producing an isolated name like
@@ -17,7 +17,7 @@ base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # This gives each run its own .art/ checkpoint dir and its own W&B RL
 # artifact collection, so every run always starts fresh from the SFT LoRA.
 # sft_source.name (below) always points back to the original SFT baseline.
-model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260517-1953"
+model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260519-0201"
 
 # ── SFT source (pull_sft_lora.py) ─────────────────────────────────────
 # Identifies which W&B artifact to seed the local .art/ checkpoint dir from.
@@ -34,9 +34,9 @@ model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260517-1953"
 # GLM-5.1 teacher SFT run: best step=12, val/reward=0.725 (72.5%)
 sft_source:
   entity: "kwt"
-  project: "tau2-ART-distill-05180253"
-  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260517-1953"
-  step: 7
+  project: "tau2-ART-distill-05190200"
+  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260519-0201"
+  step: 10
 
 # ── Domain / tasks ────────────────────────────────────────────────────
 domain: "telecom"
