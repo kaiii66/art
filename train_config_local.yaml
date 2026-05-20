@@ -73,10 +73,12 @@ kl_penalty_coef: 0.04
 groups_per_step: 3
 num_epochs: 1
 rollouts_per_group: 16
-# Raised 1e-7 -> 5e-7: mtud1ncl showed LR=1e-7 kept KL ~25× below the 3e-3
-# floor — policy was a no-op. Target loss/kl_policy_ref in [3e-3, 2e-2] by
-# step 5; if still under-shooting with groups_per_step=4, bump to 1e-6.
-learning_rate: 5.0e-7
+# Raised 5e-7 -> 1e-6 after pipeline-05190200: with the stronger SFT seed
+# (leaderboard 0.7505), lr=5e-7 kept KL hugging 1e-4 and RL tied SFT at noise
+# (-0.0017 reward). 1e-6 should land KL in [3e-3, 2e-2] target band and give
+# the policy enough movement to actually beat SFT. groups_per_step kept at 3
+# (4+ OOMs on the current pod).
+learning_rate: 1.0e-6
 # Bumped 40 -> 60: with max_tokens=512 (down from 1024) the per-turn token
 # budget is halved, so 60 steps × ~300 avg tokens ≈ 18K tokens + ~3K prompt
 # overhead = ~21K < max_model_len=24576.  Closes the gap with the leaderboard's

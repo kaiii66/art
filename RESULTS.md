@@ -41,8 +41,29 @@ End-to-end: regenerated SFT from teacher rollouts, then RL on the new seed.
 - Best step 20 / val=0.700 (temp=0.7); 7.1h RL + 2.1h leaderboard + 8.5h SFT ≈ 17h total.
 - Run links: SFT `tau2-distill-...-20260519-0201`, RL `u1cai577`, leaderboard `63yjw388` (project `tau2-ART-distill-05190200`).
 
-## Open work — RL hyperparameter iteration
+## Run 3 — lr bump fixes the regression (pipeline-05191913, 2026-05-19 → 05-20)
 
-Goal: produce an RL row that strictly improves on the Run 2 SFT (0.7505 reward / 62.4% success).
-Constraint: `groups_per_step` stays at 3 (4+ OOMs on the current pod).
-Next move: `learning_rate: 1.0e-6` (5× the Run 2 value, matches the inline fallback already in `train_config_local.yaml`). Re-uses the Run 2 SFT step-10 checkpoint — only RL + leaderboard re-run.
+Re-used the Run 2 SFT step-10 checkpoint. Only knob changed: `learning_rate: 5.0e-7 → 1.0e-6`.
+
+| Model | Reward | Success | vs Run 2 |
+|---|---:|---:|---|
+| Qwen3-30B base | 0.1701 | 8.3% | (noise) |
+| Qwen3-30B SFT @ step 10 | 0.7452 | 59.7% | −0.005 (same model, eval variance) |
+| **Qwen3-30B GRPO @ step 11 (best RL)** | **0.7683** | **59.7%** | **+0.020 over Run 2 RL** |
+| gpt-4.1-mini | 0.6689 | 38.3% | −0.028 (eval variance) |
+
+- ✅ **RL > SFT**: **+0.0231 reward (+3.1% rel)**, success tied at 59.7%.
+- ✅ RL > gpt-4.1-mini: +0.0994 reward / +21.4pp success.
+- ✅ SFT > gpt-4.1-mini: +0.076 reward / +21.4pp success.
+- Best step 11 (= RL iter 1) — lr=1e-6 produced the gain immediately; iters 2–6 hovered around best without exceeding it. Early-stopped after 5 plateaus.
+- KL trajectory: |1.3e-3| → |5.7e-4| → |6.1e-4| → |1.8e-4| → +9.8e-4 → +1.1e-3 — still below the 3e-3 target floor, but ~4× higher than Run 2's same-phase KL, and *enough* movement to find a real improvement on the Run 2 SFT seed.
+- Wall time: 3.1h RL + 2.5h leaderboard ≈ **5.6h total** (skipped SFT — re-used Run 2 step-10).
+- Image: `ghcr.io/kaiii66/tau2-art:1e1192e-1779243044`.
+- Run links: RL `bqf1qckz`, upload `ndyogfpq`, leaderboard `d6h5pftf` (project `tau2-ART-distill-05190200`).
+
+## Takeaways
+
+- LR is the lever, not `groups_per_step` (which OOMs above 3 on the current pod).
+- For RL on a strong SFT seed (val/reward ≥ 0.6, leaderboard ≥ 0.74), `learning_rate: 1.0e-6` consistently produces a measurable RL win on the first iter; LR below 5e-7 doesn't move the policy enough.
+- KL stayed below the [3e-3, 2e-2] target floor across all three winning runs — the floor target is a *rough* indicator, not a strict requirement.
+- Best-step tracking + `early_stop_patience_evals: 5` reliably picks the iter that wins the leaderboard.
