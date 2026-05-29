@@ -51,6 +51,7 @@ from tau2_art_helpers import (
     Tau2BaseModelWrapper,
     score_task_reward,
     score_success,
+    score_error,
 )
 
 
@@ -179,7 +180,7 @@ async def main(
     weave.publish(dataset)
     print("Published leaderboard dataset from current validation data")
 
-    scorers = [score_success, score_task_reward]
+    scorers = [score_success, score_task_reward, score_error]
     eval_name = f"tau2-{domain}-evaluation-leaderboard-shaped"
     shared_evaluation = weave.Evaluation(
         name=eval_name,
@@ -381,6 +382,33 @@ async def main(
             "Add it to art/.env to enable the frontier-baseline row."
         )
 
+    if os.getenv("GEMINI_API_KEY"):
+        gemini_model_id = "gemini/gemini-3.5-flash"
+        gemini_display = f"{gemini_model_id} (frontier-baseline)"
+        gemini_agent_args = {**agent_llm_args}
+        gemini_agent_args.setdefault("temperature", 0.0)
+        gemini_wrapper = Tau2BaseModelWrapper(
+            name="gemini-3.5-flash",
+            model=None,
+            model_name=gemini_display,
+            domain=domain,
+            user_llm=user_llm,
+            user_llm_args=user_llm_args,
+            agent_llm_args=gemini_agent_args,
+            max_steps=max_steps,
+            agent_llm=gemini_model_id,
+            **shaped_kwargs,
+        )
+        models.append(gemini_wrapper)
+        model_names.append("gemini-3.5-flash")
+        display_names.append(gemini_display)
+        print(f"\nAdding Gemini 3.5 Flash agent row (GEMINI_API_KEY detected): {gemini_display}")
+    else:
+        print(
+            "\nSkipping Gemini 3.5 Flash row (GEMINI_API_KEY not set). "
+            "Add it to art/.env to enable the Gemini frontier-baseline row."
+        )
+
     if not models:
         print("\nNo models to evaluate.")
         run.finish()
@@ -425,6 +453,11 @@ async def main(
                 evaluation_object_ref=eval_ref_uri,
                 scorer_name="score_task_reward",
                 summary_metric_path="task_reward.mean",
+            ),
+            leaderboard.LeaderboardColumn(
+                evaluation_object_ref=eval_ref_uri,
+                scorer_name="score_error",
+                summary_metric_path="dropped.mean",
             ),
         ]
         leaderboard_spec = leaderboard.Leaderboard(

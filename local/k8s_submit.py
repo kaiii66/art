@@ -82,42 +82,49 @@ def _render_template(template_text: str, values: dict[str, str]) -> str:
     return result
 
 
-def _upsert_openai_secret(namespace: str, snapshot_dir: Path) -> None:
-    """Idempotently create/update the `openai` k8s secret from the local env.
+def _upsert_provider_secret(
+    namespace: str,
+    snapshot_dir: Path,
+    *,
+    env_var: str,
+    secret_name: str,
+    row_label: str,
+) -> None:
+    """Idempotently create/update a `{secret_name}` k8s secret from the local env.
 
     Resolution order:
-      1. OPENAI_API_KEY in the current process environment (covers CI and shells
-         that already have the key exported).
-      2. OPENAI_API_KEY in art/.env (dotenv file next to train_config_local.yaml).
+      1. ``{env_var}`` in the current process environment.
+      2. ``{env_var}`` in art/.env (dotenv file next to train_config_local.yaml).
 
     If neither source has the key, a warning is printed but the function returns
     without error — the Job template uses ``optional: true`` so pods start even
-    when the secret is absent; the gpt-4.1-mini row will simply be skipped.
+    when the secret is absent; the corresponding leaderboard row will simply be
+    skipped.
     """
-    key = os.environ.get("OPENAI_API_KEY")
+    key = os.environ.get(env_var)
     if not key:
         env_file = REPO_ROOT / ".env"
         if env_file.exists():
             for line in env_file.read_text().splitlines():
                 line = line.strip()
-                if line.startswith("OPENAI_API_KEY"):
+                if line.startswith(f"{env_var}="):
                     _, _, val = line.partition("=")
                     key = val.strip().strip('"').strip("'")
                     break
 
     if not key:
         print(
-            "[k8s_submit] WARNING: OPENAI_API_KEY not found in env or .env — "
-            "openai k8s secret NOT created; gpt-4.1-mini leaderboard row will be skipped.",
+            f"[k8s_submit] WARNING: {env_var} not found in env or .env — "
+            f"{secret_name} k8s secret NOT created; {row_label} leaderboard row will be skipped.",
             file=sys.stderr,
         )
         return
 
     # --dry-run=client | kubectl apply is idempotent: create-or-update.
-    secret_path = snapshot_dir / "openai_secret.yaml"
+    secret_path = snapshot_dir / f"{secret_name}_secret.yaml"
     dry_run = subprocess.run(
         [
-            "kubectl", "create", "secret", "generic", "openai",
+            "kubectl", "create", "secret", "generic", secret_name,
             f"--from-literal=api={key}",
             "-n", namespace,
             "--dry-run=client", "-o", "yaml",
@@ -128,7 +135,7 @@ def _upsert_openai_secret(namespace: str, snapshot_dir: Path) -> None:
     )
     if dry_run.returncode != 0:
         print(
-            f"[k8s_submit] WARNING: could not render openai secret: {dry_run.stderr.strip()}",
+            f"[k8s_submit] WARNING: could not render {secret_name} secret: {dry_run.stderr.strip()}",
             file=sys.stderr,
         )
         return
@@ -139,12 +146,28 @@ def _upsert_openai_secret(namespace: str, snapshot_dir: Path) -> None:
         check=False,
     )
     if result.returncode == 0:
-        print(f"[k8s_submit] openai k8s secret upserted in namespace {namespace!r}")
+        print(f"[k8s_submit] {secret_name} k8s secret upserted in namespace {namespace!r}")
     else:
         print(
-            f"[k8s_submit] WARNING: kubectl apply for openai secret failed (exit {result.returncode})",
+            f"[k8s_submit] WARNING: kubectl apply for {secret_name} secret failed (exit {result.returncode})",
             file=sys.stderr,
         )
+
+
+def _upsert_openai_secret(namespace: str, snapshot_dir: Path) -> None:
+    _upsert_provider_secret(
+        namespace, snapshot_dir,
+        env_var="OPENAI_API_KEY", secret_name="openai",
+        row_label="gpt-4.1-mini",
+    )
+
+
+def _upsert_gemini_secret(namespace: str, snapshot_dir: Path) -> None:
+    _upsert_provider_secret(
+        namespace, snapshot_dir,
+        env_var="GEMINI_API_KEY", secret_name="gemini",
+        row_label="gemini-3.5-flash",
+    )
 
 
 def _git_short_sha() -> str | None:
@@ -258,8 +281,11 @@ def main() -> int:
         print("=== (dry-run; kubectl not called) ===")
         return 0
 
-    # Upsert the openai k8s secret so the gpt-4.1-mini leaderboard row gets its key.
+    # Upsert provider secrets so the corresponding frontier-baseline leaderboard
+    # rows get their keys (both are optional; the row is skipped if the key is
+    # missing in .env and the secret cannot be created).
     _upsert_openai_secret(args.namespace, snapshot_dir)
+    _upsert_gemini_secret(args.namespace, snapshot_dir)
 
     print()
     print(f"[k8s_submit] kubectl apply -f {rendered_path}")

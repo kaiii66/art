@@ -822,14 +822,24 @@ class Tau2BaseModelWrapper(weave.Model):
                 pinned_alias=self.pinned_alias,
             )
         except Exception as e:
-            logger.warning("Leaderboard eval failed for task_id=%s (will be excluded from pass^k): %s", task_id, e)
-            raise
+            logger.warning("Leaderboard eval failed for task_id=%s: %s", task_id, e)
+            return {
+                "task_id": task_id,
+                "reward": 0.0,
+                "success": 0.0,
+                "termination_reason": "error",
+                "completion_tokens": 0,
+                "dropped": True,
+                "error_reason": str(e)[:200],
+            }
         return {
             "task_id": task_id,
             "reward": traj.reward,
             "success": traj.metrics.get("success", 0.0),
             "termination_reason": traj.metadata.get("termination_reason", "unknown"),
             "completion_tokens": traj.metadata.get("completion_tokens", 0),
+            "dropped": False,
+            "error_reason": "",
         }
 
 
@@ -894,6 +904,16 @@ def score_task_reward(model_output: dict) -> dict:
 def score_success(model_output: dict) -> dict:
     """Weave scorer: extracts the binary success flag (0/1)."""
     return {"success": model_output.get("success", 0.0)}
+
+
+@weave.op()
+def score_error(model_output: dict) -> dict:
+    """Weave scorer: flags task-trials dropped due to API/infra errors.
+
+    dropped.mean on the leaderboard reads as the fraction of task-trials
+    that errored out. 0.00 is clean; anything above 0.02 deserves a footnote.
+    """
+    return {"dropped": int(model_output.get("dropped", False))}
 
 
 # NOTE: A `fork_model_weights` helper used to live here, wrapping ART's
