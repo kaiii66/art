@@ -1,6 +1,9 @@
 """End-to-end local-RL pipeline orchestrator for tau2-bench.
 
 Stages (in order):
+  0. setup       Auto-generate the val split (idempotent — skips in <1s if
+                 val already exists in split_tasks.json; no --force so the
+                 committed split is always authoritative).
   1. pull_sft    Download the SFT LoRA from W&B into .art/ and write
                  .sft_endpoint_step + .last_trained_model next to the
                  snapshot config.
@@ -299,6 +302,17 @@ def main() -> int:
 
     run_cfg = yaml_load(local_cfg)
     run_model_name = run_cfg.get("model_name", "?")
+    _domain = run_cfg.get("domain", "telecom")
+
+    # Step 0 — auto-generate val split (idempotent: skips in <1s if val exists).
+    # No --force: the committed split is authoritative; only regenerate manually.
+    gen_cmd = [*UV_RUN, "python", "scripts/generate_val_split.py", "--domain", _domain]
+    run_stage(
+        "setup: generate val split (idempotent)",
+        gen_cmd,
+        snapshot / "00-generate-val-split.log",
+        dry_run=args.dry_run,
+    )
 
     print()
     print("=== local RL pipeline plan ===")
@@ -306,6 +320,7 @@ def main() -> int:
     print(f"    project          : {project}")
     print(f"    model_name       : {run_model_name}")
     print(f"    local_config     : {local_cfg}")
+    print(f"    domain           : {_domain}")
     print(f"    stages enabled   : {[s for s in ALL_STAGES if s not in skip]}")
     print(f"    stages skipped   : {sorted(skip)}")
     print(f"    publish_lb       : {not args.no_publish_leaderboard}")

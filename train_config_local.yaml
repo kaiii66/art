@@ -9,7 +9,7 @@
 #   uv run python local/upload_rl_lora.py  --config train_config_local.yaml
 
 # ── Model ─────────────────────────────────────────────────────────────
-project: "tau2-ART-distill-05190200"
+project: "tau2-ART-distill-06011448"
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # model_name is a BASE template. run_pipeline_local.py appends the run
 # suffix (MMDDHHMM) automatically, producing an isolated name like
@@ -17,7 +17,7 @@ base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # This gives each run its own .art/ checkpoint dir and its own W&B RL
 # artifact collection, so every run always starts fresh from the SFT LoRA.
 # sft_source.name (below) always points back to the original SFT baseline.
-model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260519-0201"
+model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260601-1448"
 
 # ── SFT source (pull_sft_lora.py) ─────────────────────────────────────
 # Identifies which W&B artifact to seed the local .art/ checkpoint dir from.
@@ -34,9 +34,9 @@ model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260519-0201"
 # GLM-5.1 teacher SFT run: best step=12, val/reward=0.725 (72.5%)
 sft_source:
   entity: "kwt"
-  project: "tau2-ART-distill-05190200"
-  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260519-0201"
-  step: 10
+  project: "tau2-ART-distill-06011448"
+  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260601-1448"
+  step: 12
 
 # ── Domain / tasks ────────────────────────────────────────────────────
 domain: "telecom"
@@ -108,8 +108,14 @@ rl_prefilter_keep_band: [0.10, 0.90]
 # ── Datasets ──────────────────────────────────────────────────────────
 training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
 training_weave_dataset: "tau2-ART-telecom-training-scenarios"
-validation_dataset_artifact: "tau2-ART-telecom-validation-scenarios:latest"
-validation_weave_dataset: "tau2-ART-telecom-validation-scenarios"
+# val split: drawn from full-base pool (disjoint from train and test)
+# used for checkpoint selection / early stopping during training
+validation_dataset_artifact: "tau2-ART-telecom-val-scenarios:latest"
+validation_weave_dataset: "tau2-ART-telecom-val-scenarios"
+validation_task_split: "val"
+# test split: clean holdout, never seen during training; used only by leaderboard
+leaderboard_dataset_artifact: "tau2-ART-telecom-test-scenarios:latest"
+leaderboard_weave_dataset: "tau2-ART-telecom-test-scenarios"
 base_weave_dataset: "tau2-ART-telecom-base-scenarios"
 
 # ── Shaped reward ─────────────────────────────────────────────────────
@@ -134,11 +140,11 @@ validation_rollouts_per_task: 4
 random_seed: 42
 
 # ── Leaderboard evaluation ────────────────────────────────────────────
-leaderboard_trained_model_name: tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260519-0201-rl-05201134
-leaderboard_trained_model_step: 12
+leaderboard_trained_model_name:
+leaderboard_trained_model_step:
 
 leaderboard:
-  num_trials: 5
+  num_trials: 3
   max_steps: 100
   agent_llm_args:
     temperature: 0.0

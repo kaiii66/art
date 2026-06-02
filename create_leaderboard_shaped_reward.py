@@ -93,7 +93,14 @@ async def main(
     # bare base model.
     agent_llm = config.get("agent_llm") or f"wandb/{base_model}"
     user_llm = config["user_llm"]
-    eval_weave = config.get("validation_weave_dataset") or f"tau2-{domain}-validation-scenarios"
+    # Prefer the dedicated leaderboard dataset (test split, clean holdout).
+    # Fall back to validation_weave_dataset for configs that pre-date the split
+    # (e.g. old pipeline_runs snapshots that don't have leaderboard_weave_dataset).
+    eval_weave = (
+        config.get("leaderboard_weave_dataset")
+        or config.get("validation_weave_dataset")
+        or f"tau2-{domain}-validation-scenarios"
+    )
     trained_name = trained_model_name or config.get("leaderboard_trained_model_name")
     if not trained_name:
         last_model_file = Path(config_path).resolve().parent / ".last_trained_model"

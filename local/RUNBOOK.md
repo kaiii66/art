@@ -3,206 +3,294 @@
 Two pipelines, run in order. Skip step 1 if SFT already exists in W&B.
 
 ```
-[teacher data] ──► [SFT job] ──► SFT LoRA on W&B  ──► [Local RL pipeline] ──► Leaderboard
-                                  (step 16)              (this repo)
+[teacher data] ──► [SFT job] ──► SFT LoRA on W&B ──► [RL pipeline] ──► Leaderboard
+                                   (serverless)         (on-prem GPU)
 ```
+
+The single entry-point `run_full_pipeline.py` handles all stages. It supports two
+submission backends for the RL job: **vanilla Kubernetes** (`--k8s`, the original path)
+and **SUNK / Slurm-on-Kubernetes** (`--slurm`, the current production path on the
+`training` cluster).
 
 ---
 
 ## 0. One-time setup
 
-Required on your dev pod (the box where you run these commands).
+### 0a. Environment variables (`.env`)
 
 ```bash
-# 1. Env vars (in /home/coder/art/.env)
-WANDB_API_KEY=wandb_v1_...     # personal W&B token; must have access to entity 'kwt'
-HF_TOKEN=hf_...                # HuggingFace token (Qwen3-30B-A3B-Instruct-2507 weights)
+# /home/coder/art/.env
+WANDB_API_KEY=wandb_v1_...   # W&B token; must have write access to entity 'kwt'
+HF_TOKEN=hf_...              # HuggingFace token (for Qwen3-30B-A3B-Instruct-2507)
 WANDB_ENTITY=kwt
+GHCR_USER=kaiii66            # GitHub Container Registry username
 
-# 2. GHCR auth (for docker push)
-echo $CR_PAT | docker login ghcr.io -u kaiii66 --password-stdin
+# Frontier-baseline leaderboard rows (optional but recommended)
+OPENAI_API_KEY=sk-...        # adds gpt-4.1-mini row to every leaderboard
+GEMINI_API_KEY=...           # adds gemini-3.5-flash row to every leaderboard
+```
 
-# 3. K8s secrets in tau2 namespace (one-time)
-kubectl get secret wandb hf ghcr -n tau2   # should exist already
+`OPENAI_API_KEY` and `GEMINI_API_KEY` are **optional** — the pipeline runs fine
+without them, but the leaderboard will only show base / sft / rl rows. Add them
+to get the frontier-baseline comparison rows automatically.
+
+### 0b. GHCR auth (for docker push + enroot image pull)
+
+The Docker image must be pushed to GHCR and pulled on the cluster by enroot.
+Both require a base64-encoded auth entry in `~/.docker/config.json` — **not** a
+credential helper (`credsStore`).
+
+```bash
+# One-time login (writes base64 auth to ~/.docker/config.json):
+echo $GHCR_PAT | docker login ghcr.io -u kaiii66 --password-stdin
+
+# Verify it wrote a base64 auth (not a credsStore pointer):
+python3 -c "import json; d=json.load(open('$HOME/.docker/config.json')); print(d['auths']['ghcr.io'])"
+# Should print: {'auth': 'a2Fp...'}  NOT {'credsStore': '...'}
+```
+
+### 0c. KUBECONFIG
+
+```bash
+# SUNK (training) cluster — use this for --slurm runs:
+export KUBECONFIG=/home/coder/.kube/training
+kubectl config use-context training
+
+# Original ray cluster — use this for vanilla K8s runs:
+export KUBECONFIG=/home/coder/.kube/config-cwb607-ray
+```
+
+### 0d. SUNK cluster: bootstrap `tau2` namespace (one-time per cluster)
+
+The SUNK cluster needs PVCs and secrets created once before the first run:
+
+```bash
+export KUBECONFIG=/home/coder/.kube/training
+
+# Namespace + PVCs
+kubectl create namespace tau2
+kubectl apply -n tau2 -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tau2-artifacts
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: shared-vast
+  resources:
+    requests:
+      storage: 500Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tau2-data
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: shared-vast
+  resources:
+    requests:
+      storage: 100Gi
+EOF
+
+# Secrets
+source /home/coder/art/.env
+kubectl create secret generic wandb --from-literal=api="$WANDB_API_KEY" -n tau2
+kubectl create secret generic hf    --from-literal=token="$HF_TOKEN"    -n tau2
+python3 -c "
+import json, base64
+d = json.load(open('$HOME/.docker/config.json'))
+auth = d['auths']['ghcr.io']['auth']
+user, _, token = base64.b64decode(auth).decode().partition(':')
+print(token.strip())
+" | xargs -I{} kubectl create secret docker-registry ghcr \
+    --docker-server=ghcr.io --docker-username=kaiii66 --docker-password={} -n tau2
+```
+
+### 0e. Vanilla K8s cluster: bootstrap `tau2` namespace (one-time)
+
+Same as above but apply to the `ray` cluster context. The `wandb`, `hf`, and `ghcr`
+secrets must exist in the `tau2` namespace before submitting a job.
+
+---
+
+## 1. Full pipeline — one command
+
+### SUNK / Slurm (current production path)
+
+```bash
+cd /home/coder/art
+export KUBECONFIG=/home/coder/.kube/training
+
+SUFFIX=$(TZ=America/Los_Angeles date +%m%d%H%M)
+uv run python run_full_pipeline.py --slurm --suffix $SUFFIX --tail \
+    2>&1 | tee pipeline_runs/full_run_$SUFFIX.log
+```
+
+This runs all stages end-to-end (~4–6 h total):
+1. Generate val split (idempotent, <1 s)
+2. Upload train/val/test/base datasets to W&B + Weave
+3. SFT via serverless backend (~1 h)
+4. Patch `train_config_local.yaml` with SFT artifact coordinates
+5. Docker build + push to GHCR (~30 min)
+6. Submit Slurm batch job via the login pod (`sbatch` through `kubectl exec`)
+7. On the cluster: pull SFT LoRA → GRPO RL training → upload RL checkpoint → leaderboard
+
+When it finishes, results are at:
+```
+https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1
+```
+
+### Vanilla Kubernetes (original path, `ray` cluster)
+
+```bash
+cd /home/coder/art
+export KUBECONFIG=/home/coder/.kube/config-cwb607-ray
+
+SUFFIX=$(TZ=America/Los_Angeles date +%m%d%H%M)
+uv run python run_full_pipeline.py --suffix $SUFFIX --tail \
+    2>&1 | tee pipeline_runs/full_run_$SUFFIX.log
 ```
 
 ---
 
-## 1. SFT (one-time per dataset / base model)
+## 2. Resume points (reuse the same `$SUFFIX`)
 
-Produces a LoRA checkpoint at W&B path
-`kwt/<project>/<sft-collection-name>:step16`.
-
-If you already have one (e.g. `tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260511-1101:step16`),
-**skip this section**.
-
-To run SFT from scratch, use the existing cloud pipeline:
+After any failure, resume from the right stage rather than restarting from scratch:
 
 ```bash
-cd /home/coder/art
+# SFT done — fix RL/infra/code, then rebuild image and resubmit:
+uv run python run_full_pipeline.py --slurm --suffix $SUFFIX --skip-sft --tail
 
-# Uploads teacher trajectories → runs SFT → stops before RL/leaderboard.
-# This produces the SFT artifact your RL pipeline will start from.
-uv run python run_pipeline.py --skip rl leaderboard
+# SFT done + image already correct (e.g. fixing Slurm config only):
+uv run python run_full_pipeline.py --slurm --suffix $SUFFIX --skip-sft --skip-build --tail
+
+# Dry-run: render the sbatch script without submitting:
+uv run python local/slurm_submit.py \
+    --image-tag ghcr.io/kaiii66/tau2-art:<sha>-$SUFFIX \
+    --suffix $SUFFIX --dry-run
 ```
-
-After completion, note the **collection name** that was created (in
-`pipeline_runs/<MMDDHHMM>/.last_trained_model`) — you'll point the RL pipeline
-at that name in step 2.
 
 ---
 
-## 2. Local on-prem RL pipeline
+## 3. Slurm-specific flags
 
-Runs: `pull_sft → rl (GRPO with KL anchor) → upload_rl → leaderboard`.
+All `--slurm-*` flags have sensible defaults for this cluster. Override only when needed:
 
-### 2a. Update `train_config_local.yaml`
+| Flag | Default | When to change |
+|------|---------|----------------|
+| `--slurm-namespace` | `tenant-slurm` | Different Slurm deployment namespace |
+| `--slurm-login-pod` | `slurm-login-0` | Login pod was recreated with a different name |
+| `--slurm-login-container` | `sshd` | Container name inside the login pod |
+| `--nfs-base` | `/mnt/data/kai` | Your username/path on the shared NFS |
+| `--slurm-partition` | `h100` | Different GPU partition |
+| `--slurm-time-limit` | `08:00:00` | Longer for large task sets (use `16:00:00` to be safe) |
 
-Edit one block to point at the SFT collection from step 1:
-
-```yaml
-project: "tau2-ART-distill-05111101"
-base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
-model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260511-1101"
-
-sft_source:
-  entity: "kwt"
-  project: "tau2-ART-distill-05111101"
-  name:   "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260511-1101"
-  step:   "latest"   # or a specific integer like 16
-```
-
-The remaining hyperparameters in that file are the validated ones from this
-work — leave them alone unless you know why you're changing them
-(see `RUN_SUMMARY.md` for the rationale).
-
-### 2b. Build & push the container image
-
+Example override:
 ```bash
-cd /home/coder/art
-
-IMAGE_TAG=ghcr.io/kaiii66/tau2-art:$(git rev-parse --short HEAD)
-docker build --progress=plain -f onprem/Dockerfile.art-rl -t "$IMAGE_TAG" . \
-  2>&1 | tee /tmp/docker-build.log
-docker push "$IMAGE_TAG"
+uv run python run_full_pipeline.py --slurm --suffix $SUFFIX \
+    --nfs-base /mnt/data/myname \
+    --slurm-time-limit 16:00:00 \
+    --tail
 ```
 
-⚠️ kubelet caches images by tag and ignores `imagePullPolicy: Always` when the
-tag is unchanged. If you rebuilt without bumping the git SHA (uncommitted
-changes), append a fresh suffix:
+---
 
+## 4. Monitoring
+
+### Slurm job status
 ```bash
-IMAGE_TAG=ghcr.io/kaiii66/tau2-art:$(git rev-parse --short HEAD)-$(date +%s)
-docker build ...; docker push ...
+export KUBECONFIG=/home/coder/.kube/training
+
+# Queue
+kubectl exec -n tenant-slurm slurm-login-0 -c sshd -- squeue
+
+# Live log (JOBID is printed by slurm_submit and saved in k8s_manifest.json)
+kubectl exec -n tenant-slurm slurm-login-0 -c sshd -- \
+    tail -f /mnt/data/kai/logs/tau2-$SUFFIX-<JOBID>.log
+
+# Or read JOBID from the manifest:
+JOBID=$(python3 -c "import json; print(json.load(open('pipeline_runs/$SUFFIX/k8s_manifest.json'))['slurm_job_id'])")
+kubectl exec -n tenant-slurm slurm-login-0 -c sshd -- \
+    tail -f /mnt/data/kai/logs/tau2-$SUFFIX-$JOBID.log
 ```
 
-### 2c. Smoke test (optional, ~30 min)
+### W&B / Weave
+```
+https://wandb.ai/kwt/<project>                                          ← W&B run metrics
+https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1
+```
 
-Run 4 tasks only, skip the upload + leaderboard stages.
-
+### Vanilla K8s job status
 ```bash
-uv run python local/k8s_submit.py \
-    --image-tag "$IMAGE_TAG" \
-    --skip-stages "upload_rl leaderboard" \
-    --num-tasks 4
-
-# Tail logs (job name will be tau2-art-rl-MMDDHHMM)
-kubectl get job -n tau2 -l app.kubernetes.io/component=art-rl -w
-kubectl logs -f job/tau2-art-rl-<MMDDHHMM> -n tau2
+kubectl get job tau2-art-rl-$SUFFIX -n tau2
+kubectl logs -f job/tau2-art-rl-$SUFFIX -n tau2
 ```
 
-Success criteria:
-- A `[best-step] new best val/reward=…` line appears
-- `loss/kl_policy_ref` is non-zero (visible in the wandb run linked from
-  the log)
-- Pod ends with `phase=Succeeded`
+---
 
-### 2d. Full run (~3 h)
+## 5. Known issues and fixes
 
-```bash
-uv run python local/k8s_submit.py --image-tag "$IMAGE_TAG"
+### Fused MoE LoRA load failure
+**Symptom:** `ValueError: Target module ModuleList(... Qwen3MoeMLP ...) is not supported`
+during the `pull_sft` or vLLM startup stage.
 
-# Monitor
-kubectl get job -n tau2 -l app.kubernetes.io/component=art-rl -w
-kubectl logs -f job/tau2-art-rl-<MMDDHHMM> -n tau2
-```
+**Cause:** The SFT checkpoint's `adapter_config.json` has `"experts"` in `target_modules`
+(added by Unsloth for Qwen3-MoE). Standard PEFT cannot load a fused MoE adapter without
+first converting it.
 
-The run prints stage markers (`=== stage: rl ===`, `=== stage: upload_rl ===`,
-`=== stage: leaderboard ===`, `=== done ===`). When you see
-`Leaderboard published: ObjectRef(…)` the job is essentially done.
+**Fix** (already applied in `local/pull_sft_lora.py`): after download, the script calls
+`art.utils.convert_moe_lora.convert_checkpoint_if_needed()` and strips `"experts"` from
+`target_modules`. This is a no-op for non-MoE checkpoints. No action needed unless you
+see the symptom — it means the fix didn't apply for some reason.
 
-Final outputs:
+### Slurm wall-clock timeout
+**Symptom:** job status `TIMEOUT`; RL was still training.
 
-| Output | Where |
-|--------|-------|
-| RL LoRA checkpoints | W&B artifacts: `kwt/<project>/<model_name>-rl-<MMDDHHMM>:step{N}` |
-| Best step + val reward | Printed to log; sidecar `pipeline_runs/<MMDDHHMM>/.best_rl_step` (inside the pod, lost on pod death) |
+**Fix:** resubmit with `--slurm-time-limit 16:00:00`. A full run (RL up to 100 steps
++ leaderboard) fits comfortably in 16 h on 8× H100.
+
+### GHCR image pull failure in the compute pod
+**Symptom:** `[ERROR] URL https://ghcr.io/token returned error code: 401 Unauthorized`
+in the Slurm job log.
+
+**Fix:** the enroot credential file must be on the NFS share (not the login pod's local
+filesystem). Re-run with `--skip-sft --skip-build` — `slurm_submit.py` rewrites the
+credential file to `$NFS_BASE/.config/enroot/.credentials` on every submit.
+
+---
+
+## 6. Output artifacts
+
+| Artifact | Location |
+|----------|----------|
+| SFT LoRA checkpoints | `W&B: kwt/<project>/<model_name>:step{N}` |
+| RL LoRA checkpoints | `W&B: kwt/<project>/<model_name>-rl-<SUFFIX>:step{N}` |
+| RL best step | `pipeline_runs/$SUFFIX/.best_rl_step` (on NFS inside the pod) |
 | Weave leaderboard | `https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1` |
-| W&B run | `https://wandb.ai/kwt/<project>/runs/<id>` (link printed in log) |
+| Run audit trail | `pipeline_runs/$SUFFIX/AUTOPILOT_NOTES.md` |
+| Docker image | `ghcr.io/kaiii66/tau2-art:<git-sha>-<SUFFIX>` |
 
 ---
 
-## 3. Re-running just the leaderboard
-
-If training finished but you want to re-eval (e.g. after improving the
-leaderboard script), the only supported path right now is a **fresh full
-run** — because the snapshot dir lives inside the pod's local FS and is
-lost on pod death.
-
-Workaround if your RL LoRA is already on W&B at a known step:
+## 7. Quick reference
 
 ```bash
-# Edit train_config_local.yaml to add:
-#   leaderboard_trained_model_name: tau2-distill-...-rl-<SUFFIX>
-#   leaderboard_trained_model_step: 17    # the step you want to eval
-
-# Then submit with --skip-stages "pull_sft rl upload_rl" and a custom suffix:
-uv run python local/k8s_submit.py \
-    --image-tag "$IMAGE_TAG" \
-    --skip-stages "pull_sft rl upload_rl" \
-    --suffix 05151200
-```
-
-(There's a TODO to make this nicer — see RUN_SUMMARY.md.)
-
----
-
-## 4. Debugging a failing run
-
-The k8s pod prints to stdout (visible via `kubectl logs`). When training
-fails, three places to look:
-
-1. **`kubectl logs -f job/<name> -n tau2`** — main stream.
-2. Inside the running pod (while alive):
-   ```bash
-   POD=$(kubectl get pod -n tau2 -l job-name=<name> -o jsonpath='{.items[0].metadata.name}')
-   kubectl exec -n tau2 $POD -- bash -c 'cat /workspace/pipeline_runs/<suffix>/02-rl.log | tail -100'
-   ```
-3. **W&B run** linked from the log — has metrics over time
-   (`loss/kl_policy_ref`, `loss/grad_norm`, `train/reward`, `val/reward`).
-
-Common failure modes and their causes are documented in `RUN_SUMMARY.md`
-("What broke and how it was fixed").
-
----
-
-## Quick reference
-
-```bash
-# Full pipeline, fresh image, all stages:
+# ── SUNK full run ──────────────────────────────────────────────────────────
+export KUBECONFIG=/home/coder/.kube/training
 cd /home/coder/art
-IMAGE=ghcr.io/kaiii66/tau2-art:$(git rev-parse --short HEAD)
-docker build -f onprem/Dockerfile.art-rl -t $IMAGE . && docker push $IMAGE
-uv run python local/k8s_submit.py --image-tag $IMAGE
+SUFFIX=$(TZ=America/Los_Angeles date +%m%d%H%M)
+uv run python run_full_pipeline.py --slurm --suffix $SUFFIX --tail \
+    2>&1 | tee pipeline_runs/full_run_$SUFFIX.log
 
-# Smoke test (4 tasks, no leaderboard, ~30 min):
-uv run python local/k8s_submit.py --image-tag $IMAGE \
-    --skip-stages "upload_rl leaderboard" --num-tasks 4
+# ── Resume after failure (SFT done) ───────────────────────────────────────
+uv run python run_full_pipeline.py --slurm --suffix $SUFFIX --skip-sft --tail
 
-# Watch:
-kubectl get job -n tau2 -l app.kubernetes.io/component=art-rl -w
-kubectl logs -f job/tau2-art-rl-<MMDDHHMM> -n tau2
+# ── Watch the Slurm job ────────────────────────────────────────────────────
+JOBID=$(python3 -c "import json; print(json.load(open('pipeline_runs/$SUFFIX/k8s_manifest.json'))['slurm_job_id'])")
+kubectl exec -n tenant-slurm slurm-login-0 -c sshd -- \
+    tail -f /mnt/data/kai/logs/tau2-$SUFFIX-$JOBID.log
 
-# Leaderboard URL when done:
-echo https://wandb.ai/kwt/tau2-ART-distill-05111101/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1
+# ── Leaderboard URL ────────────────────────────────────────────────────────
+python3 -c "import json; p=json.load(open('pipeline_runs/$SUFFIX/k8s_manifest.json'))['wandb_project']; print(f'https://wandb.ai/kwt/{p}/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1')"
 ```

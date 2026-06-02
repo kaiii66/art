@@ -65,9 +65,7 @@ COPY . .
 # packages not in uv.lock (including openpipe-art[backend] which we installed
 # explicitly in the previous layer).  --no-deps is safe because tau2's runtime
 # deps are already satisfied by the earlier `uv sync --no-install-project`.
-RUN uv pip install --no-deps .
-
-# ── Entrypoint ────────────────────────────────────────────────────────────────
-RUN chmod +x /workspace/onprem/scripts/run_art_rl.sh
+RUN uv pip install --no-deps . \
+    && chmod +x /workspace/onprem/scripts/run_art_rl.sh
 
 CMD ["/workspace/onprem/scripts/run_art_rl.sh"]

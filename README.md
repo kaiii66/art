@@ -51,26 +51,36 @@ Run in that order. For more options, see each script's `--help` or docstring.
 > GRPO pipeline (Kubernetes + 8×H100 + KL-anchored LoRA training), see the
 > next section.
 
-## End-to-End Pipeline: SFT → RL → Leaderboard (on-prem Kubernetes)
+## End-to-End Pipeline: SFT → RL → Leaderboard (on-prem GPU)
 
 This repo includes a full on-prem RL pipeline that takes a teacher-distilled
-SFT checkpoint, runs KL-anchored GRPO training on a Kubernetes-managed H100
-node, and publishes a Weave leaderboard comparing **base / SFT / RL** rows.
+SFT checkpoint, runs KL-anchored GRPO training on an 8×H100 node, and
+publishes a Weave leaderboard comparing **base / SFT / RL** rows (plus
+optional frontier-baseline rows for gpt-4.1-mini and Gemini).
 
 ```
-[teacher trajectories] ──► [SFT (axolotl on k8s)] ──► SFT LoRA on W&B
-                                                              │
-                                                              ▼
-            ┌─────────── local/run_pipeline_local.py ───────────┐
-            │ pull_sft → rl (LocalBackend) → upload_rl → leaderboard │
-            └────────────────────────────────────────────────────┘
-                                                              │
-                                                              ▼
-                                                Weave leaderboard
-                                              (base / SFT / RL rows)
+[teacher trajectories] ──► [SFT (serverless)] ──► SFT LoRA on W&B
+                                                          │
+                                                          ▼
+          ┌──────────── local/run_pipeline_local.py ────────────┐
+          │ pull_sft → rl (LocalBackend) → upload_rl → leaderboard │
+          └────────────────────────────────────────────────────────┘
+                                                          │
+                                                          ▼
+                                              Weave leaderboard
+                                         (base / SFT / RL / frontier rows)
 ```
 
-Detailed runbook: [`local/RUNBOOK.md`](local/RUNBOOK.md).
+The pipeline supports two GPU submission backends:
+
+| Backend | Flag | When to use |
+|---------|------|-------------|
+| **SUNK / Slurm** | `--slurm` | Clusters running [SUNK](https://docs.coreweave.com/products/sunk) (Slurm-on-Kubernetes) — current production path |
+| **Vanilla Kubernetes** | _(default)_ | Plain K8s clusters with a `tau2` namespace and GPU nodes |
+
+> **Full step-by-step instructions, known-issue playbook, and monitoring commands:**
+> **[`local/RUNBOOK.md`](local/RUNBOOK.md)**
+
 Architecture write-up: [`local/RUN_SUMMARY.md`](local/RUN_SUMMARY.md).
 
 ### Prerequisites
@@ -84,8 +94,13 @@ uv venv .venv && source .venv/bin/activate && uv pip install -e .
 WANDB_API_KEY=wandb_v1_...     # personal W&B token
 HF_TOKEN=hf_...                # for downloading Qwen3-30B-A3B-Instruct-2507
 WANDB_ENTITY=kwt
+GHCR_USER=<gh-user>            # GitHub Container Registry username
+OPENAI_API_KEY=sk-...          # optional — adds gpt-4.1-mini leaderboard row
+GEMINI_API_KEY=...             # optional — adds Gemini leaderboard row
 
 # 3. Docker daemon + GHCR auth
+# Must write a base64 auth entry (not a credsStore pointer) so enroot can pull
+# the image on SUNK compute nodes without a credential helper.
 echo "$CR_PAT" | docker login ghcr.io -u <gh-user> --password-stdin
 
 # 4. Kubernetes namespace + PVCs + secrets (one-time bootstrap)
@@ -134,44 +149,55 @@ kubectl get pvc,secret -n "$NS"
 
 ### Quick (single command)
 
-After the one-time bootstrap above (PVCs + secrets + `.env`), the whole
-pipeline can be driven from a single entry point:
+After the one-time bootstrap (PVCs + secrets + `.env`), the whole pipeline
+runs from a single entry point. Set `KUBECONFIG` to match your cluster first.
 
 ```bash
-# Full pipeline (~3 h) — SFT → patch config → build/push image → k8s Job
-# → leaderboard. The suffix is auto-generated as MMDDHHMM (US/Pacific) and
-# shared across SFT and RL, so cross-stage state stays correlated.
-uv run python run_full_pipeline.py --tail
+# ── SUNK / Slurm (current production path) ────────────────────────────────
+export KUBECONFIG=/home/coder/.kube/training
+SUFFIX=$(TZ=America/Los_Angeles date +%m%d%H%M)
+uv run python run_full_pipeline.py --slurm --suffix $SUFFIX --tail \
+    2>&1 | tee pipeline_runs/full_run_$SUFFIX.log
 ```
 
 ```bash
-# Smoke test (~30 min) — 4-task RL only; skips upload_rl + leaderboard.
-uv run python run_full_pipeline.py --smoke --tail
+# ── Vanilla Kubernetes ─────────────────────────────────────────────────────
+export KUBECONFIG=/home/coder/.kube/config-cwb607-ray
+SUFFIX=$(TZ=America/Los_Angeles date +%m%d%H%M)
+uv run python run_full_pipeline.py --suffix $SUFFIX --tail \
+    2>&1 | tee pipeline_runs/full_run_$SUFFIX.log
 ```
 
+Both commands run all stages end-to-end (~4–6 h): SFT → patch config →
+docker build/push → submit GPU job → pull_sft → RL → upload → leaderboard.
+The suffix is auto-generated as `MMDDHHMM` (US/Pacific) and shared across all
+stages so cross-stage state stays correlated. A snapshot copy of every
+patched config lives at `pipeline_runs/<SUFFIX>/` for the audit trail.
+
+**Resume after failure** (reuse the same `$SUFFIX`):
 ```bash
-# Re-use an existing SFT snapshot (e.g., when debugging the RL side):
-uv run python run_full_pipeline.py --suffix 05151200 --skip-sft --tail
+# SFT done — fix RL/code, rebuild image, resubmit:
+uv run python run_full_pipeline.py --slurm --suffix $SUFFIX --skip-sft --tail
+
+# SFT done + image correct — resubmit only:
+uv run python run_full_pipeline.py --slurm --suffix $SUFFIX --skip-sft --skip-build --tail
 ```
 
-`run_full_pipeline.py` composes the manual Steps 1–5 below — it does not
-replace them. Each individual script (`run_pipeline.py`, `local/k8s_submit.py`,
-etc.) remains independently runnable for fine-grained control. The wrapper
-overwrites `train_config_local.yaml > sft_source.{entity,project,name}`
-with the values from the just-completed SFT run (the patched file is then
-baked into the on-prem image via `COPY . .`); that's expected — the next
-run overwrites it again. A snapshot copy lives at
-`pipeline_runs/<SUFFIX>/train_config_local.yaml` for the audit trail.
-
-The CLI surface is intentionally small:
+**Key flags:**
 
 | Flag | Effect |
 |---|---|
-| `--suffix MMDDHHMM` | Override the auto-generated suffix (e.g. to retry a prior run). |
-| `--smoke` | Pass `--skip-stages "upload_rl leaderboard" --num-tasks 4` to `k8s_submit.py`. |
-| `--skip-sft` | Skip the SFT subprocess (requires `--suffix` pointing at an existing snapshot). |
-| `--skip-build` | Skip `docker build` + `docker push`; reuse the image tag from a prior submit. |
-| `--tail` | After `kubectl apply`, stream `kubectl logs -f` until the Job ends. |
+| `--slurm` | Submit via Slurm (`sbatch` through the SUNK login pod) instead of `kubectl apply`. |
+| `--suffix MMDDHHMM` | Reuse a prior suffix (e.g. to retry after a failure). |
+| `--skip-sft` | Skip SFT — requires `--suffix` pointing at an existing snapshot. |
+| `--skip-build` | Skip docker build + push; reuse the image tag from a prior submit. |
+| `--smoke` | 4-task RL only; skips upload_rl + leaderboard. For debugging only. |
+| `--tail` | Stream job logs until the job ends. |
+| `--slurm-time-limit HH:MM:SS` | Slurm wall-clock limit (default `08:00:00`; use `16:00:00` for safety). |
+| `--nfs-base PATH` | NFS base path on SUNK cluster (default `/mnt/data/kai`). |
+
+> See **[`local/RUNBOOK.md`](local/RUNBOOK.md)** for the full flag reference,
+> cluster bootstrap steps, monitoring commands, and known-issue playbook.
 
 The rest of this section (Steps 1–5) is the canonical manual flow for
 running the pipeline stages independently.
@@ -263,15 +289,19 @@ When you see `Leaderboard published: ObjectRef(…)` the pipeline is done.
 | W&B run | `https://wandb.ai/kwt/<project>/runs/<id>` (link in log) |
 | **Weave leaderboard** | `https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1` |
 
-The leaderboard has three rows — **base**, **SFT @ step N**, **RL @ best step**
-— with `success.mean` and `task_reward.mean` for each. Validated reference
-result on `kwt/tau2-ART-distill-05111101`:
+The leaderboard has rows for **base**, **SFT @ best step**, **RL @ best step**,
+plus optional frontier-baseline rows (gpt-4.1-mini, Gemini) when the
+corresponding API keys are in `.env`. Latest validated result
+(`kwt/tau2-ART-distill-06011448`, 40-task test set, 3 trials each):
 
 | Row | success.mean | task_reward.mean |
 |---|---|---|
-| base Qwen3-30B-A3B-Instruct-2507 | 9.2% | 0.233 |
-| SFT @ step 16 | 27.5% | 0.557 |
-| **RL @ step 17** | **38.3%** | **0.624** (+10.8 pp over SFT) |
+| base Qwen3-30B-A3B-Instruct-2507 | 5.8% | 0.141 |
+| SFT @ step 12 | 46.7% | 0.639 |
+| **RL @ step 15 (GRPO)** | **53.3%** | **0.668** (+6.6 pp over SFT) |
+
+Weave leaderboard:
+`https://wandb.ai/kwt/tau2-ART-distill-06011448/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1`
 
 ## 🆕 What's New
 

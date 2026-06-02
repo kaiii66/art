@@ -131,8 +131,10 @@ def _stream_subprocess(name: str, cmd: list[str], log_path: Path | None) -> int:
     return rc
 
 
-def _preflight() -> None:
-    """Fail-fast on missing env / binaries / namespace."""
+def _preflight(slurm: bool = False, slurm_namespace: str = "tenant-slurm",
+               slurm_login_pod: str = "slurm-login-0",
+               slurm_login_container: str = "sshd") -> None:
+    """Fail-fast on missing env / binaries / cluster access."""
     missing_env = [k for k in ("WANDB_API_KEY", "HF_TOKEN", "GHCR_USER") if not os.getenv(k)]
     if missing_env:
         raise SystemExit(
@@ -142,15 +144,38 @@ def _preflight() -> None:
     for binary in ("docker", "kubectl"):
         if shutil.which(binary) is None:
             raise SystemExit(f"{binary!r} not found on PATH.  See README Prerequisites.")
-    ns_check = subprocess.run(
-        ["kubectl", "get", "ns", "tau2"],
-        capture_output=True, text=True,
-    )
-    if ns_check.returncode != 0:
-        raise SystemExit(
-            "kubectl cannot see namespace 'tau2' — bootstrap it per the README "
-            "'Prerequisites' section (PVCs + secrets)."
+
+    if slurm:
+        # Verify the Slurm login pod is reachable and cluster has idle nodes.
+        sinfo = subprocess.run(
+            ["kubectl", "exec", "-n", slurm_namespace, slurm_login_pod,
+             "-c", slurm_login_container, "--", "sinfo", "--noheader"],
+            capture_output=True, text=True,
         )
+        if sinfo.returncode != 0:
+            raise SystemExit(
+                f"Cannot reach Slurm login pod {slurm_namespace}/{slurm_login_pod} "
+                f"(container: {slurm_login_container}).  "
+                f"Check KUBECONFIG and that the pod is Running.\n{sinfo.stderr.strip()}"
+            )
+        idle_lines = [l for l in sinfo.stdout.splitlines() if "idle" in l]
+        if not idle_lines:
+            print(
+                f"[preflight] WARNING: no idle Slurm nodes found — job will queue.\n"
+                f"{sinfo.stdout.strip()}"
+            )
+        else:
+            print(f"[preflight] Slurm: {len(idle_lines)} partition(s) have idle nodes ✓")
+    else:
+        ns_check = subprocess.run(
+            ["kubectl", "get", "ns", "tau2"],
+            capture_output=True, text=True,
+        )
+        if ns_check.returncode != 0:
+            raise SystemExit(
+                "kubectl cannot see namespace 'tau2' — bootstrap it per the README "
+                "'Prerequisites' section (PVCs + secrets)."
+            )
 
 
 def _git_short_sha() -> str:
@@ -286,6 +311,42 @@ def main() -> int:
         help="After kubectl apply, stream `kubectl logs -f` until the Job ends.",
     )
     parser.add_argument(
+        "--slurm", action="store_true",
+        help=(
+            "Submit the RL job via Slurm (sbatch through the SUNK login pod) "
+            "instead of a vanilla Kubernetes Job.  Use on clusters running SUNK "
+            "(Slurm on Kubernetes) where kubectl apply Jobs cannot land on GPU nodes."
+        ),
+    )
+    parser.add_argument(
+        "--slurm-namespace", default="tenant-slurm", metavar="NS",
+        help="K8s namespace of the Slurm login pod (default: tenant-slurm)",
+    )
+    parser.add_argument(
+        "--slurm-login-pod", default="slurm-login-0", metavar="POD",
+        help="Name of the Slurm login pod (default: slurm-login-0)",
+    )
+    parser.add_argument(
+        "--slurm-login-container", default="sshd", metavar="CTR",
+        help="Container inside the login pod to exec into (default: sshd)",
+    )
+    parser.add_argument(
+        "--nfs-base", default="/mnt/data/kai", metavar="PATH",
+        help=(
+            "Base path on the NFS share shared between login and compute nodes. "
+            "Artifacts, logs and enroot credentials are written here. "
+            "(default: /mnt/data/kai)"
+        ),
+    )
+    parser.add_argument(
+        "--slurm-partition", default="h100", metavar="PARTITION",
+        help="Slurm partition to target (default: h100)",
+    )
+    parser.add_argument(
+        "--slurm-time-limit", default="08:00:00", metavar="HH:MM:SS",
+        help="Slurm wall-clock time limit (default: 08:00:00)",
+    )
+    parser.add_argument(
         "--sft-step",
         default=None,
         help=(
@@ -298,7 +359,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    _preflight()
+    _preflight(
+        slurm=args.slurm,
+        slurm_namespace=args.slurm_namespace,
+        slurm_login_pod=args.slurm_login_pod,
+        slurm_login_container=args.slurm_login_container,
+    )
 
     suffix = args.suffix or datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%m%d%H%M")
     snapshot = RUNS_DIR / suffix
@@ -312,6 +378,7 @@ def main() -> int:
     print(f"    skip_sft   : {args.skip_sft}")
     print(f"    skip_build : {args.skip_build}")
     print(f"    tail       : {args.tail}")
+    print(f"    backend    : {'slurm' if args.slurm else 'k8s'}")
 
     # ── 1. SFT ────────────────────────────────────────────────────────────
     if not args.skip_sft:
@@ -380,19 +447,39 @@ def main() -> int:
             print(f"\n=== stage: docker build/push (skipped via --skip-build) ===")
             print(f"    no prior k8s_manifest.json; using computed tag: {image_tag}")
 
-    # ── 5. k8s submit ─────────────────────────────────────────────────────
-    submit_cmd = [
-        "uv", "run", "python", "local/k8s_submit.py",
-        "--image-tag", image_tag,
-        "--suffix", suffix,
-    ]
-    if args.smoke:
-        submit_cmd += ["--skip-stages", "upload_rl leaderboard", "--num-tasks", "4"]
-    if args.tail:
-        submit_cmd += ["--tail"]
-    rc = _stream_subprocess("stage: k8s submit", submit_cmd, log_path=None)
-    if rc != 0:
-        raise SystemExit(f"k8s_submit failed (rc={rc}).")
+    # ── 5. submit ─────────────────────────────────────────────────────────
+    if args.slurm:
+        submit_cmd = [
+            "uv", "run", "python", "local/slurm_submit.py",
+            "--image-tag", image_tag,
+            "--suffix", suffix,
+            "--slurm-namespace", args.slurm_namespace,
+            "--slurm-login-pod", args.slurm_login_pod,
+            "--slurm-login-container", args.slurm_login_container,
+            "--nfs-base", args.nfs_base,
+            "--partition", args.slurm_partition,
+            "--time-limit", args.slurm_time_limit,
+        ]
+        if args.smoke:
+            submit_cmd += ["--skip-stages", "upload_rl leaderboard", "--num-tasks", "4"]
+        if args.tail:
+            submit_cmd += ["--tail"]
+        rc = _stream_subprocess("stage: slurm submit", submit_cmd, log_path=None)
+        if rc != 0:
+            raise SystemExit(f"slurm_submit failed (rc={rc}).")
+    else:
+        submit_cmd = [
+            "uv", "run", "python", "local/k8s_submit.py",
+            "--image-tag", image_tag,
+            "--suffix", suffix,
+        ]
+        if args.smoke:
+            submit_cmd += ["--skip-stages", "upload_rl leaderboard", "--num-tasks", "4"]
+        if args.tail:
+            submit_cmd += ["--tail"]
+        rc = _stream_subprocess("stage: k8s submit", submit_cmd, log_path=None)
+        if rc != 0:
+            raise SystemExit(f"k8s_submit failed (rc={rc}).")
 
     # ── 6. Summary ────────────────────────────────────────────────────────
     print()
@@ -402,7 +489,12 @@ def main() -> int:
     print(f"    image               : {image_tag}")
     print(f"    job                 : tau2-art-rl-{suffix}")
     print(f"    project             : {project}")
-    print(f"    tail logs           : kubectl logs -f job/tau2-art-rl-{suffix} -n tau2")
+    if args.slurm:
+        print(f"    tail logs           : kubectl exec -n {args.slurm_namespace} "
+              f"{args.slurm_login_pod} -c {args.slurm_login_container} -- "
+              f"tail -f {args.nfs_base}/logs/tau2-{suffix}-<JOBID>.log")
+    else:
+        print(f"    tail logs           : kubectl logs -f job/tau2-art-rl-{suffix} -n tau2")
     print(f"    weave leaderboard   : "
           f"https://wandb.ai/{os.getenv('WANDB_ENTITY', 'kwt')}/{project}"
           f"/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1")

@@ -1,11 +1,34 @@
 """End-to-end pipeline orchestrator for the tau2-bench ART workflow.
 
-Runs in order:
+Val split (auto-generated, idempotent)
+---------------------------------------
+Each run automatically runs `scripts/generate_val_split.py` as step 0.  The
+script is idempotent: if a "val" key already exists in split_tasks.json it
+prints the counts and exits in under one second — no wasted work on normal
+runs.  To regenerate the val split (e.g. after changing --min-faults), run
+manually with --force before the next pipeline run:
+
+    uv run python scripts/generate_val_split.py --domain telecom --force --min-faults 2
+
+The split is committed to the repo; re-running with the same seed and
+min-faults value is fully reproducible.
+
+Dataset split roles
+--------------------
+  train   -> gradient updates (SFT distillation + RL GRPO)
+  val     -> checkpoint selection / early stopping during training
+             (drawn from full-base pool, disjoint from train and test)
+  test    -> leaderboard holdout — never seen during training
+  base    -> train ∪ test; uploaded for reference only
+
+Pipeline stages (per run)
+--------------------------
   1. snapshot      copy train_config.yaml + train_distill_config.yaml into
                    pipeline_runs/<MMDDHHMM>/ and rewrite the `project` field
                    in both copies. Source-of-truth YAMLs in the repo root are
                    never mutated.
   2. upload        upload_dataset_to_wandb.py against the snapshot config
+                   -> uploads train, val, test, base artifacts to W&B/Weave
   3. sft           train_tau2_distill.py against the snapshot config
                    -> writes pipeline_runs/<tag>/.last_trained_model
   4. patch         (implicit, runs right before `rl`) read
@@ -18,10 +41,12 @@ Runs in order:
                    writes pipeline_runs/<tag>/.sft_endpoint_step (= the SFT
                    final step) and, on val improvement, .best_rl_step.
   5. rl            train_tau2.py against the snapshot config
+                   -> uses val artifact for checkpoint selection (no leakage)
   6. leaderboard   create_leaderboard_shaped_reward.py --models all
                    (auto-discovers .sft_endpoint_step + .best_rl_step from
-                   the snapshot dir; produces three rows in one Weave eval:
-                   base, sft @ sft_endpoint_step, rl @ best_rl_step).
+                   the snapshot dir; evaluates on test artifact — clean holdout;
+                   produces three rows: base, sft @ sft_endpoint_step,
+                   rl @ best_rl_step).
 
 Usage:
   uv run python run_pipeline.py
@@ -232,6 +257,18 @@ def main() -> int:
     distill_cfg = snapshot / "train_distill_config.yaml"
 
     skip = set(args.skip)
+
+    # Step 0 — auto-generate val split (idempotent: skips in <1s if val exists).
+    # No --force: we never regenerate automatically; the committed split is authoritative.
+    _domain = yaml_load(SRC_TRAIN_CONFIG).get("domain", "telecom")
+    gen_cmd = ["uv", "run", "python", "scripts/generate_val_split.py", "--domain", _domain]
+    run_stage(
+        "setup: generate val split (idempotent)",
+        gen_cmd,
+        snapshot / "01-generate-val-split.log",
+        dry_run=args.dry_run,
+    )
+
     print()
     print("=== pipeline plan ===")
     print(f"    snapshot         : {snapshot}")
@@ -241,6 +278,7 @@ def main() -> int:
     print(f"    stages enabled   : {[s for s in ALL_STAGES if s not in skip]}")
     print(f"    stages skipped   : {sorted(skip)}")
     print(f"    publish_lb (leaderboard): {not args.no_publish_leaderboard}")
+    print(f"    domain           : {_domain}")
 
     # When RL is skipped there is no RL checkpoint, so limit leaderboard to the
     # rows that were actually trained. --models all with no RL falls back to

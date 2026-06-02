@@ -488,7 +488,9 @@ async def tau2_teacher_rollout(
     task_id = task_scenario.task_id
 
     def _run_sync():
-        tasks = registry.get_tasks_loader(domain)()
+        # task_split_name=None loads all tasks from tasks.json (not just base),
+        # so val tasks drawn from full-base are resolvable during rollout.
+        tasks = registry.get_tasks_loader(domain)(task_split_name=None)
         task = None
         for t in tasks:
             if t.id == task_id:
@@ -627,7 +629,9 @@ async def tau2_rollout(
     task_id = task_scenario.task_id
 
     def _run_sync():
-        tasks = registry.get_tasks_loader(domain)()
+        # task_split_name=None loads all tasks from tasks.json (not just base),
+        # so val tasks drawn from full-base are resolvable during rollout.
+        tasks = registry.get_tasks_loader(domain)(task_split_name=None)
         task = None
         for t in tasks:
             if t.id == task_id:

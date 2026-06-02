@@ -1,7 +1,19 @@
 """
-Upload tau2 training, validation, and base scenarios to W&B artifacts and Weave.
+Upload tau2 training, validation (val), leaderboard test, and base scenarios to
+W&B artifacts and Weave.
 
-By default loads full train/test/base splits from the domain data (tasks.json +
+Split roles:
+  train  -> training_dataset_artifact / training_weave_dataset
+            Used for gradient updates during SFT and RL.
+  val    -> validation_dataset_artifact / validation_weave_dataset
+            Used for checkpoint selection and early stopping during training.
+            Drawn from full-base pool (disjoint from train and test).
+  test   -> leaderboard_dataset_artifact / leaderboard_weave_dataset
+            Clean holdout; only consumed by create_leaderboard_shaped_reward.py.
+  base   -> base_weave_dataset
+            Union of train+test; uploaded for reference only.
+
+By default loads full train/val/test/base splits from the domain data (tasks.json +
 split_tasks.json). Use --num-base-tasks N to limit base to first N tasks (same
 order as tau2 run --num-tasks N). Domain (and project) come from config.
 
@@ -57,13 +69,19 @@ def main(
         print(f"Total task set size: {total} tasks")
         return
 
-    # Full splits from domain data (train/test/base); base can be limited by --num-base-tasks
+    # Load splits: train (gradient updates), val (checkpoint selection),
+    # test (leaderboard holdout), base (reference, can be limited by --num-base-tasks)
     training_tasks = get_tasks(
         task_set_name=domain,
         task_split_name="train",
         num_tasks=None,
     )
-    validation_tasks = get_tasks(
+    val_tasks = get_tasks(
+        task_set_name=domain,
+        task_split_name="val",
+        num_tasks=None,
+    )
+    test_tasks = get_tasks(
         task_set_name=domain,
         task_split_name="test",
         num_tasks=None,
@@ -75,12 +93,14 @@ def main(
     )
 
     training_data = [{"task_id": t.id, "domain": domain} for t in training_tasks]
-    validation_data = [{"task_id": t.id, "domain": domain} for t in validation_tasks]
+    val_data = [{"task_id": t.id, "domain": domain} for t in val_tasks]
+    test_data = [{"task_id": t.id, "domain": domain} for t in test_tasks]
     base_data = [{"task_id": t.id, "domain": domain} for t in base_tasks]
 
     print(
         f"Domain: {domain} | Training: {len(training_tasks)} (train) | "
-        f"Validation: {len(validation_tasks)} (test) | Base: {len(base_tasks)}"
+        f"Val: {len(val_tasks)} (val) | Test: {len(test_tasks)} (test) | "
+        f"Base: {len(base_tasks)}"
     )
 
     # Initialize W&B run
@@ -97,10 +117,12 @@ def main(
 
     # Log dataset statistics
     run.summary["training_scenarios_count"] = len(training_tasks)
-    run.summary["validation_scenarios_count"] = len(validation_tasks)
+    run.summary["val_scenarios_count"] = len(val_tasks)
+    run.summary["test_scenarios_count"] = len(test_tasks)
     run.summary["base_scenarios_count"] = len(base_tasks)
     run.summary["training_split"] = "train"
-    run.summary["validation_split"] = "test"
+    run.summary["val_split"] = "val"
+    run.summary["test_split"] = "test"
     run.summary["domain"] = domain
 
     # ── Training ──
@@ -129,31 +151,57 @@ def main(
     )
     weave.publish(training_weave_dataset)
 
-    # ── Validation ──
-    validation_file = "validation_scenarios.json"
-    with open(validation_file, "w") as f:
-        json.dump(validation_data, f, indent=2)
+    # ── Val (checkpoint selection / early stopping during training) ──
+    val_file = "val_scenarios.json"
+    with open(val_file, "w") as f:
+        json.dump(val_data, f, indent=2)
 
-    val_art_name = config.get("validation_dataset_artifact", f"tau2-{domain}-validation-scenarios").split(":")[0]
-    validation_artifact = wandb.Artifact(
+    val_art_name = config.get("validation_dataset_artifact", f"tau2-{domain}-val-scenarios").split(":")[0]
+    val_artifact = wandb.Artifact(
         name=val_art_name,
         type="dataset",
-        description=f"Validation scenarios for tau2-bench {domain} ({len(validation_tasks)} tasks from split test)",
+        description=f"Val scenarios for tau2-bench {domain} ({len(val_tasks)} tasks from split val; used for checkpoint selection)",
         metadata={
-            "split": "test",
-            "num_scenarios": len(validation_tasks),
+            "split": "val",
+            "num_scenarios": len(val_tasks),
             "domain": domain,
         },
     )
-    validation_artifact.add_file(validation_file)
-    run.log_artifact(validation_artifact)
+    val_artifact.add_file(val_file)
+    run.log_artifact(val_artifact)
 
-    val_weave_name = config.get("validation_weave_dataset", f"tau2-{domain}-validation-scenarios")
-    validation_weave_dataset = weave.Dataset(
+    val_weave_name = config.get("validation_weave_dataset", f"tau2-{domain}-val-scenarios")
+    val_weave_dataset = weave.Dataset(
         name=val_weave_name,
-        rows=validation_data,
+        rows=val_data,
     )
-    weave.publish(validation_weave_dataset)
+    weave.publish(val_weave_dataset)
+
+    # ── Test (leaderboard holdout — never used during training) ──
+    test_file = "test_scenarios.json"
+    with open(test_file, "w") as f:
+        json.dump(test_data, f, indent=2)
+
+    test_art_name = config.get("leaderboard_dataset_artifact", f"tau2-{domain}-test-scenarios").split(":")[0]
+    test_artifact = wandb.Artifact(
+        name=test_art_name,
+        type="dataset",
+        description=f"Test scenarios for tau2-bench {domain} ({len(test_tasks)} tasks from split test; clean leaderboard holdout)",
+        metadata={
+            "split": "test",
+            "num_scenarios": len(test_tasks),
+            "domain": domain,
+        },
+    )
+    test_artifact.add_file(test_file)
+    run.log_artifact(test_artifact)
+
+    test_weave_name = config.get("leaderboard_weave_dataset", f"tau2-{domain}-test-scenarios")
+    test_weave_dataset = weave.Dataset(
+        name=test_weave_name,
+        rows=test_data,
+    )
+    weave.publish(test_weave_dataset)
 
     # ── Base (same order as tau2 run --num-tasks N) ──
     base_file = "base_scenarios.json"
@@ -181,8 +229,8 @@ def main(
     weave.publish(base_weave_dataset)
 
     print(
-        f"Uploaded training ({len(training_tasks)}) + validation ({len(validation_tasks)}) + base ({len(base_tasks)}) "
-        f"to W&B and Weave"
+        f"Uploaded training ({len(training_tasks)}) + val ({len(val_tasks)}) + "
+        f"test ({len(test_tasks)}) + base ({len(base_tasks)}) to W&B and Weave"
     )
     run.finish()
 

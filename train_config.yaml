@@ -122,8 +122,14 @@ verify_checkpoint_digest_before_train: true
 # leaderboard_trained_model_name: "tau2-telecom-Qwen3-30B-A3B-Instruct-2507-0313-20260312-1009"
 training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
 training_weave_dataset: "tau2-ART-telecom-training-scenarios"
-validation_dataset_artifact: "tau2-ART-telecom-validation-scenarios:latest"
-validation_weave_dataset: "tau2-ART-telecom-validation-scenarios"
+# val split: drawn from full-base pool (disjoint from train and test)
+# used for checkpoint selection / early stopping during training
+validation_dataset_artifact: "tau2-ART-telecom-val-scenarios:latest"
+validation_weave_dataset: "tau2-ART-telecom-val-scenarios"
+validation_task_split: "val"
+# test split: clean holdout, never seen during training; used only by leaderboard
+leaderboard_dataset_artifact: "tau2-ART-telecom-test-scenarios:latest"
+leaderboard_weave_dataset: "tau2-ART-telecom-test-scenarios"
 base_weave_dataset: "tau2-ART-telecom-base-scenarios"
 
 # ── Shaped reward (continuous 0-1 for GRPO signal) ─────────────────

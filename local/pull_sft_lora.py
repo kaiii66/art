@@ -164,6 +164,29 @@ async def pull_sft_lora(
             )
             print(f"[pull_sft] download complete: {target_dir}")
 
+    # ── MoE LoRA conversion (idempotent, runs on every pull) ─────────────
+    if not dry_run and sentinel.exists():
+        try:
+            from art.utils.convert_moe_lora import convert_checkpoint_if_needed
+            convert_checkpoint_if_needed(target_dir)   # no-op for non-MoE / already-converted
+        except ImportError:
+            print("[pull_sft] convert_moe_lora unavailable; skipping MoE conversion")
+        # Also directly remove 'experts' from target_modules in adapter_config.json
+        # to fix PEFT compatibility regardless of tensor format
+        import json as _json
+        _config_path = Path(target_dir) / "adapter_config.json"
+        if _config_path.exists():
+            _cfg = _json.loads(_config_path.read_text())
+            _tms = _cfg.get("target_modules", [])
+            if any("experts" in str(m) for m in _tms):
+                _tms_fixed = [m for m in _tms if "experts" not in str(m)]
+                if not _tms_fixed:
+                    _tms_fixed = ["q_proj", "k_proj", "v_proj", "o_proj",
+                                  "gate_proj", "up_proj", "down_proj"]
+                _cfg["target_modules"] = _tms_fixed
+                _config_path.write_text(_json.dumps(_cfg, indent=2))
+                print(f"[pull_sft] fixed adapter_config.json: removed experts from target_modules")
+
     # ── Write sidecar files (sidecar_dir already resolved above) ────────
     sft_step_file = sidecar_dir / ".sft_endpoint_step"
     last_model_file = sidecar_dir / ".last_trained_model"

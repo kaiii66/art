@@ -16,6 +16,13 @@ __pycache__/
 # Pipeline run snapshots + logs
 pipeline_runs/
 
+# Leaderboard web frontend (submissions/trajectories are 500MB+ and unused by training image)
+web/
+
+# Local W&B run scratch
+wandb/
+artifacts/
+
 # Local dev / editor files
 .env
 .env.*

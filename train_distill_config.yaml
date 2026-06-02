@@ -85,8 +85,9 @@ validation_rollouts_per_task: 2
 
 # ── Datasets (W&B artifacts produced by upload_dataset_to_wandb.py) ─
 training_dataset_artifact: "tau2-ART-telecom-training-scenarios:latest"
-validation_dataset_artifact: "tau2-ART-telecom-validation-scenarios:latest"
-validation_task_split: "test"
+validation_dataset_artifact: "tau2-ART-telecom-val-scenarios:latest"
+validation_weave_dataset: "tau2-ART-telecom-val-scenarios"
+validation_task_split: "val"
 
 # ── Reproducibility / W&B ──────────────────────────────────────────
 random_seed: 42
