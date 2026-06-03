@@ -92,7 +92,7 @@ def _get_ghcr_token() -> tuple[str, str] | None:
 
 def _setup_nfs(pod: str, ns: str, container: str, nfs_base: str, creds: tuple[str, str] | None) -> None:
     """Create working dirs and write enroot credentials on the NFS share."""
-    dirs = f"{nfs_base}/tau2-artifacts {nfs_base}/tau2-data {nfs_base}/logs {nfs_base}/.config/enroot"
+    dirs = f"{nfs_base}/tau2-artifacts {nfs_base}/tau2-artifacts/.art {nfs_base}/tau2-data {nfs_base}/logs {nfs_base}/.config/enroot"
     r = _kubectl_exec(pod, ns, container, f"mkdir -p {dirs}")
     if r.returncode != 0:
         raise RuntimeError(f"Failed to create NFS dirs: {r.stderr.strip()}")
@@ -171,7 +171,7 @@ export NCCL_DEBUG='WARN'
 
 srun \\
   --container-image={image_tag} \\
-  --container-mounts={nfs_base}/tau2-artifacts:/artifacts,{nfs_base}/tau2-data:/data,{nfs_base}/logs:/workspace/pipeline_runs \\
+  --container-mounts={nfs_base}/tau2-artifacts:/artifacts,{nfs_base}/tau2-data:/data,{nfs_base}/logs:/workspace/pipeline_runs,{nfs_base}/tau2-artifacts/.art:/workspace/.art \\
   --container-env=WANDB_API_KEY,HF_TOKEN,WANDB_PROJECT,WANDB_RUN_GROUP,WANDB_NAME,PIPELINE_SUFFIX,SKIP_STAGES,NUM_TASKS,TAU2_DATA_DIR,HF_HOME,HUGGINGFACE_HUB_CACHE,HF_HUB_ENABLE_HF_TRANSFER,TOKENIZERS_PARALLELISM,PYTORCH_CUDA_ALLOC_CONF,NCCL_P2P_DISABLE,NCCL_DEBUG{frontier_env} \\
   /workspace/onprem/scripts/run_art_rl.sh
 """
@@ -236,8 +236,8 @@ def main() -> int:
                         help="Base path on the NFS share accessible from compute nodes (default: /mnt/data/kai)")
     parser.add_argument("--partition", default="h100",
                         help="Slurm partition to submit to (default: h100)")
-    parser.add_argument("--time-limit", default="08:00:00",
-                        help="Slurm wall-clock limit (default: 08:00:00)")
+    parser.add_argument("--time-limit", default="16:00:00",
+                        help="Slurm wall-clock limit (default: 16:00:00)")
     args = parser.parse_args()
 
     from dotenv import load_dotenv

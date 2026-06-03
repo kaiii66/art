@@ -604,6 +604,7 @@ async def tau2_rollout(
     task_reward_blend: Optional[float] = None,
     pinned_step: Optional[int] = None,
     pinned_alias: Optional[str] = None,
+    seed: Optional[int] = None,
 ) -> art.Trajectory:
     """Run a tau2-bench simulation and return an ART Trajectory.
 
@@ -706,6 +707,7 @@ async def tau2_rollout(
             environment=environment,
             task=task,
             max_steps=max_steps,
+            seed=seed,
         )
         simulation = orchestrator.run()
 
@@ -807,27 +809,76 @@ class Tau2BaseModelWrapper(weave.Model):
     # Useful for evaluating artifacts that were uploaded but never received
     # a `step{N}` alias (e.g. orphaned fork checkpoints).
     pinned_alias: Optional[str] = None
+    # CRN: when set, passes a fixed seed to the Orchestrator so the user
+    # simulator produces deterministic behaviour.  Both SFT and RL wrappers
+    # must receive the same seed value for the pairing to be valid.
+    seed: Optional[int] = None
+    # Concurrency cap: limits how many concurrent tau2_rollout calls this
+    # wrapper issues.  Uses a per-instance asyncio.Semaphore lazily created
+    # on first predict() call.  None means unlimited (Weave default).
+    max_concurrency: Optional[int] = None
+
+    # asyncio.Semaphore and result lists are not serialisable by Weave/pydantic;
+    # keep them outside the model fields using private instance variables.
+    _semaphore: Optional[Any] = None
+    # Accumulated per-trial results from predict() calls during evaluate().
+    # Each entry: {task_id, reward, success, dropped, trial_idx}.
+    # Read after evaluate() returns to get per-task data for paired stats and
+    # saving to data/simulations/.
+    _task_results: Optional[Any] = None
+
+    def _get_semaphore(self):
+        if self.max_concurrency is None:
+            return None
+        if self._semaphore is None:
+            object.__setattr__(self, "_semaphore", asyncio.Semaphore(self.max_concurrency))
+        return self._semaphore
+
+    def _record_result(self, result: dict) -> None:
+        """Append a predict() result to the instance-level result list."""
+        if self._task_results is None:
+            object.__setattr__(self, "_task_results", [])
+        self._task_results.append(result)
 
     @weave.op()
     async def predict(self, task_id: str, domain: str) -> dict:
+        sem = self._get_semaphore()
         scenario = Tau2TaskScenario(step=0, task_id=task_id, domain=domain)
         try:
-            traj = await tau2_rollout(
-                self.model,
-                scenario,
-                user_llm=self.user_llm,
-                user_llm_args=self.user_llm_args,
-                max_steps=self.max_steps,
-                agent_llm=self.agent_llm,
-                agent_llm_args=self.agent_llm_args,
-                use_shaped_reward=self.use_shaped_reward,
-                shaped_reward_weights=self.shaped_reward_weights,
-                pinned_step=self.pinned_step,
-                pinned_alias=self.pinned_alias,
-            )
+            if sem is not None:
+                async with sem:
+                    traj = await tau2_rollout(
+                        self.model,
+                        scenario,
+                        user_llm=self.user_llm,
+                        user_llm_args=self.user_llm_args,
+                        max_steps=self.max_steps,
+                        agent_llm=self.agent_llm,
+                        agent_llm_args=self.agent_llm_args,
+                        use_shaped_reward=self.use_shaped_reward,
+                        shaped_reward_weights=self.shaped_reward_weights,
+                        pinned_step=self.pinned_step,
+                        pinned_alias=self.pinned_alias,
+                        seed=self.seed,
+                    )
+            else:
+                traj = await tau2_rollout(
+                    self.model,
+                    scenario,
+                    user_llm=self.user_llm,
+                    user_llm_args=self.user_llm_args,
+                    max_steps=self.max_steps,
+                    agent_llm=self.agent_llm,
+                    agent_llm_args=self.agent_llm_args,
+                    use_shaped_reward=self.use_shaped_reward,
+                    shaped_reward_weights=self.shaped_reward_weights,
+                    pinned_step=self.pinned_step,
+                    pinned_alias=self.pinned_alias,
+                    seed=self.seed,
+                )
         except Exception as e:
             logger.warning("Leaderboard eval failed for task_id=%s: %s", task_id, e)
-            return {
+            result = {
                 "task_id": task_id,
                 "reward": 0.0,
                 "success": 0.0,
@@ -836,7 +887,9 @@ class Tau2BaseModelWrapper(weave.Model):
                 "dropped": True,
                 "error_reason": str(e)[:200],
             }
-        return {
+            self._record_result(result)
+            return result
+        result = {
             "task_id": task_id,
             "reward": traj.reward,
             "success": traj.metrics.get("success", 0.0),
@@ -845,6 +898,8 @@ class Tau2BaseModelWrapper(weave.Model):
             "dropped": False,
             "error_reason": "",
         }
+        self._record_result(result)
+        return result
 
 
 class PassAtKScorer(weave.Scorer):
@@ -858,9 +913,20 @@ class PassAtKScorer(weave.Scorer):
     @weave.op()
     def score(self, *, output: dict) -> dict:
         from tau2.metrics.agent_metrics import is_successful
+        # Use the precomputed BINARY success field. output["reward"] may be the
+        # continuous SHAPED reward (when shaped_reward is enabled); calling
+        # is_successful() on a shaped score like 0.99 wrongly counts it as a
+        # failure and collapses pass^k toward 0. The binary `success` field is
+        # itself is_successful(binary_reward) computed inside tau2_rollout, so
+        # results remain identical to the CLI for binary rewards. Fall back to
+        # is_successful(reward) only for older result dicts that lack `success`.
+        if "success" in output:
+            success = bool(output["success"])
+        else:
+            success = is_successful(output.get("reward", 0.0))
         return {
             "task_id": output["task_id"],
-            "success": is_successful(output.get("reward", 0.0)),
+            "success": success,
         }
 
     @weave.op()
@@ -906,7 +972,13 @@ def score_task_reward(model_output: dict) -> dict:
 
 @weave.op()
 def score_success(model_output: dict) -> dict:
-    """Weave scorer: extracts the binary success flag (0/1)."""
+    """Weave scorer: extracts the binary success flag (0/1).
+
+    Returns None for dropped trials so infra errors are excluded from the
+    mean rather than counted as 0.
+    """
+    if model_output.get("dropped"):
+        return {"success": None}
     return {"success": model_output.get("success", 0.0)}
 
 

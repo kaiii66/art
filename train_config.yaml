@@ -47,8 +47,7 @@ agent_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
 agent_llm_args:
   temperature: 0.7
   max_tokens: 16384
-# user_llm: "wandb/Qwen/Qwen3-235B-A22B-Instruct-2507" #as of 031226 there is issue with this model
-user_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
+user_llm: "wandb/Qwen/Qwen3-235B-A22B-Instruct-2507"
 user_llm_args:
   temperature: 1.0
   max_tokens: 16384
@@ -160,9 +159,21 @@ random_seed: 42
 # 17.5% -> 27.5% -> 7.5% across runs 04221526/04221704/04230729 on the
 # same 40-task test set. Three trials per (task, model) pair lets us
 # estimate variance and make RL-vs-SFT comparisons more trustworthy.
+#
+# CRN (Common Random Numbers) workflow:
+#   Set num_trials: 1 and run with --seed 0, --seed 1, --seed 2 separately.
+#   Each run fixes the user-simulator seed so SFT and RL face identical user
+#   behaviour per task. Row names are auto-suffixed "| seed=N" in the Weave
+#   leaderboard. Aggregate with: python paired_task_analysis.py --n 3
 leaderboard:
   num_trials: 3
   max_steps: 100
+  max_concurrency: 8   # cap concurrent Weave trial calls; matches run_tau2_cli_eval.py
+  seed: null           # set to int for CRN runs (also overridable via --seed CLI arg)
+  # Leaderboard user simulator: use the stronger 235B model (same as
+  # run_tau2_cli_eval.py) for eval, independent of the 30B user_llm used during
+  # training rollouts. Falls back to top-level user_llm if removed.
+  user_llm: "wandb/Qwen/Qwen3-235B-A22B-Instruct-2507"
   agent_llm_args:
     temperature: 0.0
     max_tokens: 16384

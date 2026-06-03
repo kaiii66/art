@@ -9,7 +9,7 @@
 #   uv run python local/upload_rl_lora.py  --config train_config_local.yaml
 
 # ── Model ─────────────────────────────────────────────────────────────
-project: "tau2-ART-distill-06011448"
+project: "tau2-ART-distill-06021512"
 base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # model_name is a BASE template. run_pipeline_local.py appends the run
 # suffix (MMDDHHMM) automatically, producing an isolated name like
@@ -17,7 +17,7 @@ base_model: "Qwen/Qwen3-30B-A3B-Instruct-2507"
 # This gives each run its own .art/ checkpoint dir and its own W&B RL
 # artifact collection, so every run always starts fresh from the SFT LoRA.
 # sft_source.name (below) always points back to the original SFT baseline.
-model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260601-1448"
+model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260602-1512"
 
 # ── SFT source (pull_sft_lora.py) ─────────────────────────────────────
 # Identifies which W&B artifact to seed the local .art/ checkpoint dir from.
@@ -34,9 +34,9 @@ model_name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260601-1448"
 # GLM-5.1 teacher SFT run: best step=12, val/reward=0.725 (72.5%)
 sft_source:
   entity: "kwt"
-  project: "tau2-ART-distill-06011448"
-  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260601-1448"
-  step: 12
+  project: "tau2-ART-distill-06021512"
+  name: "tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260602-1512"
+  step: 8
 
 # ── Domain / tasks ────────────────────────────────────────────────────
 domain: "telecom"
@@ -53,8 +53,8 @@ agent_llm_args:
   # KV-cache budget to support more orchestrator steps (see max_orchestrator_steps).
   max_tokens: 512
 
-# user_llm: external dialogue simulator, unchanged from serverless config.
-user_llm: "wandb/Qwen/Qwen3-30B-A3B-Instruct-2507"
+# user_llm: external dialogue simulator — 235B for train/eval consistency.
+user_llm: "wandb/Qwen/Qwen3-235B-A22B-Instruct-2507"
 user_llm_args:
   temperature: 1.0
   max_tokens: 1024
@@ -146,6 +146,11 @@ leaderboard_trained_model_step:
 leaderboard:
   num_trials: 3
   max_steps: 100
+  max_concurrency: 8   # matches run_tau2_cli_eval.py; avoids W&B inference 524s
+  # Leaderboard user simulator: use the stronger 235B model (same as
+  # run_tau2_cli_eval.py) for eval, independent of the 30B user_llm used during
+  # RL training rollouts. Falls back to top-level user_llm if removed.
+  user_llm: "wandb/Qwen/Qwen3-235B-A22B-Instruct-2507"
   agent_llm_args:
     temperature: 0.0
     max_tokens: 16384

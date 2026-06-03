@@ -343,8 +343,8 @@ def main() -> int:
         help="Slurm partition to target (default: h100)",
     )
     parser.add_argument(
-        "--slurm-time-limit", default="08:00:00", metavar="HH:MM:SS",
-        help="Slurm wall-clock time limit (default: 08:00:00)",
+        "--slurm-time-limit", default="16:00:00", metavar="HH:MM:SS",
+        help="Slurm wall-clock time limit (default: 16:00:00)",
     )
     parser.add_argument(
         "--sft-step",

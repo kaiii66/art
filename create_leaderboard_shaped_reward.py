@@ -1,11 +1,12 @@
 """
 Shaped-reward leaderboard for tau2-bench: compare base (Qwen) and trained (GRPO) models
-on the held-out validation set with TWO columns:
+on the held-out validation set with columns:
 
   - success.mean       (binary, headline)    "did the model solve the task?"
   - task_reward.mean   (shaped, diagnostic)  continuous training-objective signal
+  - pass^1/2/3.mean    (reliability)         unbiased pass^k estimator
 
-No pass^k. The shaped column reports a different unit (continuous, possibly >1 before
+The shaped column reports a different unit (continuous, possibly >1 before
 step penalty) than the binary leaderboard in create_leaderboard.py, so this script
 publishes its own Weave Evaluation / Leaderboard objects (suffixed with "-shaped")
 to keep the two histories cleanly separated.
@@ -18,11 +19,18 @@ Important caveats:
     success is near zero).
   - At num_trials=1, single-sample variance on ~40 validation tasks is roughly
     +/- 7-8pp on the binary column.
+  - CRN (Common Random Numbers): pass --seed <int> to fix the user-simulator seed.
+    Both SFT and RL will then face identical random user behaviour per task, making
+    the RL−SFT comparison statistically more powerful.  For CRN runs, use
+    num_trials: 1 in leaderboard config and run with seeds 0, 1, 2 separately.
+    Row names are automatically suffixed with "| seed=N" so all runs land in one
+    leaderboard.  After 3 seeds, run: python paired_task_analysis.py --n 3
 
 Usage:
     python create_leaderboard_shaped_reward.py --models all --publish-leaderboard
     python create_leaderboard_shaped_reward.py --models rl --trained-model-name <name>
     python create_leaderboard_shaped_reward.py --models base sft rl
+    python create_leaderboard_shaped_reward.py --models sft rl --seed 0
 
 Model options: base, sft, rl, all
   - base : raw `base_model` via tau2 LLMAgent
@@ -32,9 +40,16 @@ Model options: base, sft, rl, all
 """
 import argparse
 import asyncio
+import json
+import math
 import os
 import yaml
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+
+import numpy as np
+from scipy import stats
 
 from dotenv import load_dotenv
 
@@ -49,10 +64,152 @@ from art.serverless.backend import ServerlessBackend
 
 from tau2_art_helpers import (
     Tau2BaseModelWrapper,
+    PassAtKScorer,
     score_task_reward,
     score_success,
     score_error,
 )
+
+
+SIM_DIR = Path(__file__).resolve().parent / "data" / "simulations"
+N_BOOT = 10_000
+
+
+def _bootstrap_ci(
+    diffs: np.ndarray, rng: np.random.Generator, n_boot: int = N_BOOT, alpha: float = 0.05
+) -> tuple[float, float, float]:
+    """Return (mean, lower, upper) percentile bootstrap CI."""
+    means = np.array([
+        rng.choice(diffs, size=len(diffs), replace=True).mean()
+        for _ in range(n_boot)
+    ])
+    return float(diffs.mean()), float(np.percentile(means, 100 * alpha / 2)), float(np.percentile(means, 100 * (1 - alpha / 2)))
+
+
+def _pass_hat_k(successes: int, n_trials: int, k: int) -> float:
+    """Unbiased pass^k estimator. Returns nan if n_trials < k."""
+    if n_trials < k:
+        return float("nan")
+    return math.comb(successes, k) / math.comb(n_trials, k)
+
+
+def _print_paired_stats(
+    results_a: list[dict],
+    results_b: list[dict],
+    label_a: str,
+    label_b: str,
+    k: int = 3,
+) -> None:
+    """Print Wilcoxon + bootstrap CI paired-task analysis for two model result lists.
+
+    Operates on the BINARY success field (0/1) from each per-task result, NOT the
+    continuous shaped `reward`. Using the shaped reward here was a bug: a near-miss
+    score like 0.99 is not == 1.0, so is_successful() counted it as a failure,
+    deflating pass^1 and collapsing pass^k to ~0.
+    """
+    by_task_a: dict[str, list[float]] = defaultdict(list)
+    by_task_b: dict[str, list[float]] = defaultdict(list)
+    for r in results_a:
+        if not r.get("dropped"):
+            by_task_a[r["task_id"]].append(float(r.get("success", 0.0)))
+    for r in results_b:
+        if not r.get("dropped"):
+            by_task_b[r["task_id"]].append(float(r.get("success", 0.0)))
+
+    tasks = sorted(set(by_task_a) & set(by_task_b))
+    if not tasks:
+        print("\n[paired stats] No overlapping task_ids — skipping.")
+        return
+
+    rng = np.random.default_rng(0)
+
+    rate_a, rate_b, pk_a, pk_b = [], [], [], []
+    for t in tasks:
+        ta = [int(s >= 0.5) for s in by_task_a[t]]
+        tb = [int(s >= 0.5) for s in by_task_b[t]]
+        rate_a.append(sum(ta) / len(ta))
+        rate_b.append(sum(tb) / len(tb))
+        pk_a.append(_pass_hat_k(sum(ta), len(ta), k))
+        pk_b.append(_pass_hat_k(sum(tb), len(tb), k))
+
+    rate_a_arr = np.array(rate_a)
+    rate_b_arr = np.array(rate_b)
+    pk_a_arr   = np.array(pk_a)
+    pk_b_arr   = np.array(pk_b)
+    d_rate = rate_b_arr - rate_a_arr
+    d_pk   = pk_b_arr - pk_a_arr
+
+    print(f"\n{'='*70}")
+    print(f"PAIRED TASK ANALYSIS  ({label_a} = baseline,  {label_b} = candidate)")
+    print(f"Tasks: {len(tasks)}")
+    print(f"{'='*70}")
+
+    for metric_name, baseline, candidate, diffs in [
+        ("pass^1  (per-trial success rate)", rate_a_arr, rate_b_arr, d_rate),
+        (f"pass^{k} (strict reliability)   ", pk_a_arr,  pk_b_arr,  d_pk),
+    ]:
+        valid = diffs[~np.isnan(diffs)]
+        m_a = float(np.nanmean(baseline))
+        m_b = float(np.nanmean(candidate))
+        if len(valid) == 0:
+            print(f"\n  {metric_name}  — insufficient data")
+            continue
+        mean_d, lo, hi = _bootstrap_ci(valid, rng)
+        try:
+            w_p = stats.wilcoxon(valid, alternative="greater").pvalue
+        except ValueError:
+            w_p = float("nan")
+        print(f"\n  {metric_name}")
+        print(f"    {label_a} mean : {m_a:.4f}  ({m_a*100:.1f}%)")
+        print(f"    {label_b} mean : {m_b:.4f}  ({m_b*100:.1f}%)")
+        print(f"    mean diff    : {mean_d:+.4f}  ({mean_d*100:+.2f}pp)")
+        print(f"    95% boot CI  : [{lo:+.4f}, {hi:+.4f}]  ({lo*100:+.2f}pp to {hi*100:+.2f}pp)")
+        print(f"    Wilcoxon p   : {w_p:.4f}  (one-sided H1: {label_b} > {label_a})")
+        if lo > 0:
+            verdict = f"SIGNIFICANT — CI entirely above 0 (p={w_p:.3f})"
+        elif hi < 0:
+            verdict = "SIGNIFICANT REGRESSION — CI entirely below 0"
+        else:
+            verdict = "NOT SIGNIFICANT — CI includes 0"
+        print(f"    verdict      : {verdict}")
+
+
+def _save_leaderboard_sims(label: str, task_results: list[dict], seed: int | None) -> Path | None:
+    """Save per-task results from a leaderboard model eval to data/simulations/.
+
+    Writes a lightweight JSON list with {task_id, reward, success, trial, seed,
+    dropped} fields, where:
+      - `reward`  is the continuous shaped score (diagnostic only)
+      - `success` is the BINARY 0/1 task success used by paired_task_analysis.py
+    File pattern: tau2cli_lb_{label}_{timestamp}.json
+    Compatible with paired_task_analysis.py when using --leaderboard flag.
+    Returns the path written, or None on error.
+    """
+    if not task_results:
+        return None
+    SIM_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = SIM_DIR / f"tau2cli_lb_{label}_{ts}.json"
+    records = []
+    trial_counts: dict[str, int] = defaultdict(int)
+    for r in task_results:
+        tid = r["task_id"]
+        records.append({
+            "task_id": tid,
+            "reward": r.get("reward", 0.0),
+            "success": float(r.get("success", 0.0)),
+            "trial": trial_counts[tid],
+            "seed": seed,
+            "dropped": r.get("dropped", False),
+        })
+        trial_counts[tid] += 1
+    try:
+        out_path.write_text(json.dumps(records, indent=2))
+        print(f"  Saved {len(records)} trial results to {out_path.name}")
+    except OSError as e:
+        print(f"  Warning: could not save simulation results: {e}")
+        return None
+    return out_path
 
 
 def load_config(config_path: str) -> dict:
@@ -70,6 +227,7 @@ async def main(
     trained_model_step: int = None,
     trained_model_alias: str = None,
     publish_leaderboard: bool = False,
+    seed: int = None,
 ):
     if models_to_eval is None:
         models_to_eval = ["all"]
@@ -92,7 +250,11 @@ async def main(
     # Treat None the same as missing here, falling back to W&B Inference for the
     # bare base model.
     agent_llm = config.get("agent_llm") or f"wandb/{base_model}"
-    user_llm = config["user_llm"]
+    # Leaderboard user simulator: prefer a dedicated `leaderboard.user_llm` so the
+    # eval can use a stronger/independent user model (matching run_tau2_cli_eval.py,
+    # which uses Qwen3-235B) WITHOUT changing the top-level `user_llm` that training
+    # rollouts depend on. Falls back to the training user_llm when unset.
+    user_llm = config.get("leaderboard", {}).get("user_llm") or config["user_llm"]
     # Prefer the dedicated leaderboard dataset (test split, clean holdout).
     # Fall back to validation_weave_dataset for configs that pre-date the split
     # (e.g. old pipeline_runs snapshots that don't have leaderboard_weave_dataset).
@@ -162,6 +324,10 @@ async def main(
     max_steps = lb_config.get("max_steps", config.get("max_orchestrator_steps", 30))
     user_llm_args = lb_config.get("user_llm_args", config.get("user_llm_args", {"temperature": 1.0}))
     agent_llm_args = lb_config.get("agent_llm_args", {})
+    max_concurrency = lb_config.get("max_concurrency", None)
+    # CLI --seed overrides config leaderboard.seed
+    if seed is None:
+        seed = lb_config.get("seed", None)
 
     # Shaped-reward kwargs forwarded to Tau2BaseModelWrapper -> tau2_rollout.
     # When use_shaped_reward=True, traj.reward becomes the continuous shaped score
@@ -187,7 +353,7 @@ async def main(
     weave.publish(dataset)
     print("Published leaderboard dataset from current validation data")
 
-    scorers = [score_success, score_task_reward, score_error]
+    scorers = [score_success, score_task_reward, score_error, PassAtKScorer(num_trials=num_trials)]
     eval_name = f"tau2-{domain}-evaluation-leaderboard-shaped"
     shared_evaluation = weave.Evaluation(
         name=eval_name,
@@ -196,7 +362,15 @@ async def main(
         trials=num_trials,
     )
     weave.publish(shared_evaluation)
-    print(f"Using evaluation with {num_trials} trial(s) per task (shaped reward enabled: {shaped_kwargs['use_shaped_reward']})")
+    seed_note = f", CRN seed={seed}" if seed is not None else ""
+    print(f"Using evaluation with {num_trials} trial(s) per task (shaped reward enabled: {shaped_kwargs['use_shaped_reward']}{seed_note})")
+    if seed is not None and num_trials > 1:
+        print(
+            f"  Warning: seed={seed} is set but num_trials={num_trials} > 1. "
+            "With a fixed seed all trials of a task see identical user behaviour, "
+            "collapsing pass^k to pass^1. For CRN runs, set num_trials: 1 in "
+            "leaderboard config and run with multiple --seed values."
+        )
 
     run = wandb.init(
         project=project,
@@ -208,6 +382,10 @@ async def main(
     models = []
     model_names = []
     display_names = []
+
+    # crn_kwargs are forwarded to every wrapper so the user simulator sees
+    # identical random behaviour for all models in the same run.
+    crn_kwargs = dict(seed=seed, max_concurrency=max_concurrency)
 
     if should_eval_base:
         print(f"\nLoading base model: {base_model} (agent_llm={agent_llm})")
@@ -222,6 +400,7 @@ async def main(
             max_steps=max_steps,
             agent_llm=agent_llm,
             **shaped_kwargs,
+            **crn_kwargs,
         )
         models.append(base_wrapper)
         model_names.append("base")
@@ -296,6 +475,7 @@ async def main(
                     sft_display = f"{base_model} ({sft_label})"
                     print(f"Pinning sft row to checkpoint :step{sft_pinned_step}")
                     sft_wrapper = Tau2BaseModelWrapper(
+                        name="sft",
                         model=sft_model,
                         model_name=sft_display,
                         domain=domain,
@@ -305,6 +485,7 @@ async def main(
                         max_steps=max_steps,
                         pinned_step=sft_pinned_step,
                         **shaped_kwargs,
+                        **crn_kwargs,
                     )
                     models.append(sft_wrapper)
                     model_names.append("sft")
@@ -330,6 +511,7 @@ async def main(
                     print(f"No rl pin found; rl row defaults to :latest (step {latest_step})")
                 rl_display = f"{base_model} ({rl_label})"
                 rl_wrapper = Tau2BaseModelWrapper(
+                    name="rl",
                     model=trained_model,
                     model_name=rl_display,
                     domain=domain,
@@ -340,6 +522,7 @@ async def main(
                     pinned_step=rl_pinned_step,
                     pinned_alias=rl_pinned_alias,
                     **shaped_kwargs,
+                    **crn_kwargs,
                 )
                 models.append(rl_wrapper)
                 model_names.append("rl")
@@ -378,6 +561,7 @@ async def main(
             max_steps=max_steps,
             agent_llm=gpt41_model_id,
             **shaped_kwargs,
+            **crn_kwargs,
         )
         models.append(gpt41_wrapper)
         model_names.append("gpt-4.1-mini")
@@ -405,6 +589,7 @@ async def main(
             max_steps=max_steps,
             agent_llm=gemini_model_id,
             **shaped_kwargs,
+            **crn_kwargs,
         )
         models.append(gemini_wrapper)
         model_names.append("gemini-3.5-flash")
@@ -423,13 +608,19 @@ async def main(
 
     completed_rows: list[str] = []
     failed_rows: list[tuple[str, str]] = []
+    # Collect per-task results for paired stats (SFT and RL only).
+    collected_results: dict[str, list[dict]] = {}
+
     for idx, (model, name, display_name) in enumerate(zip(models, model_names, display_names), 1):
-        print(f"\nEvaluating {idx}/{len(models)}: {display_name}")
+        # Suffix display name with seed so multi-seed runs appear as separate
+        # rows in one leaderboard rather than overwriting each other.
+        display_name_run = f"{display_name} | seed={seed}" if seed is not None else display_name
+        print(f"\nEvaluating {idx}/{len(models)}: {display_name_run}")
         try:
-            await shared_evaluation.evaluate(model, __weave={"display_name": display_name})
+            await shared_evaluation.evaluate(model, __weave={"display_name": display_name_run})
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
-            print(f"FAILED: {display_name} -> {err}")
+            print(f"FAILED: {display_name_run} -> {err}")
             if "api.training.wandb.ai" in err or "524" in err:
                 print(
                     "  Hint: this is a Cloudflare 524 from the ART training backend "
@@ -437,16 +628,37 @@ async def main(
                     "LoRA checkpoint fetch timed out upstream. Check W&B status, then "
                     "re-run leaderboard alone with --resume <snapshot> --skip upload sft rl."
                 )
-            failed_rows.append((display_name, err))
+            failed_rows.append((display_name_run, err))
             continue
-        print(f"Completed: {display_name}")
-        completed_rows.append(display_name)
+        print(f"Completed: {display_name_run}")
+        completed_rows.append(display_name_run)
+
+        # Save per-task results for paired_task_analysis.py aggregation and for
+        # inline paired stats below.
+        task_results = model._task_results or []
+        if task_results:
+            collected_results[name] = task_results
+            _save_leaderboard_sims(name, task_results, seed)
 
     print(f"\nRow status: {len(completed_rows)} completed, {len(failed_rows)} failed")
     for d in completed_rows:
         print(f"  ok    : {d}")
     for d, err in failed_rows:
         print(f"  failed: {d} ({err})")
+
+    # Paired stats: compare SFT vs RL per task if both completed.
+    if "sft" in collected_results and "rl" in collected_results:
+        _print_paired_stats(
+            collected_results["sft"],
+            collected_results["rl"],
+            label_a="sft",
+            label_b="rl",
+            k=num_trials,
+        )
+    else:
+        missing = [m for m in ("sft", "rl") if m not in collected_results]
+        if missing:
+            print(f"\n[paired stats] Skipping — missing results for: {', '.join(missing)}")
 
     try:
         eval_ref_uri = get_ref(shared_evaluation).uri()
@@ -465,6 +677,16 @@ async def main(
                 evaluation_object_ref=eval_ref_uri,
                 scorer_name="score_error",
                 summary_metric_path="dropped.mean",
+            ),
+            leaderboard.LeaderboardColumn(
+                evaluation_object_ref=eval_ref_uri,
+                scorer_name="PassAtKScorer",
+                summary_metric_path="pass^1.mean",
+            ),
+            leaderboard.LeaderboardColumn(
+                evaluation_object_ref=eval_ref_uri,
+                scorer_name="PassAtKScorer",
+                summary_metric_path=f"pass^{num_trials}.mean",
             ),
         ]
         leaderboard_spec = leaderboard.Leaderboard(
@@ -528,6 +750,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Publish/overwrite leaderboard definition (use only for first time or to update structure)",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help=(
+            "CRN seed: fix the user-simulator random seed so all models face identical "
+            "user behaviour per task. Row display names are suffixed with '| seed=N' so "
+            "multi-seed runs land in one leaderboard. For CRN runs, use num_trials: 1 in "
+            "leaderboard config and run with seeds 0, 1, 2 separately, then aggregate with "
+            "paired_task_analysis.py --n 3. Overrides leaderboard.seed in config."
+        ),
+    )
     args = parser.parse_args()
     asyncio.run(main(
         config_path=args.config,
@@ -536,4 +770,5 @@ if __name__ == "__main__":
         trained_model_step=args.trained_model_step,
         trained_model_alias=args.trained_model_alias,
         publish_leaderboard=args.publish_leaderboard,
+        seed=args.seed,
     ))
