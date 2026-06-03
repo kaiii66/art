@@ -1,145 +1,174 @@
-# tau2-bench RL on-prem pipeline — autopilot run summary
+# tau2-bench ART Pipeline — Run Summary
 
-End-to-end RL pipeline (pull SFT → GRPO with KL anchor → upload RL LoRA →
-Weave leaderboard) running on 1×8 H100 on-prem via `art.local.LocalBackend`.
-
-**Final image**: `ghcr.io/kaiii66/tau2-art:f02d7e2-fix21-sftpin`
-**Final passing run**: `tau2-art-rl-05141922` (pod Succeeded, all 4 stages clean)
-**Leaderboard**: https://wandb.ai/kwt/tau2-ART-distill-05111101/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1
+Latest validated run: **suffix `06021512`** (2026-06-02/03)
 
 ---
 
-## Result
+## Results
 
-40 validation tasks × 3 trials per row, evaluated via W&B Inference.
+**Eval set:** tau2-telecom test split, 40 tasks × 3 trials = 120 evaluations per model.
 
-| Row                | success.mean | task_reward.mean | Δ vs SFT |
-|--------------------|--------------|------------------|----------|
-| base Qwen3-30B     | **9.2%**     | 0.233            | —        |
-| SFT @ step 16      | **27.5%**    | 0.557            | baseline |
-| **RL @ step 17**   | **38.3%**    | **0.624**        | **+10.8 pp** |
+| Model | pass^1 (success rate) | pass^3 (all 3 trials) | val/reward (training) |
+|-------|-----------------------|-----------------------|----------------------|
+| Base (Qwen3-30B, no fine-tuning) | ~14% | — | — |
+| **SFT @ step 8** | **86.7%** | **75.0%** | 73.0% |
+| **RL @ step 10 (GRPO)** | **89.2%** | **77.5%** | 79.1% |
+| GPT-4.1-mini (frontier baseline) | (see Weave) | — | — |
 
-RL improvement is one GRPO update on top of SFT (step 16 → step 17) with
-`kl_penalty_coef=0.04` and `learning_rate=1e-7`. KL anchor was live throughout
-(`loss/kl_policy_ref ≠ 0`, `loss/grad_norm` stayed under 2.0).
+RL beats SFT by **+2.5 pp** on pass^1 and pass^3. Wilcoxon p=0.32 (not statistically significant at n=40; directionally consistent).
 
----
+**Weave leaderboard:**
+https://wandb.ai/kwt/tau2-ART-distill-06021512/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1
 
-## What broke and how it was fixed
-
-The journey took 21 image rebuilds (`fix1`…`fix21`). Pattern: every problem
-was a small wiring/config issue, not a fundamental architecture flaw — once
-all of them were stacked, the pipeline went green end-to-end.
-
-### 1. Build-time
-
-| Bug | Fix |
-|---|---|
-| `uv sync --frozen` failed because the local `tau2` package wants `README.md` and `src/` which weren't yet in the layer | Split into two: `uv sync --frozen --no-dev --no-install-project` (deps only) then `uv pip install --no-deps .` after `COPY . .` |
-| First `uv pip install openpipe-art[backend]` worked, but a later `uv sync` wiped it (uv.lock didn't list vllm/unsloth/torch) | Use `uv pip install --no-deps .` for the project, never run `uv sync` after the backend install |
-| `transformers` import-time check rejected `huggingface-hub==1.14.0` (it wants `<1.0`) | Pin `huggingface-hub>=0.34.0,<1.0` in the same install command |
-| `weave` import failed: `TransportConnectionFailed` not in installed `gql==3.5.3` | openpipe-art[backend] pins `gql<4`, but `weave` needs `>=4.0`. Force-override with `uv pip install --no-deps --upgrade "gql>=4.0.0"` in a separate layer |
-
-### 2. Runtime — process management
-
-| Bug | Fix |
-|---|---|
-| `uv run python ...` in subprocess calls re-syncs the venv against `uv.lock` and clobbers the pinned `huggingface-hub`/`gql` versions, breaking imports | Use `python` directly (venv is on `$PATH` from the Dockerfile). Set `UV_RUN: list[str] = []` in `run_pipeline_local.py` |
-| Each rl-stage process never exited cleanly — `LocalBackend._monitor_openai_server` is a `while True: await asyncio.sleep(30)` task with no cancellation; vLLM EngineCore + multiprocessing.resource_tracker reparent to init and keep the parent's stdout-pipe open; `subprocess.wait()` blocks forever; upload_rl + leaderboard stages never ran | (a) `start_new_session=True` when orchestrator launches the rl stage so killing the child group doesn't take down the orchestrator. (b) At end of `train_tau2_local.py`'s `__main__`, write a `.rl_complete` sentinel file then `os.killpg(getpgrp(), SIGKILL)` + `os._exit(0)`. (c) In `run_pipeline_local.py`, treat `rc == -9` as success **iff** the sentinel exists |
-| Kubelet served stale cached image despite `imagePullPolicy: Always` (same tag `f02d7e2` rebuilt locally, but pod kept getting the first push) | Always re-tag for new pushes: `f02d7e2-fix1`, `-fix2`, ... `-fix21` |
-
-### 3. Runtime — memory / config
-
-| Bug | Fix |
-|---|---|
-| Default `max_model_len=262144` (Qwen3 advertised context) made vLLM try to reserve 24 GiB KV cache, OOMing on a single H100 | Set `engine_args.max_model_len` explicitly. Final value: `24576` |
-| `gpu_memory_utilization=0.85 + max_model_len=49152` left 8 GiB for trainer → first 44K-token batch OOMed → vLLM EngineCore went permanently dead → every subsequent batch failed with "EngineCore encountered an issue" but the loop kept churning (0 successful gradient steps across 97 batches in one run) | Re-balance to **0.82 + 24576** + `max_orchestrator_steps=40` + `max_tokens=1024`. Math: 60 GiB model + 2.5 GiB KV + 1 GiB cuda-graphs ≈ 64 GiB → vLLM gets 0.82·79 = 65 GiB. Trainer gets ~14 GiB |
-| `gpu_memory_utilization=0.78` left only 0.73 GiB for KV cache, can't even fit `max_model_len=32768` (needs 3 GiB) | (Same — settled on 0.82) |
-| ART's vLLM dedicated-mode path (`inference_gpu_ids=[7]`) crashed at subprocess startup, log gone with the pod | Stayed single-GPU; never resolved (see "Suggestions") |
-| Stuck rollout retried 30× with 60s backoff = 30 min stalled per failed call | `tau2_art_helpers.py` fail-fast on deterministic 400s (`context length`, `input_tokens`, `model ID is invalid`); other 400s (e.g. "Already borrowed" vLLM LoRA concurrency) still retry |
-| `max_orchestrator_steps=30` truncates tau2 conversations before the agent can solve a task → val collapses from 70% to 15% | Set to 40 (sweet spot with 24K context) |
-
-### 4. Auth / artifacts / leaderboard
-
-| Bug | Fix |
-|---|---|
-| `tau2_art_helpers.ARTAgent` hard-coded `inference_api_key = WANDB_API_KEY`. LocalBackend's local vLLM server expects key `"default"`, so the agent got 401 from its own local engine | Prefer `model.inference_api_key` (set by the backend during `prepare_backend_for_training`) and fall back to env: `inference_api_key = model.inference_api_key or os.getenv("WANDB_API_KEY")` |
-| tau2 data dir was looked up at `Path(__file__).parents[3]/data` which resolves to `/workspace/.venv/lib/python3.12/data` (doesn't exist) when the package is installed | K8s template sets `TAU2_DATA_DIR=/workspace/data` |
-| `upload_rl_lora.py` uploaded artifacts without `wandb.base_model` metadata → W&B Inference returned 400 `model ID is invalid: model ID must be given or included in artifact metadata` | Add `metadata={"wandb.base_model": base_model, ...}` + `storage_region="coreweave-us"` (mirroring `art/utils/deployment/wandb.py`) |
-| Leaderboard's base row crashed with `'NoneType' object has no attribute 'inference_api_key'` because `agent_llm = config.get("agent_llm", default)` returns `None` (not the default) when yaml has `agent_llm: null` | `agent_llm = config.get("agent_llm") or f"wandb/{base_model}"` |
-| Leaderboard's SFT row looked for `step16` in the **per-run** isolated collection (`...-rl-05141922`), where step 16 doesn't exist — it lives in the original SFT collection (`...-20260511-1101`) | Construct a separate `art.TrainableModel` for the SFT row using `config["sft_source"]["name"]` |
+**W&B project:**
+https://wandb.ai/kwt/tau2-ART-distill-06021512
 
 ---
 
-## What works now
+## Run Identifiers
 
-- Full pipeline: `pull_sft → rl (with KL anchor) → upload_rl → leaderboard`,
-  reaches the published Weave leaderboard end-to-end with non-null scores
-  for all three rows.
-- Run isolation via the `-rl-<MMDDHHMM>` suffix on `model_name` — each pipeline
-  invocation gets its own `.art/` checkpoint dir and W&B sub-collection without
-  any manual cleanup between runs.
-- KL anchor reliably non-zero throughout training; grad-norm spikes recover.
-- Early-stopping (3 consecutive vals without improvement) terminates within
-  ~1.5h and writes `.best_rl_step` to the snapshot directory.
-- The `.rl_complete` sentinel + `start_new_session=True` combination makes
-  the rl stage cleanly hand off to upload_rl + leaderboard, instead of
-  hanging the pod forever on the orphan vLLM child.
-- The k8s `Job` template (`onprem/k8s/art-rl-job.yaml.template`) + `k8s_submit.py`
-  give a one-command submission flow: `uv run python local/k8s_submit.py --image-tag …`.
+| Field | Value |
+|-------|-------|
+| Suffix | `06021512` |
+| W&B project | `tau2-ART-distill-06021512` |
+| Docker image | `ghcr.io/kaiii66/tau2-art:5fdd619-06021512` |
+| Slurm job | 4919 (16 h wall, node `slurm-h100-225-159`) |
+| RL W&B run | `rx7sw526` |
+| RL W&B run URL | https://wandb.ai/kwt/tau2-ART-distill-06021512/runs/rx7sw526 |
+| SFT model | `tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260602-1512` |
+| RL model | `tau2-distill-Qwen3-30B-A3B-Instruct-2507-20260602-1512-rl-06021512` |
 
 ---
 
-## Suggestions / next steps
+## Hyperparameters
 
-### Reproducibility (mission item 3)
-- AUTOPILOT.md asks for RL > SFT in **at least 2 independent runs**. We have 1.
-  One more clean run with the current image (~3h) would confirm.
+### Models
 
-### Throughput / GPU utilisation
-- **Only 1 of 8 H100s is doing real work right now.** The other 7 are reserved
-  by the Job's `nvidia.com/gpu: 8` request and sit idle. Two ways to reclaim:
-  1. Reduce `nvidia.com/gpu` in the template to 1 so other workloads can
-     share the node.
-  2. Get ART's dedicated multi-GPU vLLM subprocess working (trainer on GPUs
-     0-3 with FSDP, inference on GPU 7). The subprocess crashed at startup in
-     my attempts; the truncated `vllm-dedicated.log` was the blocker. Reproduce
-     once with the `fix10-debuglogs` trap actually firing (see bug below)
-     so the log survives pod death, then debug.
+| Role | Model |
+|------|-------|
+| Student (agent) | `Qwen/Qwen3-30B-A3B-Instruct-2507` |
+| Teacher (SFT data) | `wandb/zai-org/GLM-5.1` |
+| User simulator | `wandb/Qwen/Qwen3-235B-A22B-Instruct-2507` |
 
-### Robustness
-- **The trap-save in `run_art_rl.sh` never fires** because `exec python …` replaces
-  the bash that owns the trap. Either drop the `exec` (let bash stay alive and
-  shell out), or move the debug-log copy into the Python entrypoint (where
-  `atexit` is reliable).
-- The 3-retry trainer block in `train_tau2_local.py` doesn't restart vLLM —
-  one OOM bricks the engine for the whole run. Either reinitialize the backend
-  on `OutOfMemoryError`, or trip a hard exit so k8s reschedules.
+### SFT (distillation)
 
-### Score quality
-- Current best val is 22.5%; the conservative `max_orchestrator_steps=40` and
-  `max_tokens=1024` cut off agent reasoning. With dedicated mode + multi-GPU
-  trainer we could afford a longer context window (say 49K) and 100 turns again,
-  which historically produced val/success up to 90.9% (`tau2-art-rl-05140142`).
+| Parameter | Value |
+|-----------|-------|
+| Teacher rollouts per task | 12 |
+| Teacher concurrency | 5 |
+| Validation rollouts per task | 2 |
+| SFT epochs | 2 |
+| Batch size | 2 |
+| Peak LR | 1e-4 |
+| LR warmup ratio | 0.1 |
+| LR schedule | cosine |
+| Chunk size (batches per val) | 8 |
+| Early-stop patience | 3 consecutive flat evals |
+| Best step | **8** (val/reward = 73.0%) |
+| Total chunks trained | 11 (early-stopped) |
 
-### Tidy-up
-- Nothing committed yet — everything is on `feature/rl` uncommitted. Recommend
-  committing the working state of:
-  - `onprem/Dockerfile.art-rl`
-  - `onprem/scripts/run_art_rl.sh`
-  - `onprem/k8s/art-rl-job.yaml.template`
-  - `local/*.py`
-  - `train_config_local.yaml`
-  - `tau2_art_helpers.py` (1-line fix for `inference_api_key`)
-  - `create_leaderboard_shaped_reward.py` (`agent_llm` fallback + SFT pin)
-  Then the journey above can be reproduced from a single commit.
+### RL (GRPO)
 
-### Other observations
-- The per-run prefilter band keeps a wildly different fraction of tasks each
-  time (5–66 of 74). Consider widening to `[0.05, 0.95]` or using a
-  smaller-batch warmup before the band cutoff so we don't end up training on
-  only 5 tasks on unlucky days.
-- "Already borrowed" vLLM concurrency 400s are still common during eval. The
-  retry-with-backoff handles them, but they slow leaderboard runs down. Worth
-  asking the ART team / W&B Inference whether there's a way to disable
-  intra-LoRA concurrency.
+| Parameter | Value |
+|-----------|-------|
+| Groups per step | 3 |
+| Rollouts per group | 16 |
+| Total rollouts per step | 48 |
+| Learning rate | 5e-7 |
+| KL penalty coefficient (β) | 0.04 |
+| Max steps | 100 |
+| Early-stop patience | 5 consecutive flat evals |
+| Best step | **10** (val/reward = 79.1%) |
+| Total steps trained | 7 (steps 9–15, early-stopped) |
+| Validation rollouts per task | 4 |
+
+### Leaderboard evaluation
+
+| Parameter | Value |
+|-----------|-------|
+| Eval dataset | `tau2-ART-telecom-test-scenarios` (40 tasks) |
+| Trials per task | 3 |
+| Max concurrency | 8 |
+| User simulator | `wandb/Qwen/Qwen3-235B-A22B-Instruct-2507` |
+
+---
+
+## SFT Training Curve
+
+| Chunk | val/reward | Note |
+|-------|-----------|------|
+| 1 | 9.5% | baseline |
+| 2 | 20.3% | new best |
+| 3 | 21.6% | new best |
+| 4 | 41.1% | new best |
+| 5 | 31.1% | plateau 1/3 |
+| 6 | 66.2% | new best |
+| 7 | 64.9% | plateau 1/3 |
+| **8** | **73.0%** | **new best → early-stop seed** |
+| 9 | — | plateau 1/3 |
+| 10 | — | plateau 2/3 |
+| 11 | — | plateau 3/3 → early stop |
+
+---
+
+## RL Training Curve
+
+| RL Step | Model Step | val/reward | Note |
+|---------|-----------|-----------|------|
+| 0 | 9 | 66.9% | new best |
+| **1** | **10** | **79.1%** | **new best** |
+| 2 | 11 | — | plateau 1/5 |
+| 3 | 12 | — | plateau 2/5 |
+| 4 | 13 | — | plateau 3/5 |
+| 5 | 14 | — | plateau 4/5 |
+| 6 | 15 | — | plateau 5/5 → early stop |
+
+---
+
+## Data Collection
+
+| Metric | Value |
+|--------|-------|
+| Tasks probed | 74 |
+| Tasks solvable (≥10% probe success) | 71 (95.9%) |
+| Teacher rollouts collected | 855 |
+| Teacher success rate | 97.4% (833/855) |
+| Clean trajectories (no tool errors) | 697 / 855 (81.5%) |
+| Trajectories used for SFT | 697 |
+
+---
+
+## Infrastructure
+
+| Component | Detail |
+|-----------|--------|
+| Cluster | CoreWeave SUNK (Slurm-on-Kubernetes), `training` context |
+| GPU node | 1× `slurm-h100-225-159` (8× H100 NVLink 80 GB) |
+| Slurm partition | `h100` |
+| Wall-clock limit | 16 h (ran ~4.5 h) |
+| Container runtime | pyxis / enroot |
+| Image | `ghcr.io/kaiii66/tau2-art:5fdd619-06021512` |
+| NFS base | `/mnt/data/kai` |
+| RL checkpoint storage | `/mnt/data/kai/tau2-artifacts/.art` (NFS-persisted) |
+
+---
+
+## Reliability Notes
+
+- **Already borrowed (400) errors:** 987 incidents on Qwen3-235B user simulator during RL rollouts (48 concurrent requests vs. limited W&B inference slots). All resolved on retry ≤ attempt 4/30. No failed rollouts.
+- **SSL errors:** None (previous run `06011448` had 51/74 tasks fail due to SSL issues; fully resolved this run).
+- **Slurm timeout:** Preemptively cancelled 8 h job (4918) and resubmitted as 16 h job (4919). No work lost.
+
+---
+
+## Comparison vs Previous Run (`06011448`)
+
+| Metric | 06011448 | **06021512** | Change |
+|--------|----------|-------------|--------|
+| User simulator | Qwen3-30B | **Qwen3-235B** | ↑ |
+| Tasks solvable | 52.7% | **95.9%** | +43.2 pp |
+| Clean trajectories | 157 | **697** | +4.4× |
+| Best SFT val/reward | 50.0% | **73.0%** | +23 pp |
+| SFT pass^1 (test) | 46.7% | **86.7%** | +40 pp |
+| Best RL val/reward | 44.6% | **79.1%** | +34.5 pp |
+| RL pass^1 (test) | 53.3% | **89.2%** | +35.9 pp |
