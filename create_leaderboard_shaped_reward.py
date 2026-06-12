@@ -228,6 +228,8 @@ async def main(
     trained_model_alias: str = None,
     publish_leaderboard: bool = False,
     seed: int = None,
+    num_trials_override: int = None,
+    leaderboard_name: str = None,
 ):
     if models_to_eval is None:
         models_to_eval = ["all"]
@@ -320,7 +322,7 @@ async def main(
                 print(f"  [leaderboard] could not read {best_step_file}: {e}")
 
     lb_config = config.get("leaderboard", {})
-    num_trials = lb_config.get("num_trials", 1)
+    num_trials = num_trials_override if num_trials_override is not None else lb_config.get("num_trials", 1)
     max_steps = lb_config.get("max_steps", config.get("max_orchestrator_steps", 30))
     user_llm_args = lb_config.get("user_llm_args", config.get("user_llm_args", {"temperature": 1.0}))
     agent_llm_args = lb_config.get("agent_llm_args", {})
@@ -689,8 +691,9 @@ async def main(
                 summary_metric_path=f"pass^{num_trials}.mean",
             ),
         ]
+        lb_spec_name = leaderboard_name or f"tau2-{domain}-leaderboard-shaped-v1"
         leaderboard_spec = leaderboard.Leaderboard(
-            name=f"tau2-{domain}-leaderboard-shaped-v1",
+            name=lb_spec_name,
             description=f"tau2-bench {domain} held-out validation: binary success (headline) + shaped task_reward (diagnostic).",
             columns=lb_columns,
         )
@@ -762,6 +765,26 @@ if __name__ == "__main__":
             "paired_task_analysis.py --n 3. Overrides leaderboard.seed in config."
         ),
     )
+    parser.add_argument(
+        "--num-trials",
+        type=int,
+        default=None,
+        dest="num_trials_override",
+        help=(
+            "Override leaderboard.num_trials from config. Useful for CRN runs where you "
+            "want num_trials=1 without editing the config file."
+        ),
+    )
+    parser.add_argument(
+        "--leaderboard-name",
+        type=str,
+        default=None,
+        help=(
+            "Override the published Weave leaderboard name "
+            "(default: tau2-{domain}-leaderboard-shaped-v1). Use a distinct name for "
+            "CRN runs so they appear in a separate leaderboard from the full eval."
+        ),
+    )
     args = parser.parse_args()
     asyncio.run(main(
         config_path=args.config,
@@ -771,4 +794,6 @@ if __name__ == "__main__":
         trained_model_alias=args.trained_model_alias,
         publish_leaderboard=args.publish_leaderboard,
         seed=args.seed,
+        num_trials_override=args.num_trials_override,
+        leaderboard_name=args.leaderboard_name,
     ))

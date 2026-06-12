@@ -461,7 +461,7 @@ def main() -> int:
             "--time-limit", args.slurm_time_limit,
         ]
         if args.smoke:
-            submit_cmd += ["--skip-stages", "upload_rl leaderboard", "--num-tasks", "4"]
+            submit_cmd += ["--skip-stages", "upload_rl leaderboard leaderboard_crn paired_analysis upload_paired_analysis", "--num-tasks", "4"]
         if args.tail:
             submit_cmd += ["--tail"]
         rc = _stream_subprocess("stage: slurm submit", submit_cmd, log_path=None)
@@ -474,7 +474,7 @@ def main() -> int:
             "--suffix", suffix,
         ]
         if args.smoke:
-            submit_cmd += ["--skip-stages", "upload_rl leaderboard", "--num-tasks", "4"]
+            submit_cmd += ["--skip-stages", "upload_rl leaderboard leaderboard_crn paired_analysis upload_paired_analysis", "--num-tasks", "4"]
         if args.tail:
             submit_cmd += ["--tail"]
         rc = _stream_subprocess("stage: k8s submit", submit_cmd, log_path=None)

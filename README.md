@@ -62,13 +62,16 @@ optional frontier-baseline rows for gpt-4.1-mini and Gemini).
 [teacher trajectories] ──► [SFT (serverless)] ──► SFT LoRA on W&B
                                                           │
                                                           ▼
-          ┌──────────── local/run_pipeline_local.py ────────────┐
-          │ pull_sft → rl (LocalBackend) → upload_rl → leaderboard │
-          └────────────────────────────────────────────────────────┘
+          ┌──────────────────── local/run_pipeline_local.py ────────────────────────┐
+          │ pull_sft → rl (LocalBackend) → upload_rl → leaderboard                  │
+          │   → leaderboard_crn (CRN × 3 seeds) → paired_analysis                  │
+          │   → upload_paired_analysis                                               │
+          └─────────────────────────────────────────────────────────────────────────┘
                                                           │
                                                           ▼
-                                              Weave leaderboard
-                                         (base / SFT / RL / frontier rows)
+                                   Weave leaderboard (base / SFT / RL / frontier rows)
+                                   + CRN leaderboard (SFT / RL, 3 seeds, paired stats)
+                                   + W&B artifact: paired-analysis report + sim JSONs
 ```
 
 The pipeline supports two GPU submission backends:
@@ -191,7 +194,7 @@ uv run python run_full_pipeline.py --slurm --suffix $SUFFIX --skip-sft --skip-bu
 | `--suffix MMDDHHMM` | Reuse a prior suffix (e.g. to retry after a failure). |
 | `--skip-sft` | Skip SFT — requires `--suffix` pointing at an existing snapshot. |
 | `--skip-build` | Skip docker build + push; reuse the image tag from a prior submit. |
-| `--smoke` | 4-task RL only; skips upload_rl + leaderboard. For debugging only. |
+| `--smoke` | 4-task RL only; skips upload_rl, leaderboard, leaderboard_crn, paired_analysis, and upload_paired_analysis. For debugging only. |
 | `--tail` | Stream job logs until the job ends. |
 | `--slurm-time-limit HH:MM:SS` | Slurm wall-clock limit (default `08:00:00`; use `16:00:00` for safety). |
 | `--nfs-base PATH` | NFS base path on SUNK cluster (default `/mnt/data/kai`). |
@@ -288,6 +291,8 @@ When you see `Leaderboard published: ObjectRef(…)` the pipeline is done.
 | Best step | Printed as `[rl] best step: N best val/reward: X` |
 | W&B run | `https://wandb.ai/kwt/<project>/runs/<id>` (link in log) |
 | **Weave leaderboard** | `https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1` |
+| **CRN Weave leaderboard** | `https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-crn-v1` |
+| **Paired-analysis artifact** | W&B artifact `type=paired-analysis`, `name=paired-analysis-<SUFFIX>` (report + CRN sim JSONs) |
 
 The leaderboard has rows for **base**, **SFT @ best step**, **RL @ best step**,
 plus optional frontier-baseline rows (gpt-4.1-mini, Gemini) when the

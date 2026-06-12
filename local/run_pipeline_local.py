@@ -12,9 +12,17 @@ Stages (in order):
   3. upload_rl   Upload the best RL checkpoint back to the same W&B
                  collection so create_leaderboard_shaped_reward.py works
                  unchanged (resolves via W&B Inference).
-  4. leaderboard Run create_leaderboard_shaped_reward.py --models all
-                 (auto-discovers .sft_endpoint_step + .best_rl_step from
-                 the snapshot dir).
+  4. leaderboard     Run create_leaderboard_shaped_reward.py --models all
+                     (auto-discovers .sft_endpoint_step + .best_rl_step from
+                     the snapshot dir).
+  5. leaderboard_crn Re-run --models sft rl with --num-trials 1 for each of
+                     --crn-seeds seeds, publishing to a separate leaderboard
+                     (tau2-{domain}-leaderboard-crn-v1 by default).
+  6. paired_analysis Run paired_task_analysis.py over the CRN simulation files
+                     to produce a Wilcoxon + bootstrap-CI report.
+  7. upload_paired_analysis
+                     Upload the paired-analysis log + CRN sim JSONs to W&B as
+                     a 'paired-analysis' artifact for reproducibility.
 
 Usage:
     uv run python local/run_pipeline_local.py
@@ -25,6 +33,9 @@ Usage:
     # Re-run leaderboard alone:
     uv run python local/run_pipeline_local.py \\
         --resume pipeline_runs/05121000 --skip pull_sft rl upload_rl
+    # Re-run CRN + paired analysis only:
+    uv run python local/run_pipeline_local.py \\
+        --resume pipeline_runs/05121000 --skip pull_sft rl upload_rl leaderboard
 """
 from __future__ import annotations
 
@@ -43,7 +54,7 @@ REPO_ROOT = _HERE.parent
 SRC_LOCAL_CONFIG = REPO_ROOT / "train_config_local.yaml"
 RUNS_DIR = REPO_ROOT / "pipeline_runs"
 
-ALL_STAGES = ["pull_sft", "rl", "upload_rl", "leaderboard"]
+ALL_STAGES = ["pull_sft", "rl", "upload_rl", "leaderboard", "leaderboard_crn", "paired_analysis", "upload_paired_analysis"]
 
 # Launch each stage subprocess with whatever `python` is on $PATH.
 #
@@ -246,6 +257,21 @@ def main() -> int:
         default=None,
         help="Pass --num-tasks to RL stage (useful for smoke testing)",
     )
+    parser.add_argument(
+        "--crn-seeds",
+        type=int,
+        default=3,
+        help="Number of CRN seeds for the leaderboard_crn stage (default: 3)",
+    )
+    parser.add_argument(
+        "--crn-leaderboard-name",
+        type=str,
+        default=None,
+        help=(
+            "Weave leaderboard name for CRN runs "
+            "(default: tau2-{domain}-leaderboard-crn-v1)"
+        ),
+    )
     args = parser.parse_args()
 
     suffix = args.project_suffix or datetime.now(
@@ -304,6 +330,19 @@ def main() -> int:
     run_model_name = run_cfg.get("model_name", "?")
     _domain = run_cfg.get("domain", "telecom")
 
+    crn_lb_name = args.crn_leaderboard_name or f"tau2-{_domain}-leaderboard-crn-v1"
+
+    stage_cmds["paired_analysis"] = [
+        *UV_RUN, "python", "paired_task_analysis.py",
+        "--n", str(args.crn_seeds), "--leaderboard",
+    ]
+    stage_cmds["upload_paired_analysis"] = [
+        *UV_RUN, "python", "local/upload_paired_analysis.py",
+        "--config", str(local_cfg),
+        "--snapshot-dir", str(snapshot),
+        "--n", str(args.crn_seeds),
+    ]
+
     # Step 0 — auto-generate val split (idempotent: skips in <1s if val exists).
     # No --force: the committed split is authoritative; only regenerate manually.
     gen_cmd = [*UV_RUN, "python", "scripts/generate_val_split.py", "--domain", _domain]
@@ -324,10 +363,31 @@ def main() -> int:
     print(f"    stages enabled   : {[s for s in ALL_STAGES if s not in skip]}")
     print(f"    stages skipped   : {sorted(skip)}")
     print(f"    publish_lb       : {not args.no_publish_leaderboard}")
+    print(f"    crn_seeds        : {args.crn_seeds}")
+    print(f"    crn_lb_name      : {crn_lb_name}")
 
     for idx, stage in enumerate(ALL_STAGES, start=1):
         if stage in skip:
             print(f"\n=== stage: {stage} (skipped) ===")
+            continue
+        if stage == "leaderboard_crn":
+            for s in range(args.crn_seeds):
+                cmd = [
+                    *UV_RUN, "python", "create_leaderboard_shaped_reward.py",
+                    "--config", str(local_cfg),
+                    "--models", "sft", "rl",
+                    "--seed", str(s),
+                    "--num-trials", "1",
+                    "--leaderboard-name", crn_lb_name,
+                ]
+                if s == 0 and not args.no_publish_leaderboard:
+                    cmd.append("--publish-leaderboard")
+                run_stage(
+                    f"leaderboard_crn seed={s}",
+                    cmd,
+                    snapshot / f"{idx:02d}-leaderboard_crn-seed{s}.log",
+                    dry_run=args.dry_run,
+                )
             continue
         log_path = snapshot / f"{idx:02d}-{stage}.log"
         run_stage(stage, stage_cmds[stage], log_path, dry_run=args.dry_run)

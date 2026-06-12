@@ -3,7 +3,7 @@
 Two pipelines, run in order. Skip step 1 if SFT already exists in W&B.
 
 ```
-[teacher data] ──► [SFT job] ──► SFT LoRA on W&B ──► [RL pipeline] ──► Leaderboard
+[teacher data] ──► [SFT job] ──► SFT LoRA on W&B ──► [RL pipeline] ──► leaderboard ──► leaderboard_crn (CRN × 3) ──► paired_analysis + upload
                                    (serverless)         (on-prem GPU)
 ```
 
@@ -134,11 +134,12 @@ This runs all stages end-to-end (~4–6 h total):
 4. Patch `train_config_local.yaml` with SFT artifact coordinates
 5. Docker build + push to GHCR (~30 min)
 6. Submit Slurm batch job via the login pod (`sbatch` through `kubectl exec`)
-7. On the cluster: pull SFT LoRA → GRPO RL training → upload RL checkpoint → leaderboard
+7. On the cluster: pull SFT LoRA → GRPO RL training → upload RL checkpoint → leaderboard → CRN leaderboard (3 seeds, sft+rl, paired analysis) → upload paired-analysis artifact to W&B
 
 When it finishes, results are at:
 ```
 https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1
+https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-crn-v1
 ```
 
 ### Vanilla Kubernetes (original path, `ray` cluster)
@@ -219,6 +220,7 @@ kubectl exec -n tenant-slurm slurm-login-0 -c sshd -- \
 ```
 https://wandb.ai/kwt/<project>                                          ← W&B run metrics
 https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1
+https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-crn-v1   ← CRN leaderboard
 ```
 
 ### Vanilla K8s job status
@@ -268,6 +270,8 @@ credential file to `$NFS_BASE/.config/enroot/.credentials` on every submit.
 | RL LoRA checkpoints | `W&B: kwt/<project>/<model_name>-rl-<SUFFIX>:step{N}` |
 | RL best step | `pipeline_runs/$SUFFIX/.best_rl_step` (on NFS inside the pod) |
 | Weave leaderboard | `https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-shaped-v1` |
+| CRN Weave leaderboard | `https://wandb.ai/kwt/<project>/weave/leaderboards/tau2-telecom-leaderboard-crn-v1` |
+| Paired-analysis artifact | `W&B: kwt/<project>/paired-analysis-<SUFFIX>` (type: paired-analysis; contains log + CRN sim JSONs) |
 | Run audit trail | `pipeline_runs/$SUFFIX/AUTOPILOT_NOTES.md` |
 | Docker image | `ghcr.io/kaiii66/tau2-art:<git-sha>-<SUFFIX>` |
 
